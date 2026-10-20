@@ -1,0 +1,37 @@
+#pragma once
+
+// Argument validation helpers for the ABI boundary.
+//
+// A NaN or an infinity crossing this ABI is a caller bug, and every one of them
+// is UNRECOVERABLE once it is past the boundary:
+//
+//   * a non-finite master / monitor / input gain is stored as the ramp's
+//     "current" value, so `rampOrScale` multiplies the whole block by NaN and
+//     the output scrub then zeroes the master bus — for good, because the next
+//     block ramps FROM the stored NaN;
+//   * a non-finite EQ / filter frequency, Q or gain produces NaN biquad
+//     coefficients, and a `juce::dsp::IIR` feeds its own output back, so the
+//     band is silent until an off->on transition resets it;
+//   * a non-finite pitch or tempo reaches Rubber Band through `jmax(0.05, x)`,
+//     which is NaN-transparent in exactly the wrong direction.
+//
+// `DspChain::setParam` has rejected NaN since the rig shipped for precisely
+// this reason (every core's clamp is NaN-transparent: `v < lo` and `v > hi` are
+// both false for NaN). The engine setters did not. They do now, through this
+// header, so there is one predicate rather than 30 hand-written `isfinite`s.
+
+#include <cmath>
+
+namespace dcabi {
+
+/// True when every argument is a finite real number (not NaN, not +/-Inf).
+inline bool finite(float v) noexcept  { return std::isfinite(v); }
+inline bool finite(double v) noexcept { return std::isfinite(v); }
+
+template <typename First, typename... Rest>
+inline bool finite(First first, Rest... rest) noexcept
+{
+    return finite(first) && finite(rest...);
+}
+
+} // namespace dcabi

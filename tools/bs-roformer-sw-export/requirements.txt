@@ -1,0 +1,17 @@
+# Pinned: with exactly these, export.py + to_fp16.py reproduce the shipped file byte for byte.
+# torch from the CUDA 12.8 index (make_ref.py wants a GPU; the export itself runs on the CPU):
+#   uv pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
+torch==2.11.0
+onnx==1.23.1
+onnxscript==0.7.2
+onnxconverter-common==1.16.0
+onnxruntime-directml==1.24.4
+numpy==2.5.3
+einops==0.8.2
+rotary-embedding-torch==0.9.1
+beartype==0.22.9
+ml-collections==1.1.0
+pyyaml==6.0.3
+librosa==1.0.0
+soundfile==0.14.0
+soxr==1.1.0

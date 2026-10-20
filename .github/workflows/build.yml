@@ -1,0 +1,185 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege for the default GITHUB_TOKEN. Without this block the token
+# inherits the repository/organisation default, which on an older repo is
+# read/write on EVERYTHING (contents, packages, deployments, issues, …) — handed
+# to every third-party action in every step of a pull_request build. Nothing
+# here writes: the jobs check out, build, test and upload artifacts, and
+# actions/upload-artifact uses its own API, not `contents`. A job that later
+# needs to publish gets its own narrower `permissions:` on the JOB, never here.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOTNET_NOLOGO: "true"
+  DOTNET_CLI_TELEMETRY_OPTOUT: "true"
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: "true"
+
+jobs:
+  windows:
+    name: windows / native + managed
+    # PINNED, not `windows-latest`. The floating label moves to the next image
+    # on GitHub's schedule and takes the Visual Studio, CMake and Windows SDK
+    # versions with it — a native build that starts failing on a morning nobody
+    # pushed anything is the single most expensive kind of CI break to diagnose.
+    # Bump this deliberately, in its own commit, and read the run.
+    runs-on: windows-2025
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # global-json-file, NOT dotnet-version: "10.x". The floating spec installs
+      # whatever 10.x is newest on the runner that day, so CI and every
+      # developer machine could compile the same commit with different SDKs and
+      # different analyzer rule sets. global.json pins 10.0.400 with
+      # rollForward: latestFeature, which is the one place the toolchain is
+      # declared.
+      - uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      # JUCE / Rubber Band / NeuralAudio are FetchContent clones pinned by tag
+      # in src/JuceSharp.Native/CMakeLists.txt. Re-cloning them costs minutes
+      # per run, so key the cache on the tags themselves: a tag bump busts it
+      # automatically and nothing else does.
+      - name: Resolve dependency tags
+        id: tags
+        shell: bash
+        run: |
+          tags=$(grep -E '^set\((JUCE_TAG|RUBBERBAND_TAG|NEURALAUDIO_TAG|DEMUCS_CPP_TAG) ' \
+                   src/JuceSharp.Native/CMakeLists.txt | tr -d ' ')
+          echo "$tags"
+          echo "hash=$(printf '%s' "$tags" | sha256sum | cut -c1-32)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache FetchContent sources
+        uses: actions/cache@v6
+        with:
+          path: src/JuceSharp.Native/build/_deps
+          key: deps-windows-${{ steps.tags.outputs.hash }}
+          restore-keys: deps-windows-
+
+      # No -G: the runner ships Visual Studio 2022 and CMake must auto-detect
+      # it. Pinning a generator here is exactly how this breaks the day the
+      # runner image moves to the next VS.
+      - name: Configure native
+        run: cmake -S src/JuceSharp.Native -B src/JuceSharp.Native/build -A x64
+
+      - name: Build native (Release)
+        run: cmake --build src/JuceSharp.Native/build --config Release --parallel
+
+      - name: Build the RT gate
+        run: cmake --build src/JuceSharp.Native/build --config Release --target juce_sharp_rtcheck --parallel
+
+      # --no-tests=error: a CTest run that discovers nothing is a
+      # configuration failure, not a pass.
+      - name: Native tests (ctest)
+        run: ctest --test-dir src/JuceSharp.Native/build -C Release --output-on-failure --no-tests=error
+
+      - name: Build managed
+        run: dotnet build JuceSharp.sln -c Release
+
+      # The null device gives the engine tests a deterministic callback on a
+      # runner with no sound card.
+      #
+      # JUCESHARP_REQUIRE_NATIVE=1 is the other half, and it matters more than it
+      # looks: NativeAvailableFact/Theory guards roughly a QUARTER of this suite
+      # (228 of 815 methods when measured, including every rig, DSP and engine
+      # test), and it decides by try/catch around a native call. Without this
+      # variable a juce_sharp.dll the runner cannot load turns all of them into
+      # SKIPS and the job stays green. With it set, an unloadable engine fails —
+      # see Wave2NativeProbeTests and docs/agents/rt-safety-and-tests.md.
+      - name: Managed tests
+        env:
+          DCA_ENABLE_NULL_DEVICE: "1"
+          JUCESHARP_REQUIRE_NATIVE: "1"
+        run: dotnet test --project tests/JuceSharp.Tests/JuceSharp.Tests.csproj -c Release --no-build
+
+      # tools/check-doc-links.py was added and wired to nothing. A doc lint
+      # nobody runs is the "registered but never reached" shape one level over.
+      # It needs no build, so it runs even when the native step is red.
+      - name: Doc links
+        if: always()
+        shell: bash
+        run: python tools/check-doc-links.py
+
+      - name: Pack
+        run: dotnet pack JuceSharp.sln -c Release -o artifacts
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v6
+        with:
+          name: nupkg
+          path: |
+            artifacts/*.nupkg
+            artifacts/*.snupkg
+          if-no-files-found: error
+
+      - name: Upload native binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: native-win-x64
+          path: src/JuceSharp/runtimes/win-x64/native/
+          if-no-files-found: error
+
+  # A MEASUREMENT, not a gate. Nothing here has ever been built for Linux and
+  # the ASIO/VST3 host paths are Windows-only, so this is expected to fail —
+  # it exists so the distance to a Linux build is visible and shrinking rather
+  # than unknown. Flip continue-on-error off the day it goes green.
+  linux-distance:
+    name: linux / native only (informational)
+    # Pinned for the same reason as the windows job above.
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    timeout-minutes: 90
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install JUCE Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev \
+            libjack-jackd2-dev \
+            libfreetype6-dev \
+            libx11-dev \
+            libxrandr-dev \
+            libxinerama-dev \
+            libxcursor-dev \
+            libcurl4-openssl-dev \
+            libgl1-mesa-dev
+
+      - name: Resolve dependency tags
+        id: tags
+        run: |
+          tags=$(grep -E '^set\((JUCE_TAG|RUBBERBAND_TAG|NEURALAUDIO_TAG|DEMUCS_CPP_TAG) ' \
+                   src/JuceSharp.Native/CMakeLists.txt | tr -d ' ')
+          echo "hash=$(printf '%s' "$tags" | sha256sum | cut -c1-32)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache FetchContent sources
+        uses: actions/cache@v6
+        with:
+          path: src/JuceSharp.Native/build/_deps
+          key: deps-linux-${{ steps.tags.outputs.hash }}
+          restore-keys: deps-linux-
+
+      - name: Configure native
+        run: cmake -S src/JuceSharp.Native -B src/JuceSharp.Native/build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build juce_sharp only
+        run: cmake --build src/JuceSharp.Native/build --target juce_sharp --parallel

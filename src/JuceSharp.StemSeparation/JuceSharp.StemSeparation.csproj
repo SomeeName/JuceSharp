@@ -1,0 +1,67 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <RootNamespace>JuceSharp.StemSeparation</RootNamespace>
+        <AssemblyName>JuceSharp.StemSeparation</AssemblyName>
+        <Description>Offline ML stem separation utilities for JuceSharp: ckpt to ONNX conversion via a bundled embedded Python interpreter, model environment management, and the Python sidecar bridge.</Description>
+        <PackageId>JuceSharp.StemSeparation</PackageId>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\JuceSharp\JuceSharp.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!--
+            The python sidecar's two scripts.
+
+            THREE delivery routes have to work and only the first two did:
+
+            1. ProjectReference / this repo's own build. CopyToOutputDirectory
+               puts PythonScripts\*.py beside the consumer's exe, which is where
+               PythonEnvManager and CkptToOnnxConverter resolve them from.
+            2. `dotnet pack` PUTS them in the package — that half worked.
+            3. A NuGet consumer GETTING them into ITS OWN output. It did not.
+               PackagePath alone produces, in the generated nuspec,
+
+                   <files include="any/any/PythonScripts/separate_track.py"
+                          buildAction="None" />
+
+               with no copyToOutput — the scripts are linked into the consuming
+               project and copied NOWHERE, so the sidecar dies on a missing
+               script in the one configuration nothing in this repo exercises.
+               `PackageCopyToOutput` is the item metadata that adds
+               copyToOutput="true" to those rows; `PackageFlatten=false` keeps
+               the PythonScripts\ folder instead of dropping both scripts at the
+               output root.
+
+            The `content\` half of PackagePath is the packages.config-era mirror.
+            It is inert for PackageReference consumers and is kept only so an
+            old-style project is not silently broken.
+
+            Verified against a real nupkg — see PackagingLintTests
+            .The_python_sidecar_scripts_are_packed_so_a_consumer_gets_them.
+        -->
+        <None Include="PythonScripts\*.py" CopyToOutputDirectory="PreserveNewest"
+              Pack="true" PackagePath="contentFiles\any\any\PythonScripts\;content\PythonScripts\"
+              PackageCopyToOutput="true" PackageFlatten="false" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="JuceSharp.Tests" />
+        <!-- `DotCharter.Tests` was granted here and used nothing: its only
+             mention of an internal of this project is the STRING
+             "ResetGlobalGateForTests" in a doc-link allow-list. Removed
+             2026-09-11. -->
+        <!-- OnnxModelCatalog downloads through the internal VerifiedDownloader
+             rather than carrying a second HttpClient + hash + atomic-rename
+             implementation. -->
+        <InternalsVisibleTo Include="JuceSharp.StemSeparation.Onnx" />
+    </ItemGroup>
+
+</Project>

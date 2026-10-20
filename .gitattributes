@@ -1,0 +1,63 @@
+# Line endings
+#
+# The repo had no .gitattributes at all, so every checkout got whatever the
+# machine's core.autocrlf happened to say. On the primary Windows machine the
+# system setting is autocrlf=true, which writes CRLF into the working tree
+# while the blobs stay LF — so any tool that rewrites a file byte-for-byte
+# (a script, a formatter, an agent edit) can silently flip a whole file's
+# endings and produce a diff that touches every line.
+#
+# Normalise to LF in the index, everywhere. Nothing here builds with a tool
+# that requires CRLF.
+* text=auto eol=lf
+
+# Windows-only shells stay CRLF: cmd.exe mis-parses an LF .bat/.cmd.
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+# Sources and project files (explicit, so a new extension is never guessed).
+*.cs        text diff=csharp
+*.csproj    text
+*.sln       text eol=crlf
+*.props     text
+*.targets   text
+*.json      text
+*.md        text
+*.yml       text
+*.yaml      text
+*.py        text
+*.txt       text
+*.h         text diff=cpp
+*.hpp       text diff=cpp
+*.c         text diff=cpp
+*.cpp       text diff=cpp
+*.cmake     text
+CMakeLists.txt text
+
+# Binary: never diffed, never munged.
+*.pdf   binary
+*.zip   binary
+*.dll   binary
+*.exe   binary
+*.lib   binary
+*.pdb   binary
+*.so    binary
+*.dylib binary
+*.wav   binary
+*.flac  binary
+*.mp3   binary
+*.ogg   binary
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.onnx  binary
+*.ckpt  binary
+*.nupkg binary
+*.snupkg binary
+
+# NOTE: the tree is NOT renormalised in the change that added this file — a
+# whole-repo `git add --renormalize .` collides with every branch in flight.
+# Run it as its own follow-up commit, on a quiet tree:
+#
+#     git add --renormalize .
+#     git commit -m "chore: renormalise line endings to LF"

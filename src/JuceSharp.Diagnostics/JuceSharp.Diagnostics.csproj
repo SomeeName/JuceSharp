@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <RootNamespace>JuceSharp.Diagnostics</RootNamespace>
+        <AssemblyName>juce-stems-diag</AssemblyName>
+        <!--
+            Shipped as a `dotnet tool`: install it globally as
+            JuceSharp.Diagnostics and run `juce-stems-diag` with the probe
+            flag. QA and on-site debugging need this without a checkout of the
+            repo it lives in.
+        -->
+        <PackageId>JuceSharp.Diagnostics</PackageId>
+        <PackAsTool>true</PackAsTool>
+        <ToolCommandName>juce-stems-diag</ToolCommandName>
+        <PackageTags>$(PackageTags);cli;dotnet-tool;diagnostics</PackageTags>
+        <!--
+            NO SYMBOL PACKAGE (W5-P5). Directory.Build.props turns on
+            IncludeSymbols + SymbolPackageFormat=snupkg for the LIBRARY packages,
+            which is right for them and wrong here: a `.snupkg` may only contain
+            PDBs under `lib/` and `runtimes/`, and a tool package's payload lives
+            under `tools/net10.0/any/`.
+
+            MEASURED, not guessed — `dotnet pack` on this project succeeds and
+            produces a 283 KB snupkg whose entire contents are
+            `tools/net10.0/any/*.pdb`. It is nuget.org's SYMBOL SERVER that
+            rejects that layout, i.e. the failure is at PUSH time, long after a
+            green build, and the audit could not settle it from the XML alone.
+            Nothing is lost by switching it off: PackAsTool already ships those
+            same three PDBs INSIDE the tool package.
+        -->
+        <IncludeSymbols>false</IncludeSymbols>
+        <Description>Headless CLI utility for running an end-to-end JuceSharp stem separation. Useful for QA, benchmarking and on-site debugging without spinning up the DotCharter UI.</Description>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\JuceSharp.StemSeparation\JuceSharp.StemSeparation.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="JuceSharp.Tests" />
+    </ItemGroup>
+
+</Project>

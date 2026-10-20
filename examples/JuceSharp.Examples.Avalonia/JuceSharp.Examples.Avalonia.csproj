@@ -1,0 +1,64 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <OutputType>WinExe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <RootNamespace>JuceSharp.Examples.AvaloniaDemo</RootNamespace>
+        <AssemblyName>JuceSharp.Examples.Avalonia</AssemblyName>
+        <ApplicationManifest>app.manifest</ApplicationManifest>
+        <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Avalonia" Version="12.1.4" />
+        <PackageReference Include="Avalonia.Desktop" Version="12.1.4" />
+        <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.4" />
+        <PackageReference Include="Avalonia.Fonts.Inter" Version="12.1.4" />
+        <PackageReference Include="CommunityToolkit.Mvvm" Version="8.4.2" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\src\JuceSharp\JuceSharp.csproj" />
+        <ProjectReference Include="..\..\src\JuceSharp.AudioIo\JuceSharp.AudioIo.csproj" />
+        <ProjectReference Include="..\..\src\JuceSharp.Dsp\JuceSharp.Dsp.csproj" />
+    </ItemGroup>
+
+
+    <!--
+        Auto-rebuild the native juce_sharp.dll when its sources are newer than
+        the deployed copy, so launching the demo from Rider / dotnet run never
+        runs against a stale engine. Skipped entirely when no cmake can be found
+        (CI artifacts ship a prebuilt dll), and skipped incrementally (MSBuild
+        Inputs/Outputs) when the deployed dll is newer than every native source.
+
+        CMake is usually NOT on PATH on a Windows dev box: it is looked up in the
+        Visual Studio 2026 Build Tools, then CLion's bundled copy, then PATH.
+        Override with -p:CMakeExe=... ; disable with -p:SkipNativeJuceSharp=true.
+        The generator must match the installed toolchain — "Visual Studio 18 2026"
+        here (see JuceSharp/AGENTS.md § Native rebuild); override with -p:CMakeGenerator=... .
+    -->
+    <PropertyGroup>
+        <NativeRoot>$(MSBuildThisFileDirectory)..\..\src\JuceSharp.Native</NativeRoot>
+        <NativeBuildDir>$(NativeRoot)\build</NativeBuildDir>
+        <DeployedDll>$(MSBuildThisFileDirectory)..\..\src\JuceSharp\runtimes\win-x64\native\juce_sharp.dll</DeployedDll>
+        <CMakeGenerator Condition="'$(CMakeGenerator)' == ''">Visual Studio 18 2026</CMakeGenerator>
+        <CMakeExe Condition="'$(CMakeExe)' == '' And Exists('$(MSBuildProgramFiles32)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe')">$(MSBuildProgramFiles32)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe</CMakeExe>
+        <CMakeExe Condition="'$(CMakeExe)' == '' And Exists('$(LOCALAPPDATA)\Programs\CLion\bin\cmake\win\x64\bin\cmake.exe')">$(LOCALAPPDATA)\Programs\CLion\bin\cmake\win\x64\bin\cmake.exe</CMakeExe>
+        <CMakeExe Condition="'$(CMakeExe)' == '' And Exists('$(ProgramFiles)\CMake\bin\cmake.exe')">$(ProgramFiles)\CMake\bin\cmake.exe</CMakeExe>
+    </PropertyGroup>
+    <ItemGroup>
+        <NativeSources Include="$(NativeRoot)\src\**\*.cpp;$(NativeRoot)\src\**\*.h;$(NativeRoot)\include\**\*.h;$(NativeRoot)\CMakeLists.txt" />
+    </ItemGroup>
+    <Target Name="EnsureNativeJuceSharp" BeforeTargets="BeforeBuild"
+            Inputs="@(NativeSources)" Outputs="$(DeployedDll)"
+            Condition="'$(SkipNativeJuceSharp)' != 'true' And '$(OS)' == 'Windows_NT'">
+        <Message Importance="high" Text="EnsureNativeJuceSharp: no cmake found (set CMakeExe or put cmake on PATH); using the deployed juce_sharp.dll as is."
+                 Condition="'$(CMakeExe)' == ''" />
+        <Exec Command="&quot;$(CMakeExe)&quot; -S &quot;$(NativeRoot)&quot; -B &quot;$(NativeBuildDir)&quot; -G &quot;$(CMakeGenerator)&quot; -A x64"
+              Condition="'$(CMakeExe)' != '' And !Exists('$(NativeBuildDir)\juce_sharp.vcxproj')"
+              ContinueOnError="WarnAndContinue" />
+        <Exec Command="&quot;$(CMakeExe)&quot; --build &quot;$(NativeBuildDir)&quot; --config Release --target juce_sharp"
+              Condition="'$(CMakeExe)' != '' And Exists('$(NativeBuildDir)\juce_sharp.vcxproj')"
+              ContinueOnError="WarnAndContinue" />
+    </Target>
+</Project>

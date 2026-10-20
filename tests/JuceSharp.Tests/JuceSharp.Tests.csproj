@@ -1,0 +1,82 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <IsPackable>false</IsPackable>
+        <RootNamespace>JuceSharp.Tests</RootNamespace>
+        <AssemblyName>JuceSharp.Tests</AssemblyName>
+        <!-- Utf8InteropTests pokes the fixed byte buffers of the interop structs. -->
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!--
+            THE RUNNER CONFIGURATION IS A FILE THE RUNNER LOOKS FOR NEXT TO THE
+            ASSEMBLY, and nothing in the xunit.v3 build targets copies it there
+            (`xunit.v3.core.mtp-v2.targets` copies runner *dependencies* only).
+            Without this Content item the file sits in the project folder, the
+            in-proc console runner finds nothing, and every setting silently
+            reverts to the xunit.v3 default — which is how this suite ran 2,051
+            cases at ProcessorCount width with 42 device / child-process classes
+            in implicit per-class collections. A config that is not copied is
+            indistinguishable from no config at all, so `TestCollectionLintTests
+            .The_runner_configuration_ships_next_to_the_assembly` asserts the
+            file is in the output directory at run time.
+        -->
+        <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.10.1" />
+        <PackageReference Include="xunit.v3" Version="4.0.2" />
+        <PackageReference Include="xunit.runner.visualstudio" Version="4.0.1" />
+        <PackageReference Include="coverlet.collector" Version="10.1.0" />
+        <!--
+            CiWorkflowLintTests PARSES .github/workflows/*.yml. A substring lint
+            over CI YAML is worse than none: `permissions:` matches a comment
+            explaining why there is no permissions block, and an indentation
+            mistake that silently nests a key under the wrong job is invisible
+            to a regex and fatal on the runner. Test-only; the six packable
+            projects take no dependency on it.
+        -->
+        <PackageReference Include="YamlDotNet" Version="18.1.0" />
+        <!--
+            The managed .wem path DotCharter used before ABI v42 (Ww2Ogg.Core rebuilds
+            an Ogg, NVorbis decodes it) is the REFERENCE the native decoder is compared
+            against (Wem/WemDecoderTests, Wem/WemCorpusTests). Same versions as
+            DotCharter.Services. Test-only; no packable project takes them.
+        -->
+        <PackageReference Include="NVorbis" Version="0.10.5" />
+        <PackageReference Include="Ww2Ogg.Core" Version="1.0.0" />
+        <PackageReference Include="coverlet.msbuild" Version="10.1.0">
+            <PrivateAssets>all</PrivateAssets>
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+        </PackageReference>
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\..\src\JuceSharp\JuceSharp.csproj" />
+        <ProjectReference Include="..\..\src\JuceSharp.Dsp\JuceSharp.Dsp.csproj" />
+        <ProjectReference Include="..\..\src\JuceSharp.AudioIo\JuceSharp.AudioIo.csproj" />
+        <ProjectReference Include="..\..\src\JuceSharp.StemSeparation\JuceSharp.StemSeparation.csproj" />
+        <ProjectReference Include="..\..\src\JuceSharp.StemSeparation.Onnx\JuceSharp.StemSeparation.Onnx.csproj" />
+        <ProjectReference Include="..\..\src\JuceSharp.Diagnostics\JuceSharp.Diagnostics.csproj" />
+    </ItemGroup>
+
+    <!--
+        The native payload reaches this output through JuceSharp.csproj's
+        None items (PreserveNewest). That copy is skipped by MSBuild's
+        incremental check often enough that a C++-only rebuild left the test
+        host loading YESTERDAY's juce_sharp.dll (2026-09-12: 37 gear tests red
+        on main against a DLL whose fixes were already built). This target
+        copies the two native files unconditionally after every build, so the
+        DLL the tests load is always the one the last cmake build deployed.
+    -->
+    <Target Name="RefreshNativePayloadInTestOutput" AfterTargets="Build">
+        <ItemGroup>
+            <_NativePayload Include="../../src/JuceSharp/runtimes/win-x64/native/*.dll;../../src/JuceSharp/runtimes/win-x64/native/*.exe" />
+        </ItemGroup>
+        <Copy SourceFiles="@(_NativePayload)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="false" Retries="3" RetryDelayMilliseconds="500" ContinueOnError="true" />
+    </Target>
+
+</Project>

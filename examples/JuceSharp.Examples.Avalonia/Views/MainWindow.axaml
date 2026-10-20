@@ -1,0 +1,640 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:vm="using:JuceSharp.Examples.AvaloniaDemo.ViewModels"
+        xmlns:controls="using:JuceSharp.Examples.AvaloniaDemo.Controls"
+        x:Class="JuceSharp.Examples.AvaloniaDemo.Views.MainWindow"
+        x:DataType="vm:MainWindowViewModel"
+        Width="1280" Height="820" MinWidth="1100" MinHeight="700"
+        Title="JuceSharp — Avalonia Showcase"
+        Background="#0E1014"
+        FontSize="13">
+
+    <Window.Styles>
+        <Style Selector="TextBlock.Section">
+            <Setter Property="FontSize" Value="11"/>
+            <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Foreground" Value="#7A8088"/>
+            <Setter Property="Margin" Value="0,0,0,4"/>
+            <Setter Property="TextTrimming" Value="CharacterEllipsis"/>
+        </Style>
+        <Style Selector="TextBlock.Label">
+            <Setter Property="Foreground" Value="#B5BAC2"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="TextBlock.Value">
+            <Setter Property="Foreground" Value="#E8EAEE"/>
+            <Setter Property="FontFamily" Value="Consolas, Cascadia Mono, Menlo, monospace"/>
+            <Setter Property="VerticalAlignment" Value="Center"/>
+        </Style>
+        <Style Selector="Border.Card">
+            <Setter Property="Background" Value="#16181C"/>
+            <Setter Property="BorderBrush" Value="#23262C"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="CornerRadius" Value="6"/>
+            <Setter Property="Padding" Value="14"/>
+            <Setter Property="Margin" Value="6"/>
+        </Style>
+        <Style Selector="Button.Accent">
+            <Setter Property="Background" Value="#2A6CF4"/>
+            <Setter Property="Foreground" Value="White"/>
+            <Setter Property="Padding" Value="14,6"/>
+            <Setter Property="CornerRadius" Value="4"/>
+            <Setter Property="BorderThickness" Value="0"/>
+        </Style>
+        <Style Selector="Button.Accent:pointerover /template/ ContentPresenter">
+            <Setter Property="Background" Value="#3D7EFF"/>
+        </Style>
+        <Style Selector="Button.Ghost">
+            <Setter Property="Background" Value="Transparent"/>
+            <Setter Property="BorderBrush" Value="#33363B"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="10,5"/>
+            <Setter Property="CornerRadius" Value="4"/>
+            <Setter Property="Foreground" Value="#D5D9DF"/>
+        </Style>
+        <Style Selector="ToggleButton.Pill">
+            <Setter Property="Background" Value="#1F2228"/>
+            <Setter Property="BorderBrush" Value="#33363B"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="Padding" Value="10,5"/>
+            <Setter Property="CornerRadius" Value="14"/>
+            <Setter Property="Foreground" Value="#D5D9DF"/>
+        </Style>
+        <Style Selector="ToggleButton.Pill:checked /template/ ContentPresenter">
+            <Setter Property="Background" Value="#2A6CF4"/>
+        </Style>
+        <Style Selector="TabItem">
+            <Setter Property="FontSize" Value="13"/>
+            <Setter Property="Padding" Value="14,8"/>
+        </Style>
+    </Window.Styles>
+
+    <DockPanel LastChildFill="True">
+
+        <!-- ============================ HEADER ============================ -->
+        <Border DockPanel.Dock="Top" Background="#11141A" BorderBrush="#1B1E24" BorderThickness="0,0,0,1" Padding="16,10">
+            <Grid ColumnDefinitions="*,Auto">
+                <StackPanel Orientation="Horizontal" Spacing="14">
+                    <TextBlock Text="JuceSharp" FontSize="18" FontWeight="Bold" Foreground="#E8EAEE" VerticalAlignment="Center"/>
+                    <Border Background="#2A6CF4" CornerRadius="3" Padding="6,2" VerticalAlignment="Center">
+                        <TextBlock Text="Avalonia Showcase" FontSize="11" Foreground="White"/>
+                    </Border>
+                    <TextBlock Classes="Value" Text="{Binding EngineStatus, StringFormat='engine: {0}'}"/>
+                </StackPanel>
+                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <Button Classes="Ghost" Content="📂  Open audio…" Click="OnOpenFile"/>
+                    <TextBlock Classes="Value" Text="{Binding LoadedFile}" VerticalAlignment="Center"/>
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <!-- ============================ STATUS BAR ============================ -->
+        <Border DockPanel.Dock="Bottom" Background="#11141A" BorderBrush="#1B1E24" BorderThickness="0,1,0,0" Padding="12,4">
+            <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="18">
+                <TextBlock Classes="Value" Text="{Binding StatusLine}"/>
+                <TextBlock Grid.Column="1" Classes="Value" Foreground="#9AA3B2" Text="{Binding DropoutStatus}"
+                           ToolTip.Tip="ABI v30 dropout counters from the audio callback: late = audible; overruns = our callback overran its block; near-miss = load warning; driver = what the driver itself reports (n/a on WASAPI)"/>
+                <TextBlock Grid.Column="2" Classes="Value" Text="{Binding PositionDisplay, StringFormat='⏱ {0}'}"/>
+            </Grid>
+        </Border>
+
+        <!-- ============================ LOG STRIP ============================ -->
+        <Border DockPanel.Dock="Bottom" Background="#0B0D11" Height="120">
+            <DockPanel LastChildFill="True">
+                <Border DockPanel.Dock="Top" Background="#11141A" Padding="12,4">
+                    <TextBlock Text="Log" FontWeight="SemiBold" Foreground="#7A8088"/>
+                </Border>
+                <ScrollViewer>
+                    <ItemsControl ItemsSource="{Binding Log}">
+                        <ItemsControl.ItemTemplate>
+                            <DataTemplate>
+                                <TextBlock Text="{Binding}" Padding="12,1" Foreground="#B5BAC2"
+                                           FontFamily="Consolas, Cascadia Mono, Menlo, monospace"/>
+                            </DataTemplate>
+                        </ItemsControl.ItemTemplate>
+                    </ItemsControl>
+                </ScrollViewer>
+            </DockPanel>
+        </Border>
+
+        <!-- ============================ TABS ============================ -->
+        <TabControl Background="Transparent" Padding="6">
+
+            <!-- =================== DEVICE TAB =================== -->
+            <TabItem Header="Device">
+                <Grid ColumnDefinitions="*,*">
+
+                    <Border Classes="Card">
+                        <StackPanel Spacing="10">
+                            <TextBlock Classes="Section" Text="DRIVER &amp; ENGINE"/>
+                            <Grid ColumnDefinitions="160,*" RowDefinitions="Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto,Auto" RowSpacing="8" ColumnSpacing="10">
+                                <TextBlock Classes="Label" Text="Driver / mode"/>
+                                <ComboBox Grid.Column="1" ItemsSource="{Binding Drivers}" SelectedItem="{Binding SelectedDriver}" HorizontalAlignment="Stretch">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+DriverItem">
+                                            <TextBlock Text="{Binding Display}"/>
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+
+                                <TextBlock Grid.Row="1" Classes="Label" Text="Sample rate"/>
+                                <ComboBox Grid.Row="1" Grid.Column="1" SelectedItem="{Binding SampleRate}" HorizontalAlignment="Stretch">
+                                    <x:Int32>44100</x:Int32>
+                                    <x:Int32>48000</x:Int32>
+                                    <x:Int32>88200</x:Int32>
+                                    <x:Int32>96000</x:Int32>
+                                    <x:Int32>192000</x:Int32>
+                                </ComboBox>
+
+                                <TextBlock Grid.Row="2" Classes="Label" Text="Buffer frames"/>
+                                <ComboBox Grid.Row="2" Grid.Column="1" SelectedItem="{Binding BufferFrames}" HorizontalAlignment="Stretch">
+                                    <x:Int32>64</x:Int32>
+                                    <x:Int32>128</x:Int32>
+                                    <x:Int32>256</x:Int32>
+                                    <x:Int32>512</x:Int32>
+                                    <x:Int32>1024</x:Int32>
+                                    <x:Int32>2048</x:Int32>
+                                </ComboBox>
+
+                                <TextBlock Grid.Row="3" Classes="Label" Text="Output device"/>
+                                <ComboBox Grid.Row="3" Grid.Column="1" ItemsSource="{Binding OutputDevices}" SelectedItem="{Binding SelectedOutput}" HorizontalAlignment="Stretch">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+DeviceItem">
+                                            <TextBlock Text="{Binding Display}"/>
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+
+                                <TextBlock Grid.Row="4" Classes="Label" Text="Input device"/>
+                                <ComboBox Grid.Row="4" Grid.Column="1" ItemsSource="{Binding InputDevices}" SelectedItem="{Binding SelectedInput}" HorizontalAlignment="Stretch">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+DeviceItem">
+                                            <TextBlock Text="{Binding Display}"/>
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+
+                                <TextBlock Grid.Row="5" Classes="Label" Text="Input channel (DSP)"/>
+                                <StackPanel Grid.Row="5" Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                    <ComboBox Width="220" ItemsSource="{Binding InputChannels}" SelectedItem="{Binding SelectedInputChannel}">
+                                        <ComboBox.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:MainWindowViewModel+InputChannelItem">
+                                                <TextBlock Text="{Binding Display}"/>
+                                            </DataTemplate>
+                                        </ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                    <CheckBox Content="Live DSP from input (dry signal)" IsChecked="{Binding LiveDspFromInput}"/>
+                                </StackPanel>
+
+                                <TextBlock Grid.Row="6" Classes="Label" Text="Output channel layout"/>
+                                <ComboBox Grid.Row="6" Grid.Column="1" ItemsSource="{Binding ChannelModes}" SelectedItem="{Binding OutputChannelMode}" HorizontalAlignment="Stretch">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+ChannelModeItem">
+                                            <TextBlock Text="{Binding Display}"/>
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+
+                                <TextBlock Grid.Row="7" Classes="Label" Text="Input channel layout"/>
+                                <ComboBox Grid.Row="7" Grid.Column="1" ItemsSource="{Binding ChannelModes}" SelectedItem="{Binding InputChannelMode}" HorizontalAlignment="Stretch">
+                                    <ComboBox.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+ChannelModeItem">
+                                            <TextBlock Text="{Binding Display}"/>
+                                        </DataTemplate>
+                                    </ComboBox.ItemTemplate>
+                                </ComboBox>
+
+                                <StackPanel Grid.Row="8" Grid.Column="1" Orientation="Horizontal" Spacing="8">
+                                    <Button Classes="Accent" Content="Apply" Command="{Binding ApplyDeviceSettingsCommand}"/>
+                                    <Button Classes="Ghost"  Content="↻ Refresh" Command="{Binding RefreshDevicesCommand}"/>
+                                    <Button Classes="Ghost"  Content="(Re)start engine" Command="{Binding StartEngineCommand}"/>
+                                    <Button Classes="Ghost"  Content="ASIO panel…" Command="{Binding ShowAsioPanelCommand}"/>
+                                </StackPanel>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Grid.Column="1" Classes="Card">
+                        <StackPanel Spacing="6">
+                            <TextBlock Classes="Section" Text="DEVICE INVENTORY"/>
+                            <TextBlock Text="Outputs" FontWeight="SemiBold" Foreground="#E8EAEE" Margin="0,4,0,2"/>
+                            <ScrollViewer MaxHeight="220">
+                                <ItemsControl ItemsSource="{Binding OutputDevices}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+DeviceItem">
+                                            <TextBlock Classes="Value" Text="{Binding Display}" Padding="4,2"/>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </ScrollViewer>
+                            <TextBlock Text="Inputs" FontWeight="SemiBold" Foreground="#E8EAEE" Margin="0,8,0,2"/>
+                            <ScrollViewer MaxHeight="220">
+                                <ItemsControl ItemsSource="{Binding InputDevices}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+DeviceItem">
+                                            <TextBlock Classes="Value" Text="{Binding Display}" Padding="4,2"/>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </ScrollViewer>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- =================== PLAYER TAB =================== -->
+            <TabItem Header="Player">
+                <Grid ColumnDefinitions="2*,*">
+
+                    <DockPanel Grid.Column="0">
+                        <Border Classes="Card" DockPanel.Dock="Top">
+                            <StackPanel Spacing="10">
+                                <TextBlock Classes="Section" Text="WAVEFORM"/>
+                                <controls:WaveformDisplay Height="200"
+                                                          Mins="{Binding WaveformMins}"
+                                                          Maxs="{Binding WaveformMaxs}"
+                                                          PositionRatio="{Binding PositionSeconds}"
+                                                          LengthSeconds="{Binding LengthSeconds}"/>
+                                <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="10">
+                                    <TextBlock Classes="Value" Text="{Binding PositionDisplay}"/>
+                                    <Slider Grid.Column="1"
+                                            Minimum="0"
+                                            Maximum="{Binding LengthSeconds}"
+                                            Value="{Binding PositionSeconds, Mode=OneWay}"
+                                            PointerReleased="OnSeekReleased"/>
+                                    <TextBlock Grid.Column="2" Classes="Value" Text="{Binding LengthSeconds, StringFormat='/ {0:F2}s'}"/>
+                                </Grid>
+                                <StackPanel Orientation="Horizontal" Spacing="8">
+                                    <Button Classes="Accent" Content="▶  Play"  Command="{Binding PlayCommand}"/>
+                                    <Button Classes="Ghost"  Content="⏸  Pause" Command="{Binding PauseCommand}"/>
+                                    <Button Classes="Ghost"  Content="⏹  Stop"  Command="{Binding StopCommand}"/>
+                                    <Button Classes="Ghost"  Content="🥁 Click" Command="{Binding PlayClickCommand}"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Classes="Card">
+                            <StackPanel Spacing="10">
+                                <TextBlock Classes="Section" Text="SOURCE"/>
+                                <Grid ColumnDefinitions="120,*,80" RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="6" ColumnSpacing="8">
+                                    <TextBlock Classes="Label" Text="Volume"/>
+                                    <Slider Grid.Column="1" Minimum="0" Maximum="2" Value="{Binding Volume}"/>
+                                    <TextBlock Grid.Column="2" Classes="Value" Text="{Binding Volume, StringFormat='{}{0:F2}'}"/>
+
+                                    <TextBlock Grid.Row="1" Classes="Label" Text="Pan"/>
+                                    <Slider Grid.Row="1" Grid.Column="1" Minimum="-1" Maximum="1" Value="{Binding Pan}"/>
+                                    <TextBlock Grid.Row="1" Grid.Column="2" Classes="Value" Text="{Binding Pan, StringFormat='{}{0:+0.00;-0.00;0.00}'}"/>
+
+                                    <TextBlock Grid.Row="2" Classes="Label" Text="Tempo ×"/>
+                                    <Slider Grid.Row="2" Grid.Column="1" Minimum="0.25" Maximum="2.5" Value="{Binding TempoRatio}"/>
+                                    <TextBlock Grid.Row="2" Grid.Column="2" Classes="Value" Text="{Binding TempoRatio, StringFormat='{}{0:F2}×'}"/>
+
+                                    <TextBlock Grid.Row="3" Classes="Label" Text="Pitch (semitones)"/>
+                                    <Slider Grid.Row="3" Grid.Column="1" Minimum="-12" Maximum="12" TickFrequency="1" IsSnapToTickEnabled="True" Value="{Binding PitchSemitones}"/>
+                                    <TextBlock Grid.Row="3" Grid.Column="2" Classes="Value" Text="{Binding PitchSemitones, StringFormat='{}{0:+0;-0;0} st'}"/>
+                                </Grid>
+                                <StackPanel Orientation="Horizontal" Spacing="14">
+                                    <CheckBox Content="Mute" IsChecked="{Binding Mute}"/>
+                                    <CheckBox Content="Faster stretch (lower quality)" IsChecked="{Binding FasterStretch}"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </DockPanel>
+
+                    <DockPanel Grid.Column="1">
+                        <Border Classes="Card" DockPanel.Dock="Top">
+                            <StackPanel Spacing="8">
+                                <TextBlock Classes="Section" Text="A/B LOOP"/>
+                                <CheckBox Content="Loop enabled" IsChecked="{Binding LoopEnabled}"/>
+                                <Grid ColumnDefinitions="60,*" RowDefinitions="Auto,Auto" RowSpacing="6" ColumnSpacing="6">
+                                    <TextBlock Classes="Label" Text="Start"/>
+                                    <NumericUpDown Grid.Column="1" Minimum="0" Maximum="{Binding LengthSeconds}" Increment="0.5" Value="{Binding LoopStart}"/>
+                                    <TextBlock Grid.Row="1" Classes="Label" Text="End"/>
+                                    <NumericUpDown Grid.Row="1" Grid.Column="1" Minimum="0" Maximum="{Binding LengthSeconds}" Increment="0.5" Value="{Binding LoopEnd}"/>
+                                </Grid>
+                                <Button Classes="Ghost" Content="💾 Export loop as WAV" Command="{Binding ExportSliceWavCommand}"/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Classes="Card">
+                            <StackPanel Spacing="10">
+                                <TextBlock Classes="Section" Text="MIXER &amp; INPUT"/>
+                                <Grid ColumnDefinitions="120,*,80" RowDefinitions="Auto,Auto,Auto" RowSpacing="6" ColumnSpacing="8">
+                                    <TextBlock Classes="Label" Text="Master"/>
+                                    <Slider Grid.Column="1" Minimum="0" Maximum="2" Value="{Binding MasterGain}"/>
+                                    <TextBlock Grid.Column="2" Classes="Value" Text="{Binding MasterGain, StringFormat='{}{0:F2}'}"/>
+
+                                    <TextBlock Grid.Row="1" Classes="Label" Text="Monitor"/>
+                                    <Slider Grid.Row="1" Grid.Column="1" Minimum="0" Maximum="2" Value="{Binding MonitorGain}"/>
+                                    <TextBlock Grid.Row="1" Grid.Column="2" Classes="Value" Text="{Binding MonitorGain, StringFormat='{}{0:F2}'}"/>
+
+                                    <TextBlock Grid.Row="2" Classes="Label" Text="Input"/>
+                                    <Slider Grid.Row="2" Grid.Column="1" Minimum="0" Maximum="4" Value="{Binding InputGain}"/>
+                                    <TextBlock Grid.Row="2" Grid.Column="2" Classes="Value" Text="{Binding InputGain, StringFormat='{}{0:F2}'}"/>
+                                </Grid>
+                                <TextBlock Classes="Label" Text="Live input peak"/>
+                                <ProgressBar Minimum="0" Maximum="1" Value="{Binding InputPeak}" Height="6" Foreground="#46E2A8"/>
+                            </StackPanel>
+                        </Border>
+                    </DockPanel>
+                </Grid>
+            </TabItem>
+
+            <!-- =================== LIVE DSP TAB =================== -->
+            <TabItem Header="Live DSP">
+                <Grid ColumnDefinitions="2*,*">
+
+                    <DockPanel Grid.Column="0">
+                        <Border Classes="Card" DockPanel.Dock="Top">
+                            <StackPanel Spacing="8">
+                                <TextBlock Classes="Section" Text="LIVE SPECTRUM (FFT @ playhead, log-spaced bars)"/>
+                                <controls:LiveSpectrumDisplay Height="260"
+                                                              Magnitudes="{Binding LiveSpectrum}"
+                                                              PeakHold="{Binding LiveSpectrumPeak}"/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Classes="Card">
+                            <StackPanel Spacing="8">
+                                <TextBlock Classes="Section" Text="CHROMATIC TUNER (YIN, monophonic)"/>
+                                <controls:TunerDisplay Height="170"
+                                                       Note="{Binding TunerNote}"
+                                                       Cents="{Binding TunerCents}"
+                                                       Frequency="{Binding TunerFreq}"
+                                                       HasReading="{Binding TunerHasReading}"/>
+                            </StackPanel>
+                        </Border>
+                    </DockPanel>
+
+                    <Border Grid.Column="1" Classes="Card">
+                        <StackPanel Spacing="10">
+                            <TextBlock Classes="Section" Text="BIQUAD FILTERS (input bus)"/>
+                            <TextBlock Classes="Label" Text="High-pass"/>
+                            <Grid ColumnDefinitions="50,*,70" RowDefinitions="Auto,Auto" RowSpacing="4" ColumnSpacing="6">
+                                <TextBlock Classes="Label" Text="Hz"/>
+                                <Slider Grid.Column="1" Minimum="20" Maximum="2000" Value="{Binding HpFreq}"/>
+                                <TextBlock Grid.Column="2" Classes="Value" Text="{Binding HpFreq, StringFormat='{}{0:F0}'}"/>
+                                <TextBlock Grid.Row="1" Classes="Label" Text="Q"/>
+                                <Slider Grid.Row="1" Grid.Column="1" Minimum="0.3" Maximum="6" Value="{Binding HpQ}"/>
+                                <TextBlock Grid.Row="1" Grid.Column="2" Classes="Value" Text="{Binding HpQ, StringFormat='{}{0:F2}'}"/>
+                            </Grid>
+
+                            <TextBlock Classes="Label" Text="Low-pass" Margin="0,10,0,0"/>
+                            <Grid ColumnDefinitions="50,*,70" RowDefinitions="Auto,Auto" RowSpacing="4" ColumnSpacing="6">
+                                <TextBlock Classes="Label" Text="Hz"/>
+                                <Slider Grid.Column="1" Minimum="500" Maximum="20000" Value="{Binding LpFreq}"/>
+                                <TextBlock Grid.Column="2" Classes="Value" Text="{Binding LpFreq, StringFormat='{}{0:F0}'}"/>
+                                <TextBlock Grid.Row="1" Classes="Label" Text="Q"/>
+                                <Slider Grid.Row="1" Grid.Column="1" Minimum="0.3" Maximum="6" Value="{Binding LpQ}"/>
+                                <TextBlock Grid.Row="1" Grid.Column="2" Classes="Value" Text="{Binding LpQ, StringFormat='{}{0:F2}'}"/>
+                            </Grid>
+
+                            <TextBlock Classes="Label" Text="Band-pass" Margin="0,10,0,0"/>
+                            <Grid ColumnDefinitions="50,*,70" RowDefinitions="Auto,Auto" RowSpacing="4" ColumnSpacing="6">
+                                <TextBlock Classes="Label" Text="Hz"/>
+                                <Slider Grid.Column="1" Minimum="80" Maximum="8000" Value="{Binding BpFreq}"/>
+                                <TextBlock Grid.Column="2" Classes="Value" Text="{Binding BpFreq, StringFormat='{}{0:F0}'}"/>
+                                <TextBlock Grid.Row="1" Classes="Label" Text="Q"/>
+                                <Slider Grid.Row="1" Grid.Column="1" Minimum="0.3" Maximum="10" Value="{Binding BpQ}"/>
+                                <TextBlock Grid.Row="1" Grid.Column="2" Classes="Value" Text="{Binding BpQ, StringFormat='{}{0:F2}'}"/>
+                            </Grid>
+                        </StackPanel>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- =================== TONE RIG TAB (ABI v24–v32) =================== -->
+            <TabItem Header="Tone Rig">
+                <Grid ColumnDefinitions="*,*">
+
+                    <Border Classes="Card">
+                        <DockPanel LastChildFill="True">
+                            <StackPanel DockPanel.Dock="Top" Spacing="8">
+                                <TextBlock Classes="Section" Text="CHAIN (input path, seat 0) — catalogue-driven, reorderable, crossfaded structure changes"/>
+                                <Grid ColumnDefinitions="*,Auto,Auto" ColumnSpacing="6">
+                                    <ComboBox ItemsSource="{Binding RigModules}" SelectedItem="{Binding SelectedRigModule}" HorizontalAlignment="Stretch">
+                                        <ComboBox.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:MainWindowViewModel+RigModuleItem">
+                                                <TextBlock Text="{Binding Display}"/>
+                                            </DataTemplate>
+                                        </ComboBox.ItemTemplate>
+                                    </ComboBox>
+                                    <Button Grid.Column="1" Classes="Accent" Content="Add" Command="{Binding AddRigNodeCommand}"
+                                            ToolTip.Tip="dca_engine_dsp_add_node_for_player — appended at full wet"/>
+                                    <Button Grid.Column="2" Classes="Ghost" Content="Add parked" Command="{Binding AddRigNodeParkedCommand}"
+                                            ToolTip.Tip="ABI v32 dca_engine_dsp_add_node_bypassed_for_player — appended at zero wet; set its params, then un-bypass to fade it in"/>
+                                </Grid>
+                                <StackPanel Orientation="Horizontal" Spacing="6">
+                                    <Button Classes="Ghost" Content="▲ Up"   Command="{Binding MoveRigNodeUpCommand}"/>
+                                    <Button Classes="Ghost" Content="▼ Down" Command="{Binding MoveRigNodeDownCommand}"/>
+                                    <Button Classes="Ghost" Content="Remove" Command="{Binding RemoveRigNodeCommand}"/>
+                                    <Button Classes="Ghost" Content="Clear"  Command="{Binding ClearRigCommand}"/>
+                                </StackPanel>
+                                <TextBlock Classes="Value" Text="{Binding RigStatus}"/>
+                            </StackPanel>
+
+                            <StackPanel DockPanel.Dock="Bottom" Spacing="6" Margin="0,10,0,0">
+                                <TextBlock Classes="Section" Text="DROPOUTS (ABI v30 callback counters)"/>
+                                <Grid ColumnDefinitions="*,Auto" ColumnSpacing="6">
+                                    <TextBlock Classes="Value" Text="{Binding DropoutStatus}" TextWrapping="Wrap"/>
+                                    <Button Grid.Column="1" Classes="Ghost" Content="Reset" Command="{Binding ResetXrunStatsCommand}"/>
+                                </Grid>
+                            </StackPanel>
+
+                            <ListBox ItemsSource="{Binding RigNodes}" SelectedItem="{Binding SelectedRigNode}" Margin="0,8,0,0" Background="#101216">
+                                <ListBox.ItemTemplate>
+                                    <DataTemplate x:DataType="vm:MainWindowViewModel+RigNodeItem">
+                                        <Grid ColumnDefinitions="Auto,*,Auto" RowDefinitions="Auto,Auto" ColumnSpacing="10" RowSpacing="3">
+                                            <ToggleButton Classes="Pill" Grid.RowSpan="2" VerticalAlignment="Center"
+                                                          IsChecked="{Binding Bypassed}" Content="bypass"
+                                                          ToolTip.Tip="dca_engine_dsp_set_bypass — 10 ms crossfade by the chain, never by the module"/>
+                                            <TextBlock Grid.Column="1" Classes="Label" Text="{Binding Display}" FontWeight="SemiBold"/>
+                                            <TextBlock Grid.Column="2" Classes="Value" Text="{Binding MeterText}"/>
+                                            <ProgressBar Grid.Row="1" Grid.Column="1" Minimum="0" Maximum="1" Value="{Binding InLevel}"  Height="4" Foreground="#4C8DFF"/>
+                                            <ProgressBar Grid.Row="1" Grid.Column="2" Minimum="0" Maximum="1" Value="{Binding OutLevel}" Height="4" Width="160" Foreground="#4CC38A"/>
+                                        </Grid>
+                                    </DataTemplate>
+                                </ListBox.ItemTemplate>
+                            </ListBox>
+                        </DockPanel>
+                    </Border>
+
+                    <Border Grid.Column="1" Classes="Card">
+                        <DockPanel LastChildFill="True">
+                            <StackPanel DockPanel.Dock="Top" Spacing="4">
+                                <TextBlock Classes="Section" Text="PARAMETERS OF THE SELECTED NODE (dca_dsp_module_param_info + labels + step)"/>
+                                <TextBlock Classes="Label" Text="{Binding SelectedRigNode.Display, FallbackValue='(select a node)'}"/>
+                            </StackPanel>
+                            <ScrollViewer>
+                                <ItemsControl ItemsSource="{Binding RigParams}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+RigParam">
+                                            <Grid ColumnDefinitions="2*,3*,110" Margin="0,3" ColumnSpacing="8">
+                                                <TextBlock Text="{Binding Name}" Classes="Label" TextTrimming="CharacterEllipsis"/>
+                                                <Slider Grid.Column="1" Minimum="{Binding Min}" Maximum="{Binding Max}" TickFrequency="{Binding Step}"
+                                                        IsSnapToTickEnabled="True" Value="{Binding Value}"/>
+                                                <TextBlock Grid.Column="2" Classes="Value" Text="{Binding Display}" TextTrimming="CharacterEllipsis"/>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </ScrollViewer>
+                        </DockPanel>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+            <!-- =================== ANALYSIS TAB =================== -->
+            <TabItem Header="Analysis">
+                <Grid ColumnDefinitions="2*,*">
+
+                    <DockPanel Grid.Column="0">
+                        <Border Classes="Card" DockPanel.Dock="Top">
+                            <StackPanel Spacing="8" Orientation="Horizontal">
+                                <Button Classes="Accent" Content="🔬 Run analysis" Command="{Binding RunAnalysisCommand}"
+                                        IsEnabled="{Binding !AnalysisRunning}"/>
+                                <ProgressBar IsIndeterminate="True" Width="160" Height="6" VerticalAlignment="Center"
+                                             IsVisible="{Binding AnalysisRunning}"/>
+                                <TextBlock Classes="Value" VerticalAlignment="Center" Text="{Binding Bpm, StringFormat='BPM: {0:F1}'}"/>
+                                <TextBlock Classes="Value" VerticalAlignment="Center" Text="{Binding BeatCount, StringFormat='Beats: {0}'}"/>
+                            </StackPanel>
+                        </Border>
+
+                        <Border Classes="Card">
+                            <StackPanel Spacing="6">
+                                <TextBlock Classes="Section" Text="SPECTROGRAM (STFT, 2048/512, dB)"/>
+                                <controls:SpectrogramDisplay Height="380"
+                                                             Spectrogram="{Binding Spectrogram}"
+                                                             PositionRatio="{Binding SpectrogramRatio}"/>
+                            </StackPanel>
+                        </Border>
+                    </DockPanel>
+
+                    <Grid Grid.Column="1" RowDefinitions="*,*">
+                        <Border Classes="Card">
+                            <DockPanel LastChildFill="True">
+                                <TextBlock DockPanel.Dock="Top" Classes="Section" Text="DETECTED BEATS"/>
+                                <Grid DockPanel.Dock="Top" ColumnDefinitions="50,*" Background="#0E1115">
+                                    <TextBlock Padding="6,3" Text="#"    Foreground="#7A8088" FontWeight="SemiBold"/>
+                                    <TextBlock Grid.Column="1" Padding="6,3" Text="Time" Foreground="#7A8088" FontWeight="SemiBold"/>
+                                </Grid>
+                                <ScrollViewer>
+                                    <ItemsControl ItemsSource="{Binding BeatTimeline}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:MainWindowViewModel+BeatRow">
+                                                <Grid ColumnDefinitions="50,*">
+                                                    <TextBlock Padding="6,2" Text="{Binding Index}" Classes="Value"/>
+                                                    <TextBlock Grid.Column="1" Padding="6,2" Text="{Binding Time}" Classes="Value"/>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </ScrollViewer>
+                            </DockPanel>
+                        </Border>
+
+                        <Border Grid.Row="1" Classes="Card">
+                            <DockPanel LastChildFill="True">
+                                <TextBlock DockPanel.Dock="Top" Classes="Section" Text="DETECTED CHORDS (1s windows)"/>
+                                <Grid DockPanel.Dock="Top" ColumnDefinitions="80,80,*" Background="#0E1115">
+                                    <TextBlock Padding="6,3" Text="Time"  Foreground="#7A8088" FontWeight="SemiBold"/>
+                                    <TextBlock Grid.Column="1" Padding="6,3" Text="Chord" Foreground="#7A8088" FontWeight="SemiBold"/>
+                                    <TextBlock Grid.Column="2" Padding="6,3" Text="Conf." Foreground="#7A8088" FontWeight="SemiBold"/>
+                                </Grid>
+                                <ScrollViewer>
+                                    <ItemsControl ItemsSource="{Binding ChordTimeline}">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="vm:MainWindowViewModel+ChordRow">
+                                                <Grid ColumnDefinitions="80,80,*">
+                                                    <TextBlock Padding="6,2" Text="{Binding Time}"  Classes="Value"/>
+                                                    <TextBlock Grid.Column="1" Padding="6,2" Text="{Binding Chord}" Classes="Value"/>
+                                                    <TextBlock Grid.Column="2" Padding="6,2" Text="{Binding Confidence, StringFormat={}{0:F2}}" Classes="Value"/>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </ScrollViewer>
+                            </DockPanel>
+                        </Border>
+                    </Grid>
+                </Grid>
+            </TabItem>
+
+            <!-- =================== VST3 TAB =================== -->
+            <TabItem Header="VST3">
+                <Grid ColumnDefinitions="*,*">
+                    <Border Classes="Card">
+                        <StackPanel Spacing="10">
+                            <TextBlock Classes="Section" Text="PLUGIN"/>
+                            <StackPanel Orientation="Horizontal" Spacing="8">
+                                <Button Classes="Accent" Content="📂  Load VST3…" Click="OnLoadPlugin"/>
+                                <Button Classes="Ghost" Content="🗙 Unload"     Command="{Binding UnloadPluginCommand}"/>
+                                <Button Classes="Ghost" Content="👁 Show editor" Command="{Binding ShowPluginEditorCommand}"/>
+                                <Button Classes="Ghost" Content="Hide editor"   Command="{Binding HidePluginEditorCommand}"/>
+                                <Button Classes="Ghost" Content="🔍 Scan VST3 paths" Command="{Binding ScanVst3Command}"/>
+                            </StackPanel>
+                            <TextBlock Classes="Value" Text="{Binding PluginStatus}"/>
+                            <StackPanel Orientation="Horizontal" Spacing="12">
+                                <CheckBox Content="Bypass" IsChecked="{Binding PluginBypass}"/>
+                                <CheckBox Content="Route as instrument (MIDI)" IsChecked="{Binding PluginAsInstrument}"/>
+                            </StackPanel>
+
+                            <TextBlock Classes="Section" Text="DISCOVERED VST3" Margin="0,8,0,0"/>
+                            <ScrollViewer MaxHeight="160">
+                                <ItemsControl ItemsSource="{Binding Vst3Plugins}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+Vst3Item">
+                                            <Button Classes="Ghost" HorizontalAlignment="Stretch"
+                                                    HorizontalContentAlignment="Left"
+                                                    Margin="0,1"
+                                                    Content="{Binding Display}"
+                                                    Click="OnLoadPluginFromList"
+                                                    Tag="{Binding Path}"/>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </ScrollViewer>
+
+                            <TextBlock Classes="Section" Text="MIDI KEYBOARD (octave 4)" Margin="0,8,0,0"/>
+                            <UniformGrid Columns="12" Rows="1">
+                                <Button Classes="Ghost" Content="C"  Command="{Binding SendMidiNoteCommand}" CommandParameter="60"/>
+                                <Button Classes="Ghost" Content="C#" Command="{Binding SendMidiNoteCommand}" CommandParameter="61"/>
+                                <Button Classes="Ghost" Content="D"  Command="{Binding SendMidiNoteCommand}" CommandParameter="62"/>
+                                <Button Classes="Ghost" Content="D#" Command="{Binding SendMidiNoteCommand}" CommandParameter="63"/>
+                                <Button Classes="Ghost" Content="E"  Command="{Binding SendMidiNoteCommand}" CommandParameter="64"/>
+                                <Button Classes="Ghost" Content="F"  Command="{Binding SendMidiNoteCommand}" CommandParameter="65"/>
+                                <Button Classes="Ghost" Content="F#" Command="{Binding SendMidiNoteCommand}" CommandParameter="66"/>
+                                <Button Classes="Ghost" Content="G"  Command="{Binding SendMidiNoteCommand}" CommandParameter="67"/>
+                                <Button Classes="Ghost" Content="G#" Command="{Binding SendMidiNoteCommand}" CommandParameter="68"/>
+                                <Button Classes="Ghost" Content="A"  Command="{Binding SendMidiNoteCommand}" CommandParameter="69"/>
+                                <Button Classes="Ghost" Content="A#" Command="{Binding SendMidiNoteCommand}" CommandParameter="70"/>
+                                <Button Classes="Ghost" Content="B"  Command="{Binding SendMidiNoteCommand}" CommandParameter="71"/>
+                            </UniformGrid>
+                        </StackPanel>
+                    </Border>
+
+                    <Border Grid.Column="1" Classes="Card">
+                        <DockPanel LastChildFill="True">
+                            <TextBlock DockPanel.Dock="Top" Classes="Section" Text="PARAMETERS"/>
+                            <ScrollViewer>
+                                <ItemsControl ItemsSource="{Binding PluginParams}">
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate x:DataType="vm:MainWindowViewModel+PluginParam">
+                                            <Grid ColumnDefinitions="2*,3*,60" Margin="0,3" ColumnSpacing="8">
+                                                <TextBlock Text="{Binding Name}" Classes="Label" TextTrimming="CharacterEllipsis"/>
+                                                <Slider Grid.Column="1" Minimum="0" Maximum="1" Value="{Binding Value}"/>
+                                                <TextBlock Grid.Column="2" Classes="Value" Text="{Binding Value, StringFormat='{}{0:F2}'}"/>
+                                            </Grid>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </ScrollViewer>
+                        </DockPanel>
+                    </Border>
+                </Grid>
+            </TabItem>
+
+        </TabControl>
+
+    </DockPanel>
+</Window>
