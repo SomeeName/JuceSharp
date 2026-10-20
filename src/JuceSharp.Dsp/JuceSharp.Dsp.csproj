@@ -1,0 +1,41 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <RootNamespace>JuceSharp.Dsp</RootNamespace>
+        <AssemblyName>JuceSharp.Dsp</AssemblyName>
+        <Description>Pure-managed DSP utilities for JuceSharp: FFT, beat/chord/chroma detection, chromatic tuner. No native engine dependency.</Description>
+        <PackageId>JuceSharp.Dsp</PackageId>
+        <!--
+            The ONE package in this repo that is honestly MIT.
+
+            It has no ProjectReference, no PackageReference, no P/Invoke and no
+            path to juce_sharp.dll, so none of JUCE's AGPLv3, Rubber Band's
+            GPLv2, the VST 3 SDK or the ASIO SDK reaches a consumer of this
+            package. The other five declare PackageLicenseFile instead (see
+            Directory.Build.props); a package may carry an expression or a file,
+            never both, so clearing the inherited file here is required rather
+            than tidy. Pinned by PackagingLintTests
+            .The_packages_that_carry_native_code_ship_the_third_party_licence.
+        -->
+        <PackageLicenseFile />
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <!--
+            OPTIMIZED IN EVERY CONFIGURATION. This is the live note detection's
+            per-block DSP, and a Debug build (JIT optimizations off, no SIMD
+            inlining) ran it at ~277 % of real time against ~40 % in Release
+            (30 s of audio through JuceGuitarAnalyzer + JuceConstantQ, measured
+            2026-09-29): a Debug app's detection fell further behind every tick
+            until the capture ring skipped whole seconds and almost every note
+            read as a miss. Breakpoints still bind; locals may be optimized away.
+        -->
+        <Optimize>true</Optimize>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="JuceSharp.Tests" />
+        <!-- Stft shares the one Hann-window implementation (Windows.Hann). -->
+        <InternalsVisibleTo Include="JuceSharp.StemSeparation.Onnx" />
+    </ItemGroup>
+
+</Project>

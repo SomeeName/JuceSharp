@@ -1,0 +1,5 @@
+build/
+out/
+cmake-build-*/
+third_party/ASIOSDK*/
+_deps/

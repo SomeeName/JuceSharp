@@ -1,0 +1,81 @@
+# Every mutex the audio thread is allowed to acquire, by DCA_RT_LOCK_GUARD site
+# name. The RT gate asserts the OBSERVED set across all scenarios is exactly
+# this set.
+#
+# Adding a lock to a callback path therefore fails the build with a diff, which
+# no allocation hook can do. Removing one fails too — so a site that genuinely
+# goes away must be deleted here in the same change, and a site that stops
+# being exercised means a scenario regressed, not that the lock is gone.
+#
+# ---------------------------------------------------------------------------
+# THE ONE LOCK CLASS THIS FILE CANNOT SEE: std::atomic_*(shared_ptr*)
+# ---------------------------------------------------------------------------
+# "the OBSERVED set is exactly this set" is only true for mutexes we WRAP. The
+# gate counts DCA_RT_LOCK_GUARD sites; a lock taken inside the standard library
+# is invisible to it, and there is one on the callback today.
+#
+# On the MSVC STL the free-function shared_ptr atomics are NOT lock-free —
+# atomic_is_lock_free(const shared_ptr<T>*) returns false and every one of
+# atomic_load/store/exchange_explicit constructs a `_Shared_ptr_spin_lock`,
+# which is a PROCESS-WIDE spin lock in the CRT (_Lock_shared_ptr_spin_lock).
+# The audio thread takes it at three sites:
+#
+#   AudioEngine.h    processInputChain   atomic_load_explicit(&inputChain_)
+#   dsp/DspChain.h   process             atomic_load_explicit(&order_)
+#   dsp/NamAmpModule process             atomic_load_explicit(&active_)
+#
+# ...and non-RT threads take the SAME global lock in DspChain::publishLocked
+# (every add/remove/move/bypass/branch edit), attach/detachInputPlugin, and the
+# namamp worker's model swap. The critical sections are a pointer copy plus a
+# refcount bump, so the stall is tens of nanoseconds and it has never shown up
+# in the callback-duration numbers — but it is a real lock on the RT path, it
+# is shared with every other user of shared_ptr atomics in the process, and
+# NOTHING here or in rt_baseline.txt will fail if a fourth site appears.
+#
+# So: adding another std::atomic_*(shared_ptr*) call to an audio-thread path
+# passes this gate silently. Don't. If the snapshot-swap pattern needs to grow,
+# raise it in review rather than trusting a green run. (C++20's
+# std::atomic<std::shared_ptr<T>> is lock-free-ish on MSVC via a split refcount
+# and would remove the site outright; this project is on C++17.)
+#
+# ABI v28 note: the first two of those three are now PER LIVE SEAT — the
+# callback walks `playerCount_` rigs, so it takes inputChain_[p] and each
+# chain's order_ once per live seat. At the default playerCount_ == 1 the count
+# is exactly what it was at v27, which is why this list is unchanged; at 2 it
+# doubles. The SITE NAMES below are unchanged (the mutexes became arrays, not
+# new sites), so the observed set the gate compares against is identical.
+#
+# ---------------------------------------------------------------------------
+# THE SECOND BLIND SPOT: LOCKS INSIDE JUCE (found the hard way, 2026-08-23)
+# ---------------------------------------------------------------------------
+# The note above is about the standard library. There is a third-party layer
+# with the same property, and it hid a REAL unbounded stall for as long as this
+# gate has existed.
+#
+# juce::BufferingAudioSource takes `callbackLock` in getNextAudioBlock (audio
+# thread) AND in readBufferSection (its read-ahead thread) -- and the read-ahead
+# side calls the reader's getNextAudioBlock, i.e. a disk read plus an Opus/Vorbis
+# decode, while holding it. So the callback waited on a decode. The owner's
+# 2026-08-23 session logged 22 deadline overruns in 11,030 callbacks with the rig
+# at 3-5% of block budget and one callback at 503 ms.
+#
+# Every scenario here was green throughout, because the gate counts
+# DCA_RT_LOCK_GUARD sites and that lock is inside JUCE.
+#
+# Fixed by not using BufferingAudioSource: TransportSource decodes into RAM and
+# plays through juce::MemoryAudioSource (see wireReaderToTransport), which is a
+# copyFrom loop with no lock. RtPreloadedSourceAvoidsTheReadAheadLock pins it.
+#
+# The lesson for the next reader: "the observed set is exactly this set" is a
+# claim about OUR mutexes only. Any third-party source, sink or plugin wrapper
+# you put on the callback path can take a lock this file will never show you --
+# read its implementation before trusting a green run here.
+#
+# One name per line. Order is irrelevant.
+
+dspChain/processMutex            # in-house tone rig snapshot barrier (DspChain.h)
+inputChainProcessMutex           # VST3 input-chain detach barrier (AudioEngine.h)
+instrumentMutex                  # VSTi slot detach barrier (AudioEngine.cpp)
+remoteBridgeMutex/process        # sandbox round trip, input leg (AudioEngine.h)
+remoteBridgeMutex/instrument     # sandbox round trip, instrument leg (AudioEngine.h)
+stretcherMutex                   # per-source Rubber Band guard (RubberBandAudioSource.cpp)

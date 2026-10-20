@@ -1,0 +1,49 @@
+# Build artifacts
+[Bb]in/
+[Oo]bj/
+examples/publish/
+
+# `dotnet pack -o artifacts` — what the CI workflow uploads.
+artifacts/
+*.nupkg
+*.snupkg
+
+# CMake / native build
+src/JuceSharp.Native/build/
+src/JuceSharp.Native/out/
+
+# No Steinberg SDK is vendored: ASIO compiles against the headers JUCE (8.0.15+,
+# 9.0.3 today) bundles (GPLv3 / proprietary). src/JuceSharp.Native/.gitignore still ignores
+# third_party/ASIOSDK*/ so a local SDK copy is never committed by accident.
+
+# Deployed native binary (rebuilt locally; never committed)
+src/JuceSharp/runtimes/win-x64/native/*.dll
+src/JuceSharp/runtimes/win-x64/native/*.pdb
+src/JuceSharp/runtimes/win-x64/native/*.exe
+src/JuceSharp/runtimes/linux-x64/native/*.so
+src/JuceSharp/runtimes/osx-arm64/native/*.dylib
+src/JuceSharp/runtimes/osx-x64/native/*.dylib
+
+# IDE
+.vs/
+.idea/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Agent worktrees (orchestrated fixes)
+.claude/
+.codex/
+
+# Python bytecode (tools/voice/extract_excitations.py)
+__pycache__/
+
+# Coverage output (coverlet / dotnet-coverage) — it records absolute local paths.
+coverage/
+*.cobertura.xml
+coverage.*.xml
+*.coverage
+TestResults/

@@ -1,0 +1,21 @@
+{
+  "name": "docs",
+  "version": "1.0.0",
+  "description": "HonKit toolchain for the JuceSharp documentation site.",
+  "private": true,
+  "main": "index.js",
+  "scripts": {
+    "build": "honkit build",
+    "serve": "honkit serve"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "gitbook-plugin-anchors": "^0.7.1",
+    "gitbook-plugin-expandable-chapters": "^0.2.0",
+    "gitbook-plugin-hints": "^1.0.2",
+    "honkit": "^6.2.0"
+  }
+}

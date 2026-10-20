@@ -1,0 +1,28 @@
+<Project>
+
+    <!--
+        The licence FILE has to be in the package, not just named by it: NuGet
+        fails the pack (NU5030) if <PackageLicenseFile> points at nothing.
+
+        This lives in Directory.Build.targets rather than Directory.Build.props
+        on purpose. tests/ and examples/ set IsPackable=false in their OWN
+        Directory.Build.props, which imports the root one FIRST — so a condition
+        on IsPackable evaluated in the root .props reads the value before those
+        files have set it, and would add the item to every project in the tree.
+        A .targets file is imported after the project body, where IsPackable is
+        already settled.
+
+        JuceSharp.Dsp keeps the MIT expression (it links nothing native), so it
+        clears PackageLicenseFile and the item skips it — a package may declare
+        an expression or a file, never both (NU5035).
+    -->
+    <ItemGroup Condition="'$(IsPackable)' != 'false' and '$(PackageLicenseFile)' != ''">
+        <None Include="$(MSBuildThisFileDirectory)LICENSE"
+              Pack="true" PackagePath="\" Visible="false" />
+        <!-- LICENSE names each component; the copyright lines and licence
+             texts its binary-licence statement points at travel with it. -->
+        <None Include="$(MSBuildThisFileDirectory)THIRD-PARTY-NOTICES.md"
+              Pack="true" PackagePath="\" Visible="false" />
+    </ItemGroup>
+
+</Project>

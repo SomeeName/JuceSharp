@@ -1,0 +1,27 @@
+# RT gate baseline — the ONLY real-time violations allowed on the audio thread.
+#
+# One exact "KIND site" per line. NO WILDCARDS: a violation at a new site fails
+# the gate even when a similar one is already listed here. Every line needs a
+# "# why:" justifying it as architectural rather than fixable.
+#
+# KIND is one of ALLOC / REALLOC / FREE / WAIT.
+#   * ALLOC/REALLOC/FREE sites are the symbol (file:line) the allocation came
+#     from, as resolved by DbgHelp. There are none, and there should never be.
+#   * WAIT sites are the static names passed to DCA_RT_WAIT_SCOPE.
+#
+# Lock sites are NOT listed here — they are governed by rt_lock_sites.txt, so
+# that adding a lock to the callback fails with a diff rather than a count.
+
+WAIT bridge/responseWait   # why: the out-of-process VST sandbox is a
+# synchronous round trip by construction; the audio thread has to wait for the
+# child or pass audio through dry. Baselined as EXISTING, not as unbounded:
+# RtBridgeWaitIsBounded asserts p99 < one block budget with a healthy child and
+# that a wedged child stops costing the callback anything within 3 blocks. If
+# that assertion is ever relaxed, this line must be re-argued.
+#
+# NOTE it is no longer a kernel wait: the parent spins on responseSeq against a
+# QPC deadline (see RemoteVstBridge::process). A TIMED WaitForSingleObject
+# rounds up to the ~15.6 ms system timer tick, which is what made this a 20.5 ms
+# audio-thread stall (finding E-1). The site keeps its WAIT kind because it is
+# still a bounded stall the callback pays; it is just bounded by the block
+# budget now instead of by the scheduler's tick.

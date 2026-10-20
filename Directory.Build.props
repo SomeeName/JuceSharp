@@ -1,0 +1,162 @@
+<Project>
+
+    <!--
+        ONE place for the version and the package metadata.
+
+        Before this file existed, JuceSharp.csproj carried <Version>0.8.0</Version>
+        next to <AssemblyVersion>0.4.0.0</AssemblyVersion> — four releases apart,
+        so the binding identity of the shipped assembly disagreed with the package
+        it came in — and the four other packable projects (.Dsp, .AudioIo,
+        .StemSeparation, .StemSeparation.Onnx) declared a PackageId with NO
+        <Version> at all, which packs as 1.0.0. A consumer restoring
+        "JuceSharp 0.8.0" would have got "JuceSharp.Dsp 1.0.0" beside it.
+
+        AssemblyVersion is deliberately left to the SDK (which derives it from
+        <Version>), so there is nothing to forget to bump.
+
+        Keep this in step with src/JuceSharp.Native/CMakeLists.txt's project
+        VERSION — that one feeds dca_version_string(), so a disagreement makes
+        the DLL report a version the package does not have. PackagingLintTests
+        asserts they are equal (it used to pin the LITERAL 0.8.0, which turned
+        this bump red and taught the reader to revert it).
+    -->
+    <PropertyGroup>
+        <Version>1.0.0</Version>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <LangVersion>latest</LangVersion>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <Authors>JuceSharp contributors</Authors>
+        <Company>JuceSharp</Company>
+        <Copyright>Copyright (c) JuceSharp contributors</Copyright>
+        <!--
+            NOT `<PackageLicenseExpression>MIT</PackageLicenseExpression>`, which
+            is what every package here declared until 2026-09-11 and which was
+            not true of five of the six.
+
+            The MIT grant covers the managed wrapper SOURCE. Five of the six
+            packages carry, or transitively pull in, `juce_sharp.dll` — which
+            STATICALLY LINKS JUCE 9 (AGPLv3 or commercial), Rubber Band 4
+            (GPLv2 or commercial), the Steinberg VST 3 SDK (MIT) and ASIO SDK
+            headers (GPLv3 or proprietary) that JUCE bundles, plus NeuralAudio /
+            NAM Core / RTNeural / Eigen by default. A consumer reading "MIT" off
+            nuget.org was being told the opposite of the truth about the binary
+            they were about to redistribute.
+
+            `PackageLicenseFile` points at the repository LICENSE, whose
+            native-binaries statement names each linked component and the
+            terms its own project states. Directory.Build.targets packs that
+            file, and THIRD-PARTY-NOTICES.md beside it, into every packable
+            project.
+
+            THE ONE EXCEPTION is JuceSharp.Dsp: pure managed code, no
+            ProjectReference, no P/Invoke, nothing GPL anywhere near it. It
+            overrides this back to the MIT expression in its own csproj, and
+            PackagingLintTests pins both halves.
+        -->
+        <PackageLicenseFile>LICENSE</PackageLicenseFile>
+        <!--
+            The JuceSharp repo, NOT DotCharter. Every csproj pointed at
+            https://github.com/SomeeName/DotCharter, which is the CONSUMER of
+            this submodule — SourceLink would have resolved every source file
+            against the wrong repository.
+        -->
+        <RepositoryUrl>https://github.com/SomeeName/JuceSharp</RepositoryUrl>
+        <RepositoryType>git</RepositoryType>
+        <PackageProjectUrl>https://github.com/SomeeName/JuceSharp</PackageProjectUrl>
+        <PackageTags>juce;audio;asio;wasapi;vst3;dsp;stem-separation;demucs;low-latency;interop</PackageTags>
+    </PropertyGroup>
+
+    <!--
+        Static analysis.
+
+        These were ALL implicit before 2026-09-11. `EnableNETAnalyzers` defaults
+        to true for net5.0+ and `AnalysisLevel` defaults to the TARGET
+        FRAMEWORK, so the rule set that gates this repo moved on its own every
+        time the TFM or the SDK moved — and nothing stopped a project setting
+        `AnalysisMode=None` and going quiet. Declared, they are a decision.
+
+        MEASURED solution-wide (dotnet build -t:Rebuild, 2026-09-11, at
+        AnalysisLevel=latest), because the whole point is to pick the highest
+        level that is clean WITHOUT touching product code:
+
+            AnalysisMode=Default        0 warnings   <- chosen
+            AnalysisMode=Minimum      418
+            AnalysisMode=Recommended 2440
+            AnalysisMode=All         4226
+
+        Minimum is DIRTIER than Default: CA1512/CA1513/CA1510
+        (ArgumentOutOfRangeException.ThrowIf…) are off at Default and on at
+        Minimum. So "higher number = stricter" does not hold, and the next
+        person to raise this must re-measure rather than assume.
+
+        Per CATEGORY, two are clean at All and are therefore raised to it —
+        that is the real headroom, and it is free:
+
+            AnalysisModeDocumentation=All   0
+            AnalysisModeSingleFile=All      0
+            AnalysisModeMaintainability=All 128 (CA1515 x70, CA1512 x50, …)
+
+        TreatWarningsAsErrors: the whole solution builds with 0 warnings today,
+        including CS1591, so it is on EVERYWHERE and tests/examples do NOT opt
+        out. If that becomes a nuisance mid-iteration, use
+        `-p:TreatWarningsAsErrors=false` on the command line; do not weaken it
+        here. Pinned by PackagingLintTests.The_static_analysis_settings_are_declared.
+    -->
+    <PropertyGroup>
+        <EnableNETAnalyzers>true</EnableNETAnalyzers>
+        <!--
+            PINNED, NOT `latest` (W5-P1). `latest` is the one non-pinned value
+            the property takes: it resolves to whatever analyzer set the
+            INSTALLED SDK ships, and global.json's rollForward=latestFeature
+            explicitly permits a later 10.0.x feature band — which enables new CA
+            rules at AnalysisMode=Default. With TreatWarningsAsErrors=true and no
+            NoWarn anywhere, a newly enabled rule is a HARD ERROR in all 13
+            projects on a machine whose only sin was installing an SDK update.
+            The "0 warnings" measurement above is true of one SDK build; this pin
+            is what makes it true of every contributor's.
+            Raise the number deliberately, with the warning count re-measured.
+        -->
+        <AnalysisLevel>10.0</AnalysisLevel>
+        <AnalysisMode>Default</AnalysisMode>
+        <AnalysisModeDocumentation>All</AnalysisModeDocumentation>
+        <AnalysisModeSingleFile>All</AnalysisModeSingleFile>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    </PropertyGroup>
+
+    <!-- Reproducible builds + debuggable packages. -->
+    <PropertyGroup>
+        <Deterministic>true</Deterministic>
+        <ContinuousIntegrationBuild Condition="'$(GITHUB_ACTIONS)' == 'true'">true</ContinuousIntegrationBuild>
+        <EmbedUntrackedSources>true</EmbedUntrackedSources>
+        <PublishRepositoryUrl>true</PublishRepositoryUrl>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+    </PropertyGroup>
+
+    <!--
+        Library defaults. Overridden to false by the test project and by every
+        example (see Directory.Build.props under those folders), because a
+        sample app in the feed is noise and a test assembly in the feed is a
+        mistake.
+    -->
+    <PropertyGroup>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <!--
+            CS1591 (undocumented public member) is deliberately NOT suppressed.
+            Every public type and member in the six packable projects carries a
+            real XML doc comment, and PublicApiDocsLintTests fails the gate if a
+            suppression comes back, if a shipped .xml loses a member, or if a
+            summary degrades into a placeholder. Tests and examples set
+            GenerateDocumentationFile=false in their own Directory.Build.props,
+            so the warning never reaches them.
+
+            Removing this suppression surfaced 252 warnings across 42 files at
+            once (0.9). Do not put it back to make a build green: document the
+            member.
+        -->
+    </PropertyGroup>
+
+</Project>

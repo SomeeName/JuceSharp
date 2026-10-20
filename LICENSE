@@ -1,0 +1,70 @@
+MIT License
+
+Copyright (c) 2025 JuceSharp contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+--------------------------------------------------------------------------
+LICENCE OF THE NATIVE BINARIES (read before you redistribute)
+--------------------------------------------------------------------------
+
+The MIT grant above covers the JuceSharp source in this repository: the
+managed C# wrapper and the other managed projects, the examples, the tools,
+the tests, and the native C++ source we wrote. It does NOT make the native
+binaries MIT.
+
+Every build of the native library statically links JUCE 9: `juce_sharp.dll`
+(and `libjuce_sharp.so` / `.dylib` where built) links JUCE 9 and the Rubber
+Band Library, and the sandboxed VST3 host `juce_vst_host.exe` links JUCE 9.
+Such a build, and every
+NuGet package or application that carries one, is therefore distributed under
+the GNU Affero General Public License version 3 (AGPLv3, from JUCE 9) together
+with the GNU GPL terms of Rubber Band (GPLv2 or later) and of the ASIO SDK
+headers JUCE bundles (GPLv3), unless you hold commercial licences from JUCE
+Ltd., Particular Programs Ltd. (Rubber Band) and Steinberg. In practice: if
+you distribute the native library, you must offer its complete corresponding
+source under the AGPLv3. This repository at the commit you built, plus the
+pinned FetchContent dependencies its CMakeLists.txt downloads, is that source;
+docs/getting-started/building-native.md says how to rebuild it.
+
+Components linked into the native library (full notices, copyright lines and
+licence texts: THIRD-PARTY-NOTICES.md):
+
+* JUCE 9 (tag 9.0.3) -- AGPLv3 or the commercial JUCE 9 licence.
+* Rubber Band Library (tag v4.0.0) -- GPLv2 or later, or a commercial licence.
+* Steinberg VST 3 SDK 3.8.0 (bundled inside JUCE) -- MIT.
+* Steinberg ASIO SDK 2.3 headers (bundled inside JUCE) -- GPLv3 or the
+  proprietary Steinberg ASIO licence.
+* ww2ogg's Vorbis codebooks and header rebuild -- BSD-style.
+* NeuralAudio (MIT) with NAM Core (MIT), RTNeural (BSD-3-Clause), math_approx
+  (BSD-3-Clause), xsimd (BSD-3-Clause), nlohmann/json (MIT) and Eigen
+  (MPL-2.0) -- the neural amp capture module, on by default.
+* demucs.cpp (MIT) with Eigen (MPL-2.0) -- only when built with
+  -DDOTCHARTER_STEMS_DEMUCS_CPP=ON (off by default).
+
+The managed packages also reference Microsoft.ML.OnnxRuntime.DirectML (MIT)
+and DirectML (Microsoft's proprietary redistributable licence); see
+THIRD-PARTY-NOTICES.md for those, the sample data compiled into the DLL, the
+voice packs, and what the stem-separation backends download at run time.
+
+`JuceSharp.Dsp` alone is plain MIT: it contains no native code and references
+nothing.
+
+This statement is informational and is not legal advice. Verify the current
+terms with each vendor before you redistribute anything.

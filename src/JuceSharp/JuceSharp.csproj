@@ -1,0 +1,84 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <RootNamespace>JuceSharp</RootNamespace>
+        <AssemblyName>JuceSharp</AssemblyName>
+        <Description>Reusable managed (.NET) wrapper over the JuceSharp.Native JUCE-based audio engine DLL.</Description>
+        <PackageId>JuceSharp</PackageId>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.Extensions.Logging.Abstractions" Version="10.0.12" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!--
+            juce_sharp.dll and its out-of-process VST host child.
+
+            TWO delivery routes have to work, and only the first one did:
+
+            1. ProjectReference (DotCharter, the examples). <Link> flattens the
+               pair next to the consumer's exe and CopyToOutputDirectory flows
+               them transitively.
+            2. `dotnet pack`. This item had NO Pack attribute — and the
+               catch-all item below EXCLUDES *.dll/*.exe — so the produced
+               nupkg contained lib/net10.0/JuceSharp.dll, a README and nothing
+               else. Every P/Invoke in the package threw DllNotFoundException
+               at runtime. PackagePath puts them where NuGet's RID-asset
+               convention expects them.
+
+            The native binaries are BUILD ARTIFACTS (git-ignored, produced by
+            the CMake POST_BUILD step), so `dotnet pack` on a tree that has
+            never built the native side simply omits them. The guard,
+            PackagingLintTests.The_wrapper_packs_its_native_payload_and_still_copies_it_to_output,
+            reads THIS csproj, so it proves the Pack attribute is present and
+            NOT that the payload folder is non-empty — build native before
+            `dotnet pack`.
+        -->
+        <None Include="runtimes\win-x64\native\*.dll;runtimes\win-x64\native\*.exe"
+              CopyToOutputDirectory="PreserveNewest"
+              Pack="true" PackagePath="runtimes\win-x64\native\">
+            <Link>%(Filename)%(Extension)</Link>
+        </None>
+        <!--
+            PackagePath IS REQUIRED HERE (W5-P2). `Pack="true"` without one does
+            NOT preserve the on-disk layout: NuGet falls back to
+            ContentTargetFolders, so the file lands under `content/` /
+            `contentFiles/any/net10.0/` and is not a RID asset at all. `<Link>`
+            affects BUILD output only and never the package. Today the single
+            match is runtimes/README.txt — harmless but already in the wrong
+            place — and the item is a live trap: the moment the CMake POST_BUILD
+            step deploys a .pdb, a .json, a model blob or a vendor .lib beside
+            the DLL, it silently stops being co-located for every NuGet consumer
+            while continuing to work for every ProjectReference consumer in this
+            repo. %(RecursiveDir) keeps the sub-path under runtimes\.
+        -->
+        <None Include="runtimes\**\*.*"
+              Exclude="runtimes\win-x64\native\*.dll;runtimes\win-x64\native\*.exe;runtimes\**\.gitignore"
+              Pack="true" PackagePath="runtimes\%(RecursiveDir)"
+              CopyToOutputDirectory="PreserveNewest">
+            <Link>runtimes\%(RecursiveDir)%(Filename)%(Extension)</Link>
+        </None>
+        <None Include="README.md" Pack="true" PackagePath="\" Visible="false" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!--
+            These packages are SHIPPED and UNSIGNED, so every InternalsVisibleTo
+            here is a grant anyone can claim by naming their assembly — it is a
+            coupling, not a protection. Grant one only when a named assembly
+            demonstrably uses an internal member TODAY.
+
+            `DotCharter.Tests` was granted here and used nothing: every hit in
+            the consumer repo is either a comment or a SOURCE-TEXT lint that
+            reads NativeMethods.cs off disk (DropTuneNativeMirrorTests), which
+            needs no access at all. Removed 2026-09-11.
+        -->
+        <InternalsVisibleTo Include="JuceSharp.Tests" />
+        <InternalsVisibleTo Include="JuceSharp.AudioIo" />
+    </ItemGroup>
+
+</Project>

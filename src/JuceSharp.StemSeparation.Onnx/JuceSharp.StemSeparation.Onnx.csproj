@@ -1,0 +1,92 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <RootNamespace>JuceSharp.StemSeparation.Onnx</RootNamespace>
+        <AssemblyName>JuceSharp.StemSeparation.Onnx</AssemblyName>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <Description>In-process ONNX stem separation engine for the JuceSharp ecosystem. Wraps Microsoft.ML.OnnxRuntime and provides HTDemucs / MDX-Net / BS-RoFormer inference pipelines that run on DirectML, CUDA, or CPU. Reusable from any .NET project.</Description>
+        <PackageId>JuceSharp.StemSeparation.Onnx</PackageId>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <!--
+            Stem separation runs on the DirectML build of ONNX Runtime: one
+            onnxruntime.dll that drives any DirectX 12 GPU (NVIDIA, AMD, Intel)
+            and has the CPU provider built in. Only one onnxruntime.dll can sit
+            beside an exe, so this REPLACES the CUDA (Gpu) build; CUDA is gone.
+
+            Measured 2026-10-05 (htdemucs 6-stem, 224 s song, RTX 5070 Ti and
+            RTX 3080): DirectML separated in 22-37 s against CUDA's 36-49 s,
+            peaked at ~2.5 GB of video memory against CUDA's ~5.4 GB, needs no
+            990 MB CUDA/cuDNN download, and the native payload shrinks from
+            ~182 MB (onnxruntime + onnxruntime_providers_cuda) to ~35 MB
+            (onnxruntime + DirectML.dll).
+
+            1.24.4 is the LAST Microsoft.ML.OnnxRuntime.DirectML release (DirectML
+            is in maintenance; Windows ML succeeds it), so the managed API is pinned
+            there too - this package brings Microsoft.ML.OnnxRuntime.Managed 1.24.4.
+            Every DirectML session takes OnnxSessionFactory.ApplyDirectMlOptions:
+            with DirectML's graph fusion on, htdemucs returns garbage.
+        -->
+        <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
+        <!--
+            DirectML.dll itself. The package's own targets copy it only when
+            PlatformTarget is x64 and only into the project that references it
+            directly (build assets are not transitive), so an app that reaches this
+            library through a ProjectReference got onnxruntime.dll WITHOUT
+            DirectML.dll and fell back to the older copy in System32. The None item
+            below travels through every ProjectReference and into the NuGet package.
+        -->
+        <PackageReference Include="Microsoft.AI.DirectML" Version="1.15.4" GeneratePathProperty="true" />
+        <None Include="$(PkgMicrosoft_AI_DirectML)\bin\x64-win\DirectML.dll"
+              Link="DirectML.dll"
+              CopyToOutputDirectory="PreserveNewest"
+              Visible="false"
+              Pack="true"
+              PackagePath="runtimes\win-x64\native" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\JuceSharp.AudioIo\JuceSharp.AudioIo.csproj" />
+        <ProjectReference Include="..\JuceSharp.Dsp\JuceSharp.Dsp.csproj" />
+        <!--
+            Declared, not inherited. Both arrived transitively through AudioIo
+            before 0.9 while this project used types from each of them directly
+            (CoalescingProgressStream / ImmediateProgress from the core package,
+            VerifiedDownloader + PythonEnvManager's download pattern from the
+            sidecar one) — a reference change in AudioIo could therefore have
+            broken this project's compile.
+
+            The .StemSeparation edge is the notable one: this package now
+            depends on the python-sidecar package. It buys ONE downloader
+            implementation instead of two (see VerifiedDownloader's remarks on
+            why a second copy is the bug, not the duplication), and the sidecar
+            package is pure managed code with no python of its own until
+            PythonEnvManager is actually asked to bootstrap one.
+        -->
+        <ProjectReference Include="..\JuceSharp\JuceSharp.csproj" />
+        <ProjectReference Include="..\JuceSharp.StemSeparation\JuceSharp.StemSeparation.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="JuceSharp.Tests" />
+        <!--
+            DELIBERATE CONSUMER COUPLING, and the only one left in the repo.
+
+            DotCharter.Tests/Services/Audio/HtdemucsChunkScratchTests.cs
+            constructs the internal `HtdemucsChunkScratch` directly and asserts
+            over `StftWorkspace` — the scratch-buffer footprint of the ONNX
+            htdemucs path is a memory budget the consuming app owns, and there
+            is no public surface that exposes it. Keep the grant while that file
+            exists; a `dotnet build` of DotCharter.Tests is the only thing that
+            will tell you it stopped being true.
+
+            `DotCharter.Services` was granted alongside it and used nothing:
+            OnnxStemSeparationService constructs `OnnxStemSeparator` through its
+            PUBLIC five-argument constructor. Removed 2026-09-11.
+        -->
+        <InternalsVisibleTo Include="DotCharter.Tests" />
+    </ItemGroup>
+
+</Project>

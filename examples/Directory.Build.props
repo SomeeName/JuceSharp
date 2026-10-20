@@ -1,0 +1,12 @@
+<Project>
+
+    <Import Project="$([MSBuild]::GetPathOfFileAbove('Directory.Build.props', '$(MSBuildThisFileDirectory)../'))" />
+
+    <!-- Samples are documentation, not products: never packed, never doc'd. -->
+    <PropertyGroup>
+        <IsPackable>false</IsPackable>
+        <GenerateDocumentationFile>false</GenerateDocumentationFile>
+        <IncludeSymbols>false</IncludeSymbols>
+    </PropertyGroup>
+
+</Project>
