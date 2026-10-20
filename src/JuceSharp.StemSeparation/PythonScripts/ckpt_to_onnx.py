@@ -5,8 +5,13 @@ Handles the three real-world cases we see in the BS-RoFormer / MDX-Net
 ecosystem:
 
     1. The .ckpt file is a fully pickled torch.nn.Module — export directly.
-    2. The .ckpt file holds a state_dict and a sibling .yaml that names a
-       model class (e.g. bs_roformer.BSRoformer); instantiate and export.
+       Reading one needs a FULL unpickle, which runs code contained in the
+       file, so it happens only with --allow-unsafe-pickle (the host passes
+       that only after the user accepted the risk).
+    2. The .ckpt / .safetensors file holds a state_dict and a sibling .yaml
+       that names a model class (e.g. bs_roformer.BSRoformer); instantiate
+       and export. A .safetensors file is read without pickle; a .ckpt with
+       torch.load(weights_only=True), a real boundary on torch >= 2.6.
     3. Otherwise, fail with a clear instruction to run the upstream
        project-specific export_onnx.py from the training repository.
 
@@ -23,7 +28,56 @@ def _err(msg, code=2):
     sys.exit(code)
 
 
-def _load_ckpt(path):
+# CVE-2025-32434: torch.load(weights_only=True) could still run code before
+# torch 2.6.0, so on an older torch it is not treated as a boundary at all.
+_SAFE_TORCH = (2, 6)
+
+# stderr token the C# host maps to UnsafeCheckpointException
+# (CkptToOnnxConverter.UnsafePickleRefusedMarker).
+_UNSAFE_REFUSED = "UNSAFE_PICKLE_REFUSED"
+
+
+def _torch_at_least(torch, wanted):
+    parts = []
+    for piece in torch.__version__.split("+")[0].split(".")[:2]:
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        parts.append(int(digits or 0))
+    return tuple(parts) >= wanted
+
+
+def _load_ckpt(path, allow_unsafe_pickle=False):
+    if path.lower().endswith(".safetensors"):
+        from safetensors.torch import load_file
+        return load_file(path, device="cpu")
+
+    import torch
+    why = f"torch {torch.__version__} predates {_SAFE_TORCH[0]}.{_SAFE_TORCH[1]}"
+    if _torch_at_least(torch, _SAFE_TORCH):
+        try:
+            # No extra safe globals: the state_dict checkpoints this converter
+            # exports (case 2) are tensors in (Ordered)dicts, which the default
+            # weights-only allowlist already covers.
+            return torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as e:
+            why = f"{type(e).__name__}: {e}"
+
+    if not allow_unsafe_pickle:
+        _err(
+            f"{_UNSAFE_REFUSED}: this checkpoint cannot be read as plain weights "
+            f"({why}). Loading it would run code contained in the file, which "
+            f"was not allowed.",
+            9,
+        )
+    sys.stderr.write(
+        f"Warning: falling back to a FULL unpickle of '{path}' ({why}); "
+        f"allowed by --allow-unsafe-pickle.\n"
+    )
+    return _load_ckpt_full_pickle(path)
+
+
+def _load_ckpt_full_pickle(path):
+    # Runs code contained in the file. Reached only through _load_ckpt with
+    # --allow-unsafe-pickle, i.e. after the user accepted that risk.
     import torch
     return torch.load(path, map_location="cpu", weights_only=False)
 
@@ -119,6 +173,10 @@ def main():
     ap.add_argument("--ckpt", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--config", default=None)
+    ap.add_argument("--allow-unsafe-pickle", dest="allow_unsafe_pickle", action="store_true",
+                    help="Allow a full unpickle (runs code in the file) when a "
+                         "weights-only load fails. Pass only after the user "
+                         "accepted that risk.")
     args = ap.parse_args()
 
     try:
@@ -127,7 +185,7 @@ def main():
         _err(f"PyTorch is required: {e}", 3)
 
     try:
-        obj = _load_ckpt(args.ckpt)
+        obj = _load_ckpt(args.ckpt, args.allow_unsafe_pickle)
     except Exception as e:
         _err(f"Failed to load checkpoint: {e}", 5)
 

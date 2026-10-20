@@ -41,7 +41,27 @@ public sealed class CkptToOnnxConverter
         PythonPackagePins.PyYaml,
         PythonPackagePins.Onnx,
         PythonPackagePins.BsRoformer,
+        PythonPackagePins.SafeTensors,
     };
+
+    /// <summary>
+    /// The token <c>ckpt_to_onnx.py</c> writes to stderr when a checkpoint
+    /// would need a full unpickle and <see cref="AllowUnsafePickleFallback"/>
+    /// was not set. <see cref="ConvertAsync"/> maps it to
+    /// <see cref="UnsafeCheckpointException"/>.
+    /// </summary>
+    public const string UnsafePickleRefusedMarker = "UNSAFE_PICKLE_REFUSED";
+
+    /// <summary>
+    /// A <c>.ckpt</c> / <c>.pt</c> / <c>.pth</c> is a pickle, and unpickling
+    /// runs whatever code the file names. The script always tries
+    /// <c>torch.load(weights_only=True)</c> first (a real boundary on the
+    /// pinned torch 2.6+) and loads <c>.safetensors</c> without pickle at
+    /// all. Only when this is <c>true</c> may it fall back to a FULL unpickle
+    /// — set it only after the user has explicitly accepted that the file can
+    /// run code on their machine. Default <c>false</c>.
+    /// </summary>
+    public bool AllowUnsafePickleFallback { get; init; }
 
     private readonly PythonEnvManager _env;
     private readonly ILogger _logger;
@@ -161,6 +181,8 @@ public sealed class CkptToOnnxConverter
             argumentList.Add("--config");
             argumentList.Add(yamlPath);
         }
+        if (AllowUnsafePickleFallback)
+            argumentList.Add("--allow-unsafe-pickle");
 
         bool ok;
         string stdout, stderr;
@@ -180,6 +202,10 @@ public sealed class CkptToOnnxConverter
         {
             TryDelete(tmp);
             _logger.LogError("ckpt→onnx conversion failed. stdout:\n{Stdout}\nstderr:\n{Stderr}", stdout, stderr);
+            if (stderr.Contains(UnsafePickleRefusedMarker, StringComparison.Ordinal))
+                throw new UnsafeCheckpointException(
+                    $"'{Path.GetFileName(ckptPath)}' cannot be read as plain weights, and loading it fully " +
+                    "would run code contained in the file, which was not allowed.");
             throw new InvalidOperationException(
                 $"Conversion of '{Path.GetFileName(ckptPath)}' failed. stderr: {Truncate(stderr, 600)}");
         }

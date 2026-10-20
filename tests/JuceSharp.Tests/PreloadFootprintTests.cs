@@ -45,7 +45,15 @@ public sealed class PreloadFootprintTests
     public void AMemoryOpenedSong_IsHeldAsSixteenBitPcm()
     {
         var logger = new CapturingLogger();
-        using var engine = new JuceAudioEngine(new JuceEngineConfig { EnableNullDevice = true }, logger);
+        // ON the Null device at 48 kHz, not merely with it registered: the held
+        // length follows the DEVICE rate, and a default device at 44.1 kHz (a CI
+        // runner's virtual cable) resamples the song down to 3.4 MB.
+        using var engine = new JuceAudioEngine(new JuceEngineConfig
+        {
+            EnableNullDevice = true,
+            OutputTypeName = "Null",
+            SampleRate = Rate,
+        }, logger);
         using var source = engine.OpenMemory(StereoWav(), "wav");
 
         var line = logger.Records.Select(r => r.Message)
@@ -56,8 +64,7 @@ public sealed class PreloadFootprintTests
 
         var mb = double.Parse(Regex.Match(line!, @"preloaded into RAM \(([0-9.]+) MB\)").Groups[1].Value,
             CultureInfo.InvariantCulture);
-        // Held at the device rate: the null device may run at 44.1 or 48 kHz,
-        // and a 48 kHz file is never DOWN-sampled, so the held length is the file's.
+        // Held at the device rate, which is pinned to the file's 48 kHz above.
         var int16Mb = (double)Rate * Seconds * 2 * sizeof(short) / (1024 * 1024);
         Assert.True(Math.Abs(mb - int16Mb) <= 0.1,
             $"a 20 s 48 kHz stereo song is held as {mb} MB; 16-bit PCM is {int16Mb:0.0} MB and float32 "

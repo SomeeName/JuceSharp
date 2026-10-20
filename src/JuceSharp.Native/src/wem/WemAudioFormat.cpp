@@ -45,7 +45,7 @@ class WemAudioFormatReader final : public juce::AudioFormatReader
 {
 public:
     WemAudioFormatReader(juce::InputStream* stream, std::unique_ptr<WemVorbisDecoder> decoder)
-        : juce::AudioFormatReader(stream, "Wwise Vorbis (WEM)"), decoder_(std::move(decoder))
+        : juce::AudioFormatReader(stream, kWemFormatName), decoder_(std::move(decoder))
     {
         const auto& info = decoder_->info();
         sampleRate = info.sampleRate;
@@ -86,7 +86,7 @@ private:
 
 } // namespace
 
-WemAudioFormat::WemAudioFormat() : juce::AudioFormat("Wwise Vorbis (WEM)", ".wem") {}
+WemAudioFormat::WemAudioFormat() : juce::AudioFormat(kWemFormatName, ".wem") {}
 WemAudioFormat::~WemAudioFormat() = default;
 
 juce::AudioFormatReader* WemAudioFormat::createReaderFor(juce::InputStream* sourceStream,
@@ -107,17 +107,22 @@ juce::AudioFormatReader* WemAudioFormat::createReaderFor(juce::InputStream* sour
         return reject();
 
     sourceStream->setPosition(start);
+    // Capped BEFORE anything is buffered: a declared length over the cap is
+    // refused outright, and a stream that does not know its length is refused
+    // the moment it passes the cap.
+    const auto total = sourceStream->getTotalLength();
+    if (total > 0 && total - start > (juce::int64) kMaxWemBytes)
+        return reject();
     auto bytes = std::make_shared<std::vector<uint8_t>>();
     try
     {
-        const auto total = sourceStream->getTotalLength();
-        if (total > 0 && total - start < (juce::int64) 1 << 31)
-            bytes->reserve((size_t) (total - start));
+        if (total > 0) bytes->reserve((size_t) (total - start));
         uint8_t buf[65536];
         for (;;)
         {
             const int n = sourceStream->read(buf, (int) sizeof(buf));
             if (n <= 0) break;
+            if (bytes->size() + (size_t) n > kMaxWemBytes) return reject();
             bytes->insert(bytes->end(), buf, buf + n);
         }
     }

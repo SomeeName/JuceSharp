@@ -45,4 +45,15 @@ public:
 /// Cheap header sniff: a RIFF/RIFX WAVE whose fmt chunk says codec 0xFFFF.
 bool looksLikeWem(const void* data, size_t size);
 
+/// The format name every WEM reader reports (AudioFormatReader::getFormatName).
+inline constexpr const char* kWemFormatName = "Wwise Vorbis (WEM)";
+
+/// A WEM is decoded into memory on the load thread and NEVER streamed: its
+/// decoder allocates, and a streamed reader is decoded under the lock the audio
+/// callback takes (TransportSource::wireReaderToTransport).
+inline bool isWemReader(const juce::AudioFormatReader& reader)
+{
+    return reader.getFormatName() == kWemFormatName;
+}
+
 } // namespace dcwem

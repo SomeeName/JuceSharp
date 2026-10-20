@@ -49,7 +49,8 @@ public sealed partial class JuceAudioEngine
     ///     finite and non-negative, release at or after start, pitch in [0, 127];
     ///     every bend range must lie inside <paramref name="bends" />. A list that
     ///     breaks a rule is rejected WHOLE and the previous table stays. Both spans
-    ///     are copied (<c>dca_engine_chart_source_set_notes_for_player</c>).
+    ///     are copied (<c>dca_engine_chart_source_set_notes_for_player2</c>, which is
+    ///     also told the byte length of the notes, ABI v48).
     ///     Control thread; validating a long chart is a copy, never audio-thread work.
     /// </summary>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="player" /> is
@@ -69,9 +70,10 @@ public sealed partial class JuceAudioEngine
                 fixed (NativeMethods.DcaChartNote* pn = nativeNotes)
                 fixed (NativeMethods.DcaChartBendPoint* pb = nativeBends)
                 {
-                    Check(NativeMethods.EngineChartSourceSetNotesForPlayer(h, player, pn, nativeNotes.Length,
-                            Unsafe.SizeOf<NativeMethods.DcaChartNote>(), pb, nativeBends.Length),
-                        "dca_engine_chart_source_set_notes_for_player");
+                    var stride = Unsafe.SizeOf<NativeMethods.DcaChartNote>();
+                    Check(NativeMethods.EngineChartSourceSetNotesForPlayer2(h, player, pn, nativeNotes.Length,
+                            stride, (long)nativeNotes.Length * stride, pb, nativeBends.Length),
+                        "dca_engine_chart_source_set_notes_for_player2");
                 }
             }
         }

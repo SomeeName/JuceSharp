@@ -16,17 +16,18 @@ namespace JuceSharp.StemSeparation.Runtime;
 ///
 ///   1. <see cref="EnsureInterpreterAsync"/> downloads the
 ///      <c>python-3.11.x-embed-amd64.zip</c> Windows distribution
-///      (~10 MB) and unzips it, or — on non-Windows — falls back to the
-///      system <c>python3</c> on PATH (Linux/macOS embed builds aren't
-///      published by python.org, so for those platforms we still rely on
-///      a user-supplied interpreter).
+///      (~10 MB, pinned by SHA-256) and unzips it. There is no other
+///      platform: python.org publishes no embeddable build for Linux or
+///      macOS, and an interpreter found on PATH is whatever the PATH says,
+///      so elsewhere the bootstrap refuses rather than run one.
 ///   2. The embedded distribution ships with site-packages disabled by
 ///      default (the trimmed <c>python311._pth</c> excludes them); we
 ///      patch that file to re-enable them so <c>pip</c>-installed
 ///      packages are importable.
-///   3. <see cref="EnsurePipAsync"/> downloads <c>get-pip.py</c> and runs
-///      it against the embedded interpreter.
-///   4. <see cref="EnsurePackagesAsync"/> wraps <c>python -m pip install</c>.
+///   3. <see cref="EnsurePipAsync"/> downloads ONE pinned pip wheel,
+///      checks its SHA-256 and installs pip from it with no index.
+///   4. <see cref="EnsurePackagesAsync"/> installs the hash-locked package
+///      set (<see cref="PythonPackageLock"/>) with <c>--require-hashes</c>.
 ///
 /// All steps are idempotent and report progress so a UI can show
 /// "Downloading Python… / Installing torch…" toasts.
@@ -78,21 +79,38 @@ public sealed class PythonEnvManager
     public string? PythonEmbedSha256 { get; set; } = DefaultPythonEmbedSha256;
 
     /// <summary>
-    /// Optional expected SHA-256 for <c>get-pip.py</c>. python.org's
-    /// bootstrap host serves a per-Python-version pinned copy only for
-    /// END-OF-LIFE interpreters (<c>https://bootstrap.pypa.io/pip/3.6/get-pip.py</c>);
-    /// for a supported version such as 3.11 the only URL is the rolling
-    /// <c>https://bootstrap.pypa.io/pip/get-pip.py</c>, whose contents change
-    /// with every pip release, so there is nothing stable to pin.
-    /// Deployments that mirror a fixed copy SHOULD set this. When it is
-    /// null the bootstrap still runs, but the manager logs a warning saying
-    /// the script was executed unverified.
+    /// The pip wheel the bootstrap installs pip from, as published on PyPI.
+    /// <para>
+    /// This replaced <c>get-pip.py</c>, which had two holes no pin on the
+    /// script could close: the only URL for a supported interpreter is the
+    /// rolling <c>bootstrap.pypa.io/pip/get-pip.py</c>, and the script installs
+    /// the LATEST pip (and, for 3.11, setuptools and wheel) from PyPI with no
+    /// hash, so even a pinned copy ran an unpinned download. A wheel is one
+    /// immutable file: it is fetched here, checked against
+    /// <see cref="DefaultPipWheelSha256"/>, and pip installs itself from it
+    /// with <c>--no-index</c>.
+    /// </para>
     /// </summary>
-    public string? GetPipSha256 { get; set; }
+    public const string DefaultPipWheelUrl =
+        "https://files.pythonhosted.org/packages/f3/6e/1736e5b4ae2b778ef2f81c47d797de9f891d4d8acb047a24ca37a60294dd/pip-26.2.1-py3-none-any.whl";
 
-    /// <summary>URL the pip bootstrap script is fetched from. Override to
-    /// point at an internal mirror (pair it with <see cref="GetPipSha256"/>).</summary>
-    public string GetPipUrl { get; set; } = "https://bootstrap.pypa.io/pip/get-pip.py";
+    /// <summary>
+    /// SHA-256 of <see cref="DefaultPipWheelUrl"/>: the
+    /// <c>digests.sha256</c> PyPI's JSON API publishes for
+    /// <c>pip-26.2.1-py3-none-any.whl</c> (1,816,632 bytes), re-computed from
+    /// the downloaded file on 2026-10-20.
+    /// </summary>
+    public const string DefaultPipWheelSha256 =
+        "71138adf1f4ca900cdb7d289c21b7494329f2332b6d85f0e1c42108c0384ed3e";
+
+    /// <summary>URL of the pip wheel. Must be https (see
+    /// <see cref="VerifiedDownload.ValidateSourceUrl"/>) and name a
+    /// <c>.whl</c> file; pair a mirror with <see cref="PipWheelSha256"/>.</summary>
+    public string PipWheelUrl { get; set; } = DefaultPipWheelUrl;
+
+    /// <summary>Expected SHA-256 of <see cref="PipWheelUrl"/>. Required:
+    /// <see cref="EnsurePipAsync"/> refuses to run pip from an unpinned file.</summary>
+    public string PipWheelSha256 { get; set; } = DefaultPipWheelSha256;
 
     private readonly ILogger _logger;
 
@@ -202,18 +220,12 @@ public sealed class PythonEnvManager
 
         if (!OperatingSystem.IsWindows())
         {
-            // python.org doesn't publish "embeddable" zips for macOS/Linux.
-            // Fall back to a user-installed python3 so this manager is
-            // still useful cross-platform.
-            var sys = ResolveSystemPython3();
-            if (sys is null)
-                throw new InvalidOperationException(
-                    "On non-Windows platforms the embedded distribution is not available. " +
-                    "Install Python 3.10+ via your package manager (apt/brew/dnf) and ensure " +
-                    "python3 is on PATH.");
-            Executable = sys;
-            progress?.Report(new PythonInstallProgress("system", 1.0, $"Using system interpreter '{sys}'."));
-            return;
+            // python.org publishes no embeddable build for macOS/Linux, and the
+            // package lock is win_amd64 wheels. Running whatever `python3` the
+            // PATH resolves to would execute an interpreter nobody pinned.
+            throw new PlatformNotSupportedException(
+                "The embedded Python interpreter and its hash-locked packages exist for Windows only. " +
+                "On this platform the Python sidecar is not available.");
         }
 
         var version = DefaultPythonVersion;
@@ -297,10 +309,20 @@ public sealed class PythonEnvManager
         _logger.LogInformation("Embedded Python {Version} installed at {Root}.", version, Root);
     }
 
-    /// <summary>Downloads <c>get-pip.py</c> and runs it against the embedded
-    /// interpreter. Idempotent.</summary>
+    /// <summary>Downloads the pinned pip wheel, verifies it, and installs pip
+    /// from it with no package index. Idempotent.</summary>
+    /// <exception cref="ArgumentException"><see cref="PipWheelUrl"/> is not https
+    ///   or does not name a <c>.whl</c> file.</exception>
+    /// <exception cref="InvalidOperationException"><see cref="PipWheelSha256"/>
+    ///   is not a SHA-256, or the install failed.</exception>
+    /// <exception cref="InvalidDataException">The download did not match
+    ///   <see cref="PipWheelSha256"/>; nothing is executed.</exception>
     public async Task EnsurePipAsync(IProgress<PythonInstallProgress>? progress = null, CancellationToken ct = default)
     {
+        // Policy first, before any process or transfer: a bad URL or an
+        // unpinned wheel is a configuration error whatever state the root is in.
+        var wheelName = ValidatePipWheelSource(PipWheelUrl, PipWheelSha256);
+
         if (string.IsNullOrEmpty(Executable))
             await EnsureInterpreterAsync(progress, ct).ConfigureAwait(false);
 
@@ -313,27 +335,70 @@ public sealed class PythonEnvManager
         var (pipOkNow, _, _) = await Run(Executable, "-m pip --version", timeout: TimeSpan.FromSeconds(20), ct).ConfigureAwait(false);
         if (pipOkNow) { progress?.Report(new PythonInstallProgress("pip-ready", 1.0, "pip already installed.")); return; }
 
-        var getPip = Path.Combine(Root, "get-pip.py");
-        progress?.Report(new PythonInstallProgress("pip-download", 0.0, "Downloading get-pip.py…"));
-        if (string.IsNullOrWhiteSpace(GetPipSha256))
-            _logger.LogWarning(
-                "GetPipSha256 is not set — '{Url}' will be executed UNVERIFIED. " +
-                "pypa publishes no per-version pinned copy for Python {Version}; set GetPipSha256 " +
-                "(and optionally GetPipUrl) to pin a mirrored script.", GetPipUrl, DefaultPythonVersion);
-        await DownloadWithProgress(GetPipUrl, getPip, _ => { }, ct, GetPipSha256).ConfigureAwait(false);
+        var wheel = Path.Combine(Root, wheelName);
+        progress?.Report(new PythonInstallProgress("pip-download", 0.0, $"Downloading {wheelName}…"));
+        await DownloadWithProgress(PipWheelUrl, wheel, _ => { }, ct, PipWheelSha256.Trim()).ConfigureAwait(false);
         progress?.Report(new PythonInstallProgress("pip-install", 0.5, "Bootstrapping pip…"));
 
-        var (ok, stdout, stderr) = await Run(Executable, new[] { getPip, "--no-warn-script-location" },
+        var (ok, stdout, stderr) = await Run(Executable, BuildPipBootstrapArguments(wheel),
             timeout: TimeSpan.FromMinutes(5), ct).ConfigureAwait(false);
-        try { File.Delete(getPip); }
-        catch (Exception ex) { _logger.LogDebug(ex, "Could not delete temp get-pip.py at {Path}", getPip); }
+        try { File.Delete(wheel); }
+        catch (Exception ex) { _logger.LogDebug(ex, "Could not delete the pip wheel at {Path}", wheel); }
         if (!ok)
-            throw new InvalidOperationException($"get-pip.py failed.\nstdout: {stdout}\nstderr: {stderr}");
+            throw new InvalidOperationException($"The pip bootstrap failed.\nstdout: {stdout}\nstderr: {stderr}");
         progress?.Report(new PythonInstallProgress("pip-ready", 1.0, "pip installed."));
     }
 
     /// <summary>
-    /// Installs a pinned set of packages via <c>python -m pip install</c>.
+    /// The transport and pin rule for the pip wheel: https (loopback http for
+    /// tests, as everywhere), a <c>.whl</c> file name pip will accept, and a
+    /// SHA-256. Returns the wheel's file name.
+    /// </summary>
+    internal static string ValidatePipWheelSource(string? url, string? sha256)
+    {
+        VerifiedDownload.ValidateSourceUrl(url, "pip wheel", nameof(PipWheelUrl));
+        var name = Path.GetFileName(new Uri(url!).AbsolutePath);
+        if (string.IsNullOrEmpty(name) || !name.EndsWith(".whl", StringComparison.OrdinalIgnoreCase)
+            || name.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0)
+            throw new ArgumentException($"'{url}' does not name a pip wheel (*.whl).", nameof(PipWheelUrl));
+        var hash = sha256?.Trim() ?? string.Empty;
+        if (hash.Length != 64 || !hash.All(Uri.IsHexDigit))
+            throw new InvalidOperationException(
+                "PipWheelSha256 must be the 64-hex-digit SHA-256 of the pip wheel. The bootstrap never " +
+                "runs an unpinned pip.");
+        return name;
+    }
+
+    /// <summary>
+    /// The argv that installs pip from its own verified wheel. pip runs from
+    /// the wheel on <c>sys.path</c> (the way <c>get-pip.py</c> runs its bundled
+    /// copy) because pip refuses to modify itself when started as
+    /// <c>&lt;wheel&gt;/pip</c> on Windows. <c>--no-index --no-deps</c>: nothing
+    /// but the verified file is installed. The wheel path is its own argument,
+    /// never spliced into the code string.
+    /// </summary>
+    internal static IReadOnlyList<string> BuildPipBootstrapArguments(string wheel) =>
+    [
+        "-c",
+        "import sys; w = sys.argv[1]; sys.path.insert(0, w); " +
+        "from pip._internal.cli.main import main; " +
+        "sys.exit(main(['install', '--isolated', '--no-index', '--no-deps', " +
+        "'--no-warn-script-location', '--disable-pip-version-check', w]))",
+        wheel,
+    ];
+
+    /// <summary>
+    /// Installs the hash-locked package set (<see cref="PythonPackageLock"/>)
+    /// that covers <paramref name="packages"/>, via
+    /// <c>python -m pip install --require-hashes --no-deps -r &lt;lock&gt;</c>.
+    /// <para>
+    /// <b>Only pinned packages.</b> Every spec must be a
+    /// <see cref="PythonPackagePins"/> value: the lock was generated from those
+    /// and holds the hash of every wheel in their dependency closure, so pip
+    /// installs exactly those bytes or fails. A spec outside the lock has no
+    /// hash to install it by and is refused. The lock is Windows-only; any
+    /// other platform gets a <see cref="PlatformNotSupportedException"/>.
+    /// </para>
     /// <para>
     /// <b>The whole set is installed at most once per root.</b> Success is
     /// recorded as a stamp file whose name carries the SHA-256 of the exact
@@ -355,8 +420,17 @@ public sealed class PythonEnvManager
         IProgress<PythonInstallProgress>? progress = null,
         CancellationToken ct = default)
     {
-        var list = packages.Where(p => !string.IsNullOrWhiteSpace(p)).ToArray();
+        var list = packages.Where(p => !string.IsNullOrWhiteSpace(p)).Select(p => p.Trim()).ToArray();
         if (list.Length == 0) return;
+
+        var unlocked = list.Where(p => !PythonPackageLock.CoveredPins.Contains(p)).ToArray();
+        if (unlocked.Length > 0)
+            throw new InvalidOperationException(
+                $"[{string.Join(", ", unlocked)}] is not in the hash-locked package set, so there is no hash " +
+                "to install it by. Only PythonPackagePins values can be installed.");
+        if (!PythonPackageLock.CoversThisPlatform)
+            throw new PlatformNotSupportedException(
+                "The hash-locked package set covers Windows x64 only; packages are not installed on this platform.");
 
         var stamp = PackageSetStampPath(list);
         if (File.Exists(stamp) && StampStillDescribesTheEnvironment(stamp, list))
@@ -378,7 +452,11 @@ public sealed class PythonEnvManager
         }
 
         progress?.Report(new PythonInstallProgress("pip-install", 0.0, $"Installing: {string.Join(", ", list)}"));
-        var (ok, stdout, stderr) = await Run(Executable, BuildPipInstallArguments(list), timeout: TimeSpan.FromHours(1), ct).ConfigureAwait(false);
+        // Written under the gate, every time: a lock file a peer or a user left
+        // in the root is never what pip reads.
+        var lockPath = Path.Combine(Root, $"requirements-{PythonPackageLock.Digest}.lock");
+        await File.WriteAllTextAsync(lockPath, PythonPackageLock.Text, new UTF8Encoding(false), ct).ConfigureAwait(false);
+        var (ok, stdout, stderr) = await Run(Executable, BuildPipInstallArguments(lockPath), timeout: TimeSpan.FromHours(1), ct).ConfigureAwait(false);
         if (!ok)
             throw new InvalidOperationException(
                 $"pip install failed for [{string.Join(", ", list)}].\nstdout: {Truncate(stdout, 800)}\nstderr: {Truncate(stderr, 800)}");
@@ -405,25 +483,21 @@ public sealed class PythonEnvManager
 
     /// <summary>
     /// The exact argv handed to <c>python -m pip install</c>, one element per
-    /// argument, for <see cref="ProcessStartInfo.ArgumentList"/>. A package
-    /// spec is passed VERBATIM — a local wheel path with spaces, a quote or a
-    /// trailing backslash is escaped by the runtime, never by us. The previous
-    /// <c>"{pkg}"</c> string concatenation broke on the first embedded quote
-    /// and on any path ending in <c>\</c> (which escaped the closing quote).
+    /// argument, for <see cref="ProcessStartInfo.ArgumentList"/>.
+    /// <para>
+    /// <c>--require-hashes</c> makes every wheel prove its SHA-256;
+    /// <c>--no-deps</c> means nothing outside the lock is resolved;
+    /// <c>--only-binary :all:</c> means no sdist build script ever runs. The
+    /// lock path is passed VERBATIM — a path with spaces, a quote or a trailing
+    /// backslash is escaped by the runtime, never by us.
+    /// </para>
     /// </summary>
-    internal static IReadOnlyList<string> BuildPipInstallArguments(IEnumerable<string> packages)
-    {
-        var args = new List<string>
-        {
-            "-m", "pip", "install", "--isolated", "--no-warn-script-location", "--disable-pip-version-check",
-        };
-        foreach (var pkg in packages)
-        {
-            if (string.IsNullOrWhiteSpace(pkg)) continue;
-            args.Add(pkg);
-        }
-        return args;
-    }
+    internal static IReadOnlyList<string> BuildPipInstallArguments(string lockPath) =>
+    [
+        "-m", "pip", "install", "--isolated", "--no-warn-script-location", "--disable-pip-version-check",
+        "--require-hashes", "--no-deps", "--only-binary", ":all:",
+        "-r", lockPath,
+    ];
 
     // --- Bootstrap serialization (cross-process) -----------------------
     //
@@ -436,12 +510,11 @@ public sealed class PythonEnvManager
     // site-packages directory, which is how you get a half-written torch
     // and an OSError on the next import.
     //
-    // The gate is therefore CROSS-PROCESS (a named kernel semaphore), not
-    // just a static lock. A named Semaphore is used rather than a Mutex
-    // because a Mutex is thread-affine and cannot be held across an await;
-    // named semaphores are Windows-only in .NET, so on other platforms the
-    // process-local half stands alone (the embed bootstrap is a Windows
-    // feature anyway — elsewhere EnsureInterpreterAsync uses system python).
+    // The gate is therefore CROSS-PROCESS (an exclusive handle on a lock file
+    // in the root, see EnvLockFileName), not just a static lock. A file
+    // handle, unlike a Mutex, is not thread-affine and can be held across an
+    // await, and unlike a named kernel object it is neither nameable by
+    // another user nor left held by a dead owner.
     // Refcounted, like VerifiedDownloader.DestinationGates: an entry lives
     // only while someone holds or waits on it. A static table keyed by a root
     // path and never pruned is a leak for any host that bootstraps into
@@ -487,29 +560,38 @@ public sealed class PythonEnvManager
     /// Upper bound on the wait for the CROSS-PROCESS half of the gate.
     ///
     /// <para>
-    /// A named <see cref="Semaphore"/> — unlike a <see cref="Mutex"/> — is NOT
-    /// released when its owner dies. If the process holding the count crashes
-    /// or is killed mid-<c>pip install</c> (the exact scenario the gate exists
-    /// for, and this repo's standing advice is to kill stray test hosts) while
-    /// any other process still holds a handle keeping the kernel object alive,
-    /// the count stays at 0 for ever. Without a bound every later
-    /// <c>Ensure*</c> polls until the heat death of the universe, with no
-    /// diagnostic. On expiry we log at Warning and proceed with the
+    /// The cross-process half is an exclusive handle on a lock file, which the
+    /// OS drops when its owner dies — a crashed or killed bootstrap does not
+    /// wedge the next one. The bound is for a LIVE owner that is stuck (a
+    /// hung <c>pip install</c>): on expiry we log at Warning and proceed with the
     /// process-local gate alone — degraded, loudly, rather than hung.
     /// </para>
     /// <para>Settable for tests only.</para>
     /// </summary>
-    internal static TimeSpan GlobalEnvLockTimeout { get; set; } = TimeSpan.FromMinutes(30);
+    internal static TimeSpan CrossProcessEnvLockTimeout { get; set; } = TimeSpan.FromMinutes(30);
 
-    /// <summary>Name of the kernel object behind the cross-process gate.
-    /// Internal so a test can hold — and deliberately abandon — the very
-    /// semaphore the manager waits on.</summary>
+    /// <summary>
+    /// Name of the lock file, inside <see cref="Root"/>, whose exclusive handle
+    /// is the cross-process half of the bootstrap gate.
+    ///
+    /// <para>
+    /// It replaced a named kernel semaphore (<c>Global\JuceSharp.python-embed.&lt;hash&gt;</c>).
+    /// That name was derived from the root path alone, so any process of any
+    /// user could compute it, create the object first and hold it — every
+    /// bootstrap then waited out the timeout — and a semaphore is not released
+    /// when its owner dies. A file in the root carries the root's own ACL (by
+    /// default the user's profile), is per-root by construction, and its handle
+    /// is released by the OS on process exit.
+    /// </para>
+    /// </summary>
+    internal const string EnvLockFileName = ".bootstrap.lock";
+
+    /// <summary>Key of the PROCESS-LOCAL half of the gate for
+    /// <paramref name="root"/>: the normalised full path.</summary>
     internal static string EnvLockName(string root)
     {
         var full = Path.GetFullPath(root);
-        if (OperatingSystem.IsWindows()) full = full.ToUpperInvariant();
-        var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(full)))[..16];
-        return "JuceSharp.python-embed." + hash;
+        return OperatingSystem.IsWindows() ? full.ToUpperInvariant() : full;
     }
 
     /// <summary>
@@ -534,75 +616,58 @@ public sealed class PythonEnvManager
             UnreferenceLocalGate(name);
             throw;
         }
-        Semaphore? global = null;
-        var globalHeld = false;
+        FileStream? held = null;
         try
         {
-            global = TryOpenGlobalGate(name);
-            if (global is not null)
+            Directory.CreateDirectory(root);
+            var lockPath = Path.Combine(root, EnvLockFileName);
+            // Poll rather than block a pool thread: a bootstrap holding this
+            // gate can legitimately run for the length of a torch download.
+            // Bounded — see CrossProcessEnvLockTimeout.
+            var deadline = Environment.TickCount64 + (long)CrossProcessEnvLockTimeout.TotalMilliseconds;
+            while ((held = TryOpenLockFile(lockPath)) is null)
             {
-                // Poll rather than block a pool thread: a bootstrap holding
-                // this gate can legitimately run for the length of a torch
-                // download. Bounded — see GlobalEnvLockTimeout.
-                var deadline = Environment.TickCount64 + (long)GlobalEnvLockTimeout.TotalMilliseconds;
-                while (!(globalHeld = global.WaitOne(0)))
+                if (Environment.TickCount64 >= deadline)
                 {
-                    if (Environment.TickCount64 >= deadline)
-                    {
-                        (logger ?? NullLogger.Instance).LogWarning(
-                            "The cross-process Python bootstrap gate for {Root} was not released within {Timeout}. " +
-                            "The owning process is gone or wedged (a named semaphore is not released when its " +
-                            "owner dies). Proceeding with process-local serialization only.", root,
-                            GlobalEnvLockTimeout);
-                        break;
-                    }
-                    await Task.Delay(250, ct).ConfigureAwait(false);
+                    (logger ?? NullLogger.Instance).LogWarning(
+                        "The cross-process Python bootstrap gate for {Root} was not released within {Timeout}. " +
+                        "Another process holds {LockFile} and appears stuck. Proceeding with process-local " +
+                        "serialization only.", root, CrossProcessEnvLockTimeout, EnvLockFileName);
+                    break;
                 }
+                await Task.Delay(250, ct).ConfigureAwait(false);
             }
         }
         catch
         {
-            if (globalHeld) { try { global!.Release(); } catch (Exception) { /* best effort */ } }
-            global?.Dispose();
+            held?.Dispose();
             local.Release();
             UnreferenceLocalGate(name);
             throw;
         }
-        return new EnvLockHandle(name, local, global, globalHeld);
+        return new EnvLockHandle(name, local, held);
     }
 
-    private static Semaphore? TryOpenGlobalGate(string name)
+    /// <summary>The exclusive handle, or null while another process holds it.
+    /// Any other failure (no access to the root) is an exception: proceeding
+    /// unserialized must be a logged decision, not a silent one.</summary>
+    private static FileStream? TryOpenLockFile(string path)
     {
-        if (!OperatingSystem.IsWindows()) return null;
-        // Global\ spans terminal-server sessions, which is what makes the
-        // gate hold between an elevated CLI and a per-user app. A locked-down
-        // session can deny it; falling back to Local\ still serializes every
-        // process in the same session, which is the realistic collision.
-        foreach (var prefix in new[] { @"Global\", @"Local\" })
+        try
         {
-            try { return new Semaphore(1, 1, prefix + name); }
-            catch (Exception) { /* try the next namespace */ }
+            return new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None,
+                bufferSize: 1, FileOptions.None);
         }
-        return null;
+        catch (IOException) { return null; }
     }
 
-    private sealed class EnvLockHandle(string name, SemaphoreSlim local, Semaphore? global, bool globalHeld) : IDisposable
+    private sealed class EnvLockHandle(string name, SemaphoreSlim local, FileStream? crossProcess) : IDisposable
     {
         private int _disposed;
         public void Dispose()
         {
             if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
-            if (global is not null)
-            {
-                // Only release what we actually took: a timed-out wait holds a
-                // HANDLE and not the COUNT, and releasing it anyway would raise
-                // the kernel semaphore to 2 and let two bootstraps in for ever.
-                if (globalHeld)
-                {
-                    try { global.Release(); } catch (Exception) { /* best effort */ }
-                }
-                global.Dispose();
-            }
+            crossProcess?.Dispose();
             local.Release();
             UnreferenceLocalGate(name);
         }
@@ -616,9 +681,15 @@ public sealed class PythonEnvManager
     /// SHA-256 of the set, so changing, adding or removing a pin invalidates
     /// it automatically — there is no version number to forget to bump.
     /// </summary>
-    internal static string PackageSetStampFileName(IEnumerable<string> packages)
+    internal static string PackageSetStampFileName(IEnumerable<string> packages) =>
+        PackageSetStampFileNameForLock(packages, PythonPackageLock.Digest);
+
+    /// <summary>The stamp name for a pin set installed from the lock whose
+    /// digest is <paramref name="lockDigest"/>: regenerating the lock (new
+    /// versions, new hashes) re-runs pip exactly as changing a pin does.</summary>
+    internal static string PackageSetStampFileNameForLock(IEnumerable<string> packages, string lockDigest)
     {
-        var canonical = string.Join('\n', packages
+        var canonical = "lock=" + lockDigest + "\n" + string.Join('\n', packages
             .Where(p => !string.IsNullOrWhiteSpace(p))
             .Select(p => p.Trim()));
         var hash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(canonical))).ToLowerInvariant();
@@ -748,14 +819,12 @@ public sealed class PythonEnvManager
             catch (Exception ex) { _logger.LogDebug(ex, "Could not stamp legacy interpreter root {Root}", Root); }
             return p;
         }
-        // Match what EnsureInterpreterAsync stored — and, failing that, look for
-        // the same system python3 that call WOULD store. Reading only the field
-        // made Probe()/IsReady() answer "no interpreter" on Linux and macOS until
-        // something had already provisioned in THIS process, so a host honouring
-        // IsReady() showed a permanent install prompt for a python that was
-        // installed. This is a probe: it resolves, it does not provision.
+        // There is no embedded interpreter off Windows, and the PATH is never
+        // searched for one: whichever `python3` comes first on it is not an
+        // interpreter anybody pinned. Only an Executable assigned explicitly
+        // (by a test) counts.
         if (!string.IsNullOrEmpty(Executable) && File.Exists(Executable)) return Executable;
-        return ResolveSystemPython3();
+        return null;
     }
 
     /// <summary>
@@ -776,22 +845,6 @@ public sealed class PythonEnvManager
         }
         catch (IOException) { return false; }
         catch (UnauthorizedAccessException) { return false; }
-    }
-
-    private static string? ResolveSystemPython3()
-    {
-        var path = Environment.GetEnvironmentVariable("PATH");
-        if (string.IsNullOrEmpty(path)) return null;
-        foreach (var dir in path.Split(Path.PathSeparator))
-        {
-            foreach (var name in new[] { "python3", "python" })
-            {
-                var ext = OperatingSystem.IsWindows() ? ".exe" : string.Empty;
-                var full = Path.Combine(dir, name + ext);
-                if (File.Exists(full)) return full;
-            }
-        }
-        return null;
     }
 
     // --- Interpreter version cache ------------------------------------

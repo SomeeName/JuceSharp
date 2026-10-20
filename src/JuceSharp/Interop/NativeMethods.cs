@@ -104,7 +104,7 @@ internal static class NativeMethods
     ///         <see cref="DcaStatus.NotFound" />.
     ///     </para>
     /// </summary>
-    internal const uint   ExpectedAbiVersion = 47;
+    internal const uint   ExpectedAbiVersion = 48;
 
     /// <summary>Mirrors <c>DCA_MAX_PLAYERS</c>: how many independent live-input
     /// rigs (seats) the native engine hosts. Each has its own DSP chain, VST3
@@ -564,6 +564,13 @@ internal static class NativeMethods
     [DllImport(LibName, EntryPoint = "dca_engine_chart_source_set_notes_for_player", CallingConvention = CallingConvention.Cdecl)]
     internal static extern unsafe DcaStatus EngineChartSourceSetNotesForPlayer(nint engine, int player,
         DcaChartNote* notes, int noteCount, int noteStrideBytes, DcaChartBendPoint* bends, int bendCount);
+
+    /// <summary>ABI v48: the note upload with the byte length of the notes buffer,
+    /// so the engine checks count x stride against it.</summary>
+    [DllImport(LibName, EntryPoint = "dca_engine_chart_source_set_notes_for_player2", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern unsafe DcaStatus EngineChartSourceSetNotesForPlayer2(nint engine, int player,
+        DcaChartNote* notes, int noteCount, int noteStrideBytes, long notesByteLength,
+        DcaChartBendPoint* bends, int bendCount);
 
     [DllImport(LibName, EntryPoint = "dca_engine_chart_source_set_enabled_for_player", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DcaStatus EngineChartSourceSetEnabledForPlayer(nint engine, int player, int enabled);

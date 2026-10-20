@@ -50,6 +50,7 @@ public sealed class StemSeparator : IStemSeparator
         PythonPackagePins.Demucs,
         PythonPackagePins.BsRoformer,
         PythonPackagePins.PyYaml,
+        PythonPackagePins.SafeTensors,
     };
 
     // --- Global concurrency gate --------------------------------------
@@ -379,6 +380,11 @@ public sealed class StemSeparator : IStemSeparator
 
         Directory.CreateDirectory(outputDir);
         options ??= StemSeparationOptions.Default;
+
+        // A Demucs bag is only ever loaded from pinned, hash-verified files
+        // (DemucsWeightPins); a model with no pin is refused here, before
+        // anything is downloaded or installed.
+        var weightBag = ResolveWeightBag(options);
         ct.ThrowIfCancellationRequested();
 
         // Install progress is folded into the front 5% of the bar so the
@@ -397,10 +403,20 @@ public sealed class StemSeparator : IStemSeparator
         if (!options.SkipPackageBootstrap)
             await _env.EnsurePackagesAsync(RequiredPackages, installProgress, ct).ConfigureAwait(false);
 
+        string? weightsDir = null;
+        if (weightBag is not null)
+        {
+            report?.Invoke(new StemSeparationProgress("weights", installScale,
+                $"Fetching the pinned {weightBag.Model} weights…", Stem: null));
+            weightsDir = await DemucsWeightPins.EnsureAsync(weightBag,
+                options.DemucsWeightsDirectory ?? Path.Combine(_env.Root, "demucs-weights", weightBag.Model),
+                line => _logger.LogInformation("[weights] {Line}", line), ct).ConfigureAwait(false);
+        }
+
         report?.Invoke(new StemSeparationProgress("loading", installScale,
             $"Loading {options.Model} on {options.Device}…", Stem: null));
 
-        var args = BuildArgs(_scriptPath, inputPath, outputDir, options);
+        var args = BuildArgs(_scriptPath, inputPath, outputDir, options, weightsDir);
         var stems = new List<StemFile>();
         string? deviceUsed = null;
 
@@ -494,7 +510,8 @@ public sealed class StemSeparator : IStemSeparator
     /// <summary>Internal so the path contract can be asserted without a
     /// sidecar: every path in this argv has to be ROOTED, because the child's
     /// working directory is the interpreter's and not ours.</summary>
-    internal static List<string> BuildArgs(string script, string input, string outDir, StemSeparationOptions opt)
+    internal static List<string> BuildArgs(string script, string input, string outDir, StemSeparationOptions opt,
+        string? weightsDir = null)
     {
         var args = new List<string>
         {
@@ -520,12 +537,34 @@ public sealed class StemSeparator : IStemSeparator
             args.Add("--config");
             args.Add(Path.GetFullPath(opt.ConfigPath));
         }
+        if (!string.IsNullOrWhiteSpace(weightsDir))
+        {
+            args.Add("--weights-dir");
+            args.Add(Path.GetFullPath(weightsDir));
+        }
         if (opt.Stems is { Count: > 0 })
         {
             args.Add("--stems");
             args.Add(string.Join(',', opt.Stems));
         }
         return args;
+    }
+
+    /// <summary>
+    /// The pinned bag a Demucs separation will load, or null when this call
+    /// fetches no weights: a RoFormer model (it reads
+    /// <see cref="StemSeparationOptions.ModelPath"/>), or a caller that skipped
+    /// the bootstrap and named no <see cref="StemSeparationOptions.DemucsWeightsDirectory"/>
+    /// (the script then refuses to load a Demucs bag at all).
+    /// </summary>
+    /// <exception cref="ArgumentException">The model has no pinned weights.</exception>
+    internal static DemucsWeightBag? ResolveWeightBag(StemSeparationOptions options)
+    {
+        if (string.Equals(options.Model, "bs_roformer", StringComparison.OrdinalIgnoreCase)) return null;
+        if (options.SkipPackageBootstrap && options.DemucsWeightsDirectory is null) return null;
+        return DemucsWeightPins.Find(options.Model) ?? throw new ArgumentException(
+            $"'{options.Model}' has no pinned weights. Pinned Demucs models: " +
+            string.Join(", ", DemucsWeightPins.All.Select(b => b.Model)) + ".", nameof(options));
     }
 
     private static string ResolveBundledScript()
@@ -544,8 +583,9 @@ public sealed class StemSeparator : IStemSeparator
 public sealed record StemSeparationOptions
 {
     /// <summary>Model identifier passed to the script. For Demucs models
-    /// these are the canonical names (<c>htdemucs</c>, <c>htdemucs_ft</c>,
-    /// <c>htdemucs_6s</c>, <c>mdx_extra</c>). For RoFormer models pass
+    /// these are the canonical names with pinned weights (<c>htdemucs</c>,
+    /// <c>htdemucs_ft</c>, <c>htdemucs_6s</c>, <c>hdemucs_mmi</c>, <c>mdx</c>,
+    /// <c>mdx_extra</c>); any other name is refused. For RoFormer models pass
     /// <c>bs_roformer</c> and supply <see cref="ModelPath"/> +
     /// <see cref="ConfigPath"/>.</summary>
     public string Model { get; init; } = "htdemucs";
@@ -579,8 +619,19 @@ public sealed record StemSeparationOptions
     /// <summary>When true, <see cref="StemSeparator.SeparateTrackAsync"/>
     /// skips the <c>pip install torch demucs …</c> step and assumes the
     /// caller has provisioned the interpreter themselves. Useful for
-    /// advanced users with system-managed envs and for offline tests.</summary>
+    /// advanced users with system-managed envs and for offline tests.
+    /// <para>It also skips the Demucs weight download unless
+    /// <see cref="DemucsWeightsDirectory"/> is set; the bundled script then
+    /// refuses a Demucs model, because it never fetches weights itself.</para></summary>
     public bool SkipPackageBootstrap { get; init; }
+
+    /// <summary>
+    /// Where the pinned Demucs weights are kept (one directory per model).
+    /// Null means <c>&lt;interpreter root&gt;/demucs-weights/&lt;model&gt;</c>.
+    /// Whatever is there is checked against its pinned SHA-256 before use, and
+    /// a missing or wrong file is fetched again from its pinned revision.
+    /// </summary>
+    public string? DemucsWeightsDirectory { get; init; }
 
     /// <summary>
     /// Process-global ceiling on concurrent separations. Defaults to 1

@@ -23,7 +23,7 @@ their source is committed to this repository.
 
 ### JUCE
 
-- Version: **9.0.3** (`JUCE_TAG`), <https://github.com/juce-framework/JUCE>
+- Version: **9.0.3** (`JUCE_TAG`), fetched as commit be29c81492b6151c8ea8d14c840e1311963b3a83 (`JUCE_COMMIT`), <https://github.com/juce-framework/JUCE>
 - Copyright (c) Raw Material Software Limited
 - Linked into: `juce_sharp.dll` and `juce_vst_host.exe`
 - Licence: **AGPLv3 or the commercial JUCE 9 licence.** JUCE 9.0.3's
@@ -45,7 +45,7 @@ their source is committed to this repository.
 
 ### Rubber Band Library
 
-- Version: **v4.0.0** (`RUBBERBAND_TAG`), <https://github.com/breakfastquay/rubberband>,
+- Version: **v4.0.0** (`RUBBERBAND_TAG`), fetched as commit 1d95888bec3ae0a17c0c4af791810d5a63f6bc35 (`RUBBERBAND_COMMIT`), <https://github.com/breakfastquay/rubberband>,
   statically linked through upstream's single-file build
   (`single/RubberBandSingle.cpp`)
 - Copyright 2007-2024 Particular Programs Ltd.
@@ -102,7 +102,7 @@ the `namamp` module.
 
 | Component | Version | Copyright | Licence |
 |---|---|---|---|
-| **NeuralAudio**, <https://github.com/mikeoliphant/NeuralAudio> | **v0.1.3** (`NEURALAUDIO_TAG`) | Copyright (c) 2024 Mike Oliphant | MIT |
+| **NeuralAudio**, <https://github.com/mikeoliphant/NeuralAudio> | **v0.1.3** (`NEURALAUDIO_TAG`), commit b1137e1db2d43670e7dcf6345ade7808613cac20 (`NEURALAUDIO_COMMIT`) | Copyright (c) 2024 Mike Oliphant | MIT |
 | NeuralAmpModelerCore (NAM Core), submodule of NeuralAudio | as pinned by NeuralAudio v0.1.3 | Copyright (c) 2023 Steven Atkinson | MIT |
 | RTNeural, submodule of NeuralAudio | as pinned by NeuralAudio v0.1.3 | Copyright (c) 2020, jatinchowdhury18 | BSD-3-Clause |
 | math_approx, submodule of NeuralAudio | as pinned by NeuralAudio v0.1.3 | Copyright (c) 2024, jatinchowdhury18 | BSD-3-Clause |
@@ -196,22 +196,28 @@ carries `juce_sharp.dll`, so a built example is under the terms in § 1.
 
 ### By `JuceSharp.StemSeparation` (the Python sidecar)
 
-Fetched into a per-user cache on first use:
+Fetched into a per-user cache on first use, every file pinned by SHA-256
+(`PythonEnvManager.DefaultPythonEmbedSha256`, `DefaultPipWheelSha256`, and the
+hash-locked package set `requirements-win_amd64-cp311.lock`, which also lists
+each package's own dependencies):
 
 - **CPython 3.11.9 embeddable distribution** — Python Software Foundation
   License, from python.org.
+- **pip** — MIT, the wheel from PyPI.
 - **torch / torchaudio** — BSD-3-Clause.
 - **demucs** — MIT.
 - **bs_roformer** — see the project's own terms.
 - **librosa** — ISC.
 - **soundfile** — BSD-3-Clause, wrapping **libsndfile** (**LGPL-2.1**).
-- **numpy** (BSD-3-Clause), **pyyaml** (MIT), **onnx** (Apache-2.0).
+- **numpy** (BSD-3-Clause), **pyyaml** (MIT), **onnx** (Apache-2.0),
+  **safetensors** (Apache-2.0).
 
 ### Model weights
 
-Downloaded by demucs / Hugging Face into their own caches:
-
-- **htdemucs** checkpoints — Meta, MIT.
+- **Demucs bags** (`htdemucs`, `htdemucs_ft`, `htdemucs_6s`, `hdemucs_mmi`,
+  `mdx`, `mdx_extra`) — Meta, MIT; the safetensors exports in the Hugging Face
+  repositories `adefossez/*`, fetched by `StemSeparator` at a pinned revision
+  with a pinned SHA-256 per file (`DemucsWeightPins`).
 - **htdemucs ggml conversions** fetched by `DemucsGgmlModelCatalog` for the
   native `demucs.cpp` backend — a third-party re-host of the Meta MIT weights
   (Hugging Face dataset `Retrobear/demucs.cpp`); each catalogue row carries a

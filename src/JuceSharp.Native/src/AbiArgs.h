@@ -20,9 +20,37 @@
 // both false for NaN). The engine setters did not. They do now, through this
 // header, so there is one predicate rather than 30 hand-written `isfinite`s.
 
+#include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <limits>
 
 namespace dcabi {
+
+/// True when `n` fits an int32_t out-param or a JUCE `int` size. Check BEFORE
+/// the cast: a size_t over INT32_MAX narrows to a negative int32, and a negative
+/// count handed to memcpy or a JUCE API becomes a huge size_t again.
+inline bool fitsInt32(std::size_t n) noexcept
+{
+    return n <= (std::size_t) std::numeric_limits<int32_t>::max();
+}
+
+/// The tail of a "size query + copy" export (dca_plugin_save_state): reports the
+/// whole size in *out and copies at most `capacity` bytes of it. A block that
+/// does not fit int32 is refused (false, *out = 0) before any cast or copy; a
+/// null buffer or a capacity <= 0 copies nothing.
+inline bool copyBlockOut(const void* data, std::size_t size, uint8_t* buffer, int32_t capacity,
+                         int32_t* out) noexcept
+{
+    *out = 0;
+    if (! fitsInt32(size)) return false;
+    *out = (int32_t) size;
+    if (buffer != nullptr && capacity > 0 && size > 0 && data != nullptr)
+        std::memcpy(buffer, data, std::min((std::size_t) capacity, size));
+    return true;
+}
 
 /// True when every argument is a finite real number (not NaN, not +/-Inf).
 inline bool finite(float v) noexcept  { return std::isfinite(v); }

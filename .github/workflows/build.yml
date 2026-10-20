@@ -1,5 +1,10 @@
 name: build
 
+# Push and pull_request start runs on the PUBLIC repo, where Actions minutes are
+# free. The private dev repo pays for every minute, so there EVERY job is gated
+# on the event being a manual dispatch: a push or a PR there creates a run whose
+# jobs are all skipped, which bills nothing. Keep the `if:` on every job you add
+# (CiWorkflowLintTests fails a job without it).
 on:
   push:
     branches: [main]
@@ -16,8 +21,10 @@ on:
 permissions:
   contents: read
 
+# The event is part of the group: on the private repo a push creates a run of
+# skipped jobs, and it must never cancel a manual run of the same ref.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -28,6 +35,7 @@ env:
 jobs:
   windows:
     name: windows / native + managed
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
     # PINNED, not `windows-latest`. The floating label moves to the next image
     # on GitHub's schedule and takes the Visual Studio, CMake and Windows SDK
     # versions with it — a native build that starts failing on a morning nobody
@@ -37,8 +45,9 @@ jobs:
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           submodules: recursive
 
       # global-json-file, NOT dotnet-version: "10.x". The floating spec installs
@@ -47,7 +56,7 @@ jobs:
       # different analyzer rule sets. global.json pins 10.0.400 with
       # rollForward: latestFeature, which is the one place the toolchain is
       # declared.
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6
         with:
           global-json-file: global.json
 
@@ -59,13 +68,13 @@ jobs:
         id: tags
         shell: bash
         run: |
-          tags=$(grep -E '^set\((JUCE_TAG|RUBBERBAND_TAG|NEURALAUDIO_TAG|DEMUCS_CPP_TAG) ' \
+          tags=$(grep -E '^set\((JUCE|RUBBERBAND|NEURALAUDIO)_(TAG|COMMIT) |^set\(DEMUCS_CPP_TAG ' \
                    src/JuceSharp.Native/CMakeLists.txt | tr -d ' ')
           echo "$tags"
           echo "hash=$(printf '%s' "$tags" | sha256sum | cut -c1-32)" >> "$GITHUB_OUTPUT"
 
       - name: Cache FetchContent sources
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: src/JuceSharp.Native/build/_deps
           key: deps-windows-${{ steps.tags.outputs.hash }}
@@ -90,6 +99,14 @@ jobs:
 
       - name: Build managed
         run: dotnet build JuceSharp.sln -c Release
+
+      # A hosted runner has NO audio endpoint, and most engine tests open the
+      # DEFAULT device (`new JuceAudioEngine()` -> WASAPI default output); without
+      # one engine_create fails with Device in ~860 cases. This installs the
+      # VB-CABLE virtual device (LABSN/sound-ci-helpers, pinned to v1.0.4's SHA)
+      # so those tests run against a real WASAPI endpoint.
+      - name: Virtual audio device
+        uses: LABSN/sound-ci-helpers@d08c889a7bba7d9b1b059f8f76dac4672ea3a9cf # v1.0.4
 
       # The null device gives the engine tests a deterministic callback on a
       # runner with no sound card.
@@ -119,7 +136,7 @@ jobs:
         run: dotnet pack JuceSharp.sln -c Release -o artifacts
 
       - name: Upload packages
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: nupkg
           path: |
@@ -128,28 +145,34 @@ jobs:
           if-no-files-found: error
 
       - name: Upload native binaries
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: native-win-x64
           path: src/JuceSharp/runtimes/win-x64/native/
           if-no-files-found: error
 
-  # A MEASUREMENT, not a gate. Nothing here has ever been built for Linux and
-  # the ASIO/VST3 host paths are Windows-only, so this is expected to fail —
-  # it exists so the distance to a Linux build is visible and shrinking rather
-  # than unknown. Flip continue-on-error off the day it goes green.
-  linux-distance:
-    name: linux / native only (informational)
+  # The Linux build of the engine library alone (juce_sharp). It went green
+  # once the JUCE Linux dependencies below were complete (fontconfig, XInput2),
+  # so it is a gate now: a change that breaks the Linux compile fails the run.
+  # Only the library is built; the VST host (Win32 kernel objects), ctest and
+  # the managed suite stay Windows-only (the windows job above).
+  linux:
+    name: linux / native library
+    if: github.event_name == 'workflow_dispatch' || !github.event.repository.private
     # Pinned for the same reason as the windows job above.
     runs-on: ubuntu-24.04
-    continue-on-error: true
     timeout-minutes: 90
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          persist-credentials: false
           submodules: recursive
 
+      # fontconfig: JUCE looks for 'freetype2;fontconfig' as ONE pkg-config
+      # set, so without libfontconfig1-dev it drops freetype too and juceaide
+      # (built at configure time) fails on <ft2build.h>. libxi-dev: JUCE's
+      # gui_basics includes <X11/extensions/XInput2.h> unconditionally on Linux.
       - name: Install JUCE Linux dependencies
         run: |
           sudo apt-get update
@@ -157,7 +180,12 @@ jobs:
             libasound2-dev \
             libjack-jackd2-dev \
             libfreetype6-dev \
+            libfontconfig1-dev \
             libx11-dev \
+            libxext-dev \
+            libxi-dev \
+            libxcomposite-dev \
+            libxrender-dev \
             libxrandr-dev \
             libxinerama-dev \
             libxcursor-dev \
@@ -167,12 +195,12 @@ jobs:
       - name: Resolve dependency tags
         id: tags
         run: |
-          tags=$(grep -E '^set\((JUCE_TAG|RUBBERBAND_TAG|NEURALAUDIO_TAG|DEMUCS_CPP_TAG) ' \
+          tags=$(grep -E '^set\((JUCE|RUBBERBAND|NEURALAUDIO)_(TAG|COMMIT) |^set\(DEMUCS_CPP_TAG ' \
                    src/JuceSharp.Native/CMakeLists.txt | tr -d ' ')
           echo "hash=$(printf '%s' "$tags" | sha256sum | cut -c1-32)" >> "$GITHUB_OUTPUT"
 
       - name: Cache FetchContent sources
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: src/JuceSharp.Native/build/_deps
           key: deps-linux-${{ steps.tags.outputs.hash }}

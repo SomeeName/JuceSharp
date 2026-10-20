@@ -23,7 +23,7 @@ Namespaces: `JuceSharp.StemSeparation.Processing` and
 | Member | Description |
 |---|---|
 | `StemSeparator(PythonEnvManager? env = null, ILogger<StemSeparator>? logger = null, string? scriptPathOverride = null)` | All three arguments are for testing and embedding. |
-| `static IReadOnlyList<string> RequiredPackages` | `torch>=2.1,<2.6`, `torchaudio>=2.1,<2.6`, `numpy<2`, `soundfile`, `librosa`, `demucs>=4.0`, `bs_roformer>=1.1.0`, `pyyaml`. |
+| `static IReadOnlyList<string> RequiredPackages` | `torch>=2.6,<2.9`, `torchaudio>=2.6,<2.9`, `numpy<2`, `soundfile`, `librosa`, `demucs>=4.1`, `bs_roformer>=1.1.0`, `pyyaml`, `safetensors>=0.4`. |
 | `static int GlobalConcurrencyLimit { get; set; }` | The **process-static** gate. **Grow-only** — assigning a lower value throws `InvalidOperationException`. |
 | `bool IsReady()` · `PythonEnvStatus Probe()` · `Task<SeparationResult> SeparateTrackAsync(…)` · `IAsyncEnumerable<StemSeparationProgress> SeparateWithProgressAsync(…)` | the four `IStemSeparator` members. `SeparateWithProgressAsync` has a default interface implementation that bridges `SeparateTrackAsync`, so a backend only has to write the other three. |
 | `Task<PythonEnvStatus> ProbeAsync(CancellationToken ct = default)` · `Task<bool> IsReadyAsync(CancellationToken ct = default)` | the async forms — prefer them on a UI thread; `Probe()` shells out to the interpreter. |
@@ -35,7 +35,7 @@ Namespaces: `JuceSharp.StemSeparation.Processing` and
 
 | Property | Default | Notes |
 |---|---|---|
-| `Model` | `"htdemucs"` | `htdemucs`, `htdemucs_ft`, `htdemucs_6s`, `mdx_extra`, `bs_roformer`, … |
+| `Model` | `"htdemucs"` | A pinned Demucs bag (`htdemucs`, `htdemucs_ft`, `htdemucs_6s`, `hdemucs_mmi`, `mdx`, `mdx_extra`) or `bs_roformer`; any other name is refused. |
 | `Device` | `"auto"` | `auto` / `cuda` / `cuda:0` / `mps` / `cpu`. |
 | `Shifts` | `1` | Demucs equivariant shifts. |
 | `Overlap` | `0.25` | Chunk overlap. Lower uses less VRAM. |
@@ -43,7 +43,8 @@ Namespaces: `JuceSharp.StemSeparation.Processing` and
 | `ConfigPath` | `null` | RoFormer YAML for a custom checkpoint. |
 | `Stems` | `null` | Restrict the outputs. |
 | `Timeout` | **`4 h`** | Hard upper bound on the child process. |
-| `SkipPackageBootstrap` | `false` | Skip pip on every call. |
+| `SkipPackageBootstrap` | `false` | Skip pip, and the Demucs weight download unless `DemucsWeightsDirectory` is set. |
+| `DemucsWeightsDirectory` | `null` | Where the pinned Demucs weights are kept and verified; `null` = `<embed root>/demucs-weights/<model>`. |
 | `MaxConcurrentSeparations` | `1` | Grows the process-global gate. |
 | `static Default` | | A ready-made instance. |
 
@@ -182,7 +183,9 @@ below.
 | Member | Description |
 |---|---|
 | `CkptToOnnxConverter(PythonEnvManager? env = null, ILogger<CkptToOnnxConverter>? logger = null, string? scriptPathOverride = null)` | |
-| `static IReadOnlyList<string> RequiredPackages` | `torch>=2.1,<2.6`, `numpy<2`, `pyyaml`, `onnx>=1.15`, `bs_roformer>=1.1.0` — a **smaller** set than `StemSeparator`'s. |
+| `static IReadOnlyList<string> RequiredPackages` | `torch>=2.6,<2.9`, `numpy<2`, `pyyaml`, `onnx>=1.15`, `bs_roformer>=1.1.0`, `safetensors>=0.4` — a **smaller** set than `StemSeparator`'s. |
+| `bool AllowUnsafePickleFallback { get; init; }` | Default `false`. The script reads `.safetensors` without pickle and a `.ckpt` / `.pt` / `.pth` with `torch.load(weights_only=True)`; only when this is `true` may it fall back to a FULL unpickle, which runs code contained in the file. Set it only after the user accepted that risk. |
+| `const string UnsafePickleRefusedMarker` | The stderr token for a refused full unpickle; `ConvertAsync` throws `UnsafeCheckpointException` (an `InvalidOperationException`) for it. |
 | `bool IsReady()` | |
 | `PythonEnvStatus Probe()` | |
 | `Task ConvertAsync(string ckptPath, string? yamlPath, string onnxOutputPath, IProgress<PythonInstallProgress>? progress = null, CancellationToken ct = default)` | |

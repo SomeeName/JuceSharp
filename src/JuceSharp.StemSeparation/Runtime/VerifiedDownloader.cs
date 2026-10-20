@@ -328,8 +328,8 @@ internal static class VerifiedDownloader
             // existing prefix (a file of alreadyHave + N bytes), and a
             // `multipart/byteranges` reply has MIME part headers inside the
             // body that went in verbatim. With a pinned hash that is a wasted
-            // transfer; with Sha256 = null — which EnsureFileAsync permits and
-            // the get-pip bootstrap uses — it is a corrupt file that gets
+            // transfer; with Sha256 = null — which EnsureFileAsync permits for a
+            // caller that decided to accept it — it is a corrupt file that may get
             // EXECUTED. A 206 we cannot confirm is re-requested WITHOUT a Range
             // header rather than written from byte 0, because the body in hand
             // may itself be a partial one and there is no way to tell which.
@@ -374,9 +374,9 @@ internal static class VerifiedDownloader
 
             // A CLEAN early close — a proxy, a flaky mirror — makes ReadAsync
             // return 0, the loop exit normally and FlushAsync succeed. With a
-            // pinned hash the next line catches it; with none (the shipping
-            // get-pip default, and every allowUnverified model) the truncated
-            // file would be renamed into place and then EXECUTED. The declared
+            // pinned hash the next line catches it; with none (an unpinned
+            // EnsureFileAsync caller, and every allowUnverified model) the truncated
+            // file would be renamed into place and then loaded or executed. The declared
             // length is the evidence we have, so use it.
             if (declared is { } declaredLength && read - startAt != declaredLength)
                 throw new IOException(

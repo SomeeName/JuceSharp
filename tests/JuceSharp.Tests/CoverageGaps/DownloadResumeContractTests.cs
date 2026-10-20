@@ -144,7 +144,7 @@ public sealed class DownloadResumeContractTests : IDisposable
         Assert.False(File.Exists(dest));
 
         // …and the default is unchanged: an unpinned fetch still warns and proceeds,
-        // because the get-pip bootstrap has nothing to pin.
+        // because the one-URL primitive has no table to consult.
         var warnings = new List<string>();
         var path = await VerifiedDownload.EnsureFileAsync(
             new Uri(server.Url), dest, sha256: null, log: warnings.Add,

@@ -1,9 +1,8 @@
 # JuceSharp
 
-📖 **Docs:** the GitBook/HonKit source lives under [`docs/`](./docs/) — start at
-[`docs/README.md`](./docs/README.md) and [`docs/SUMMARY.md`](./docs/SUMMARY.md).
-No site is published today; render locally with HonKit if you want the browsable
-version (`cd docs && npm install && npx honkit serve`).
+📖 **Docs:** plain Markdown under [`docs/`](./docs/), readable right here on
+GitHub — start at [`docs/README.md`](./docs/README.md); the table of contents is
+[`docs/SUMMARY.md`](./docs/SUMMARY.md).
 
 A reusable .NET wrapper around a JUCE-based native audio engine
 (`juce_sharp.dll`). Extracted from the
@@ -36,7 +35,7 @@ A reusable .NET wrapper around a JUCE-based native audio engine
 ```
 JuceSharp/
 ├── JuceSharp.sln              standalone solution
-├── docs/                      GitBook/HonKit documentation source
+├── docs/                      documentation (Markdown)
 ├── examples/                  six runnable sample projects
 ├── src/
 │   ├── JuceSharp/                    managed C# wrapper (PackageId: JuceSharp)

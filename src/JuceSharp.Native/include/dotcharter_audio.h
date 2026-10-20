@@ -198,7 +198,11 @@ extern "C" {
 // the DCA_EXTPROC_STATE_* values and two APPENDED status codes,
 // DCA_ERR_SAMPLE_RATE = 7 and DCA_ERR_NOT_FOUND = 8. No existing struct or
 // signature changed.
-#define DCA_ABI_VERSION 47
+// v48: dca_engine_chart_source_set_notes_for_player2 -- the note upload with the
+// BYTE LENGTH of the notes buffer, so the engine checks count * stride against
+// it instead of trusting the caller to have sized the buffer. One additive
+// export; the v38 entry point is unchanged. No struct or signature changed.
+#define DCA_ABI_VERSION 48
 
 // ---- Per-player live-input rigs (ABI v28) ---------------------------------
 // The engine hosts DCA_MAX_PLAYERS independent live-input rigs ("seats"). Each
@@ -812,6 +816,19 @@ DCA_API dca_status DCA_CALL dca_engine_chart_source_set_notes_for_player(dca_eng
                                                                          int32_t note_stride_bytes,
                                                                          const dca_chart_bend_point* bends,
                                                                          int32_t bend_count);
+// v48: the same upload with `notes_byte_length`, the size in bytes of the buffer
+// `notes` points to. note_count * note_stride_bytes must not exceed it (computed
+// in 64 bits), else DCA_ERR_INVALID_ARG and the previous table stays; a negative
+// length is DCA_ERR_INVALID_ARG. Every other rule is the v38 export's. Prefer this
+// one: the v38 form can only trust the caller's count and stride.
+DCA_API dca_status DCA_CALL dca_engine_chart_source_set_notes_for_player2(dca_engine_t engine,
+                                                                          int32_t player,
+                                                                          const dca_chart_note* notes,
+                                                                          int32_t note_count,
+                                                                          int32_t note_stride_bytes,
+                                                                          int64_t notes_byte_length,
+                                                                          const dca_chart_bend_point* bends,
+                                                                          int32_t bend_count);
 // OFF at engine start. Enabling builds the selected voice first (loading only
 // its sample pack). Disabling releases every note through the voice's fast fade
 // and then (v40, #61) FREES the voice and its pack off the audio thread, so a
@@ -1820,7 +1837,8 @@ typedef struct dca_wem_info {
 // Open a decoder over a .wem file (UTF-8 path; the whole file is read into
 // memory) or over a caller buffer (COPIED -- the caller may free it on return).
 // `out` is NULL on every failure. DCA_ERR_INVALID_ARG for a NULL argument, an
-// empty buffer or an unknown variant; DCA_ERR_DECODE for a missing file or
+// empty buffer or an unknown variant; DCA_ERR_DECODE for a missing file, a file
+// or buffer over the 256 MiB cap (refused before it is read or copied) or
 // anything that is not a decodable .wem (the reason goes to the log callback).
 DCA_API dca_status DCA_CALL dca_wem_open_file(const char* path, int32_t variant, dca_wem_t* out);
 DCA_API dca_status DCA_CALL dca_wem_open_memory(const uint8_t* data, size_t length, int32_t variant, dca_wem_t* out);

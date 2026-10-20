@@ -98,8 +98,9 @@ public static class VerifiedDownload
     ///   The two download doors disagree on unpinned fetches on purpose: a
     ///   CATALOGUE knows its rows were supposed to be pinned and refuses
     ///   (<c>OnnxModelCatalog</c>, <c>DemucsGgmlModelCatalog</c>), while this is
-    ///   the one-URL primitive with no table to consult — and the shipping
-    ///   get-pip bootstrap is a legitimately unpinnable fetch. The gap this
+    ///   the one-URL primitive with no table to consult. (Every fetch this
+    ///   package makes on its own — the interpreter, the pip wheel, the Demucs
+    ///   weights — IS pinned; the pip wheel and the weights pass this flag.) The gap this
     ///   closes is narrower than either: a host that WANTS the catalogue's
     ///   refusal for a single URL had to re-implement it.</para></param>
     /// <returns><paramref name="destinationPath"/>.</returns>

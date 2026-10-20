@@ -7,6 +7,15 @@
         <AssemblyName>JuceSharp.Tests</AssemblyName>
         <!-- Utf8InteropTests pokes the fixed byte buffers of the interop structs. -->
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <!--
+            The source lints find the repo through [CallerFilePath]. On GitHub
+            Actions Directory.Build.props sets ContinuousIntegrationBuild, which
+            turns on DeterministicSourcePaths and maps every source path to
+            "/_/…" — the lints then cannot find the repo root ("Could not locate
+            the JuceSharp root"). A test assembly ships nowhere, so it keeps its
+            real paths.
+        -->
+        <DeterministicSourcePaths>false</DeterministicSourcePaths>
     </PropertyGroup>
 
     <ItemGroup>

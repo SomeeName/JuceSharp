@@ -8,6 +8,11 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace dcrig { extern void (*namLoadTestHook)(int); extern int namNonFiniteTestBlocks;
@@ -56,6 +61,56 @@ float runBlock(dcrig::DspModule& module, double& phase)
     float peak = 0.f;
     for (float v : buf) { if (!std::isfinite(v)) return -1.f; peak = std::max(peak, std::fabs(v)); }
     return peak;
+}
+
+/// A capture names its own sample rate, and a shared capture is untrusted. A
+/// huge finite rate overflowed the frame arithmetic in armRateAdaptation and
+/// sized the resampler buffers from the overflow; the allocation threw on the
+/// load worker's std::thread, where an escaping exception is std::terminate for
+/// the whole host. It must load as a capture the module dry-bypasses, with
+/// "rateMismatch" saying why, and the process must keep running.
+///
+/// Not vacuous: without the range check and the try/catch around the post-load
+/// step this process dies inside the wait below.
+int anAbsurdCaptureRateBypassesInsteadOfTerminating(const char* fixture)
+{
+    std::ifstream in(fixture, std::ios::binary);
+    std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    const auto brace = json.find('{');
+    if (brace == std::string::npos) { std::fprintf(stderr, "fixture is not a JSON capture\n"); return 1; }
+    json.insert(brace + 1, "\"sample_rate\": 1e12, ");
+    const auto path = std::filesystem::temp_directory_path() / "juce_sharp_nam_absurd_rate.nam";
+    { std::ofstream out(path, std::ios::binary | std::ios::trunc); out << json; }
+
+    auto module = dcrig::createNamAmpModule();
+    module->prepare(44100, 256, 1);
+    module->setStringParam("modelPath", path.u8string().c_str());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (! loaded(*module) && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    float mismatch = 0.f, resampling = 1.f;
+    module->getParam("rateMismatch", mismatch);
+    module->getParam("resampling", resampling);
+    int rc = 0;
+    if (! loaded(*module))
+    { std::fprintf(stderr, "a capture declaring 1e12 Hz never finished loading\n"); rc = 1; }
+    else if (mismatch != 1.f || resampling != 0.f)
+    { std::fprintf(stderr, "a capture declaring 1e12 Hz was armed (rateMismatch %f, resampling %f) "
+                           "instead of dry-bypassed\n", mismatch, resampling); rc = 1; }
+    else
+    {
+        // The bypass is a wire: audio passes untouched and nothing is allocated
+        // for the absurd rate.
+        double phase = 0.0;
+        const float peak = runBlock(*module, phase);
+        if (! (peak > 0.2f && peak < 0.3f))
+        { std::fprintf(stderr, "the bypassed capture did not pass audio dry (peak %f)\n", peak); rc = 1; }
+    }
+    module.reset();
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+    return rc;
 }
 
 /// W4-D34. The neural stage is UNTRUSTED by this engine's own definition, and
@@ -247,12 +302,15 @@ int main(int argc, char** argv)
     if (neuralNaNCannotLatchTheAmpFace(*module) != 0) return 1;
     module.reset();
 
+    if (anAbsurdCaptureRateBypassesInsteadOfTerminating(argv[1]) != 0) return 1;
+
     if (aQueueDestroyedUnderAReaderLeaksRatherThanFrees() != 0) return 1;
     if (theQueueRaisesItsOverflowFlagPerRetireNotPerExcursion() != 0) return 1;
     if (theOverflowWarningIsReportedOncePerExcursion() != 0) return 1;
 
     std::puts("PASS: NAM clear and superseding requests cannot publish stale prepared captures");
     std::puts("PASS: a non-finite sample out of the capture cannot latch the amp face");
+    std::puts("PASS: a capture declaring an absurd sample rate dry-bypasses instead of terminating");
     std::puts("PASS: a retirement queue destroyed under a reader leaks instead of freeing");
     std::puts("PASS: the queue re-raises its overflow flag per retire (its doc says otherwise)");
     std::puts("PASS: namamp reports the soft-cap warning once per excursion, and re-arms");

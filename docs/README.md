@@ -47,7 +47,7 @@ the library's.
 ```
 JuceSharp/
 ├── JuceSharp.sln              standalone solution
-├── docs/                      ← you are here (GitBook/HonKit source)
+├── docs/                      ← you are here (Markdown docs)
 ├── examples/                  six runnable sample projects
 ├── src/
 │   ├── JuceSharp/                     managed wrapper (PackageId: JuceSharp)

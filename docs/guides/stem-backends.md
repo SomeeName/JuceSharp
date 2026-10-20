@@ -443,9 +443,18 @@ var conv = new CkptToOnnxConverter();
 await conv.ConvertAsync(ckptPath, yamlPath, onnxOutputPath, progress, ct);
 ```
 
+A `.ckpt` is a pickle, and unpickling runs code contained in the file. The
+converter reads `.safetensors` without pickle and anything else with
+`torch.load(weights_only=True)` (a real boundary from torch 2.6, the pinned
+floor). A checkpoint that needs a full unpickle (a pickled `nn.Module`) fails
+with `UnsafeCheckpointException` unless the host sets
+`new CkptToOnnxConverter { AllowUnsafePickleFallback = true }` — do that only
+after the user has accepted that the file can run code on their machine.
+`StemSeparator`'s RoFormer path never unpickles.
+
 It reports through `PythonInstallProgress` and adds one phase of its own,
 `convert`. Its own `RequiredPackages` list is smaller than `StemSeparator`'s —
-torch, numpy, pyyaml, onnx, bs_roformer — so `IsReady()` on the converter and
+torch, numpy, pyyaml, onnx, bs_roformer, safetensors — so `IsReady()` on the converter and
 on the separator are different questions.
 
 ## A pragmatic recommendation

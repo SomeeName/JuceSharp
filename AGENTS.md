@@ -74,6 +74,14 @@ purpose — an import would re-load the bytes and defeat the point.
   lowpass. Shares `src/wem/WemVorbisCommon.h` with the decoder. `AbiV44Tests`,
   `Wem/WemEncoderTests`. → `docs/agents/wem-encoder.md`
 
+- **ABI v48: the note upload names its byte length, and untrusted inputs are
+  capped:** `dca_engine_chart_source_set_notes_for_player2` checks count x stride
+  against the buffer; a `.wem` is capped at 256 MiB and is NEVER streamed (a
+  WEM that does not fit the preload budget is refused); `namamp` dry-bypasses a
+  capture rate outside [8, 384] kHz instead of terminating on its load thread;
+  `dca_plugin_save_state` refuses a state over INT32_MAX. `AbiV48Tests`,
+  `RtWemSourceIsPreloadedNeverStreamed`. → `native-engine-abi.md`
+
 - **ABI v42 decodes Wwise-Vorbis `.wem` NATIVELY (#426):** seven additive
   `dca_wem_*` exports, and every engine format manager opens a `.wem` as a source
   (decoded on the load thread, 16-bit preload). The decoder (`src/wem/`) is a
@@ -908,7 +916,20 @@ purpose — an import would re-load the bytes and defeat the point.
   `Directory.Build.targets` packs the LICENSE. `global.json` pins the SDK with
   `rollForward`, and `.github/workflows/build.yml` installs THAT one
   (`global-json-file:`), runs on pinned runner images, and scopes the default
-  token with a top-level `permissions: contents: read`. `CiWorkflowLintTests`
+  token with a top-level `permissions: contents: read`. It runs on push and
+  pull_request only on the PUBLIC repo: every job carries
+  `if: github.event_name == 'workflow_dispatch' || !github.event.repository.private`,
+  so on the private dev repo those events give a run of skipped jobs (0 paid
+  minutes) and only the "Run workflow" button runs it. A hosted runner has no
+  audio endpoint, so the windows job installs the VB-CABLE virtual device
+  before the managed tests (the default-device engine tests need one), and the
+  test project sets `DeterministicSourcePaths=false` so the `[CallerFilePath]`
+  source lints still find the repo under `ContinuousIntegrationBuild`.
+  Every action is pinned by full commit SHA, every checkout sets
+  `persist-credentials: false`, the concurrency group includes the event, and
+  JUCE / Rubber Band / NeuralAudio are fetched by commit (`*_COMMIT`, the
+  commit their `*_TAG` named).
+  `CiWorkflowLintTests`
   parses the YAML — never grep CI YAML, a substring matches the comment that
   explains why a block is absent.
 - **A shipped package is UNSIGNED, so an `InternalsVisibleTo` naming an assembly

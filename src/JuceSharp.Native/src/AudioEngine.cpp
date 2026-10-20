@@ -1989,7 +1989,12 @@ juce::String TransportSource::openFile(const juce::File& file)
     fileSampleRate_ = reader_->sampleRate;
     storedStep_ = stored.kind == devwav::Kind::Valid ? stored.chunk.step : 0.0f;
 
-    wireReaderToTransport();
+    if (! wireReaderToTransport(/*requirePreload*/ dcwem::isWemReader(*reader_)))
+    {
+        releaseWiring();
+        return juce::String("A .wem must be decoded into memory and the preload budget is exhausted: ")
+             + file.getFullPathName();
+    }
     return {};
 }
 
@@ -2063,7 +2068,12 @@ juce::String TransportSource::openMemory(const void* bytes, size_t numBytes, con
     fileSampleRate_ = reader_->sampleRate;
     storedStep_ = stored.kind == devwav::Kind::Valid ? stored.chunk.step : 0.0f;
 
-    wireReaderToTransport();
+    if (! wireReaderToTransport(/*requirePreload*/ dcwem::isWemReader(*reader_)))
+    {
+        releaseWiring();
+        memoryBytes_.reset();
+        return juce::String("A .wem must be decoded into memory and the preload budget is exhausted.");
+    }
     return {};
 }
 
@@ -2425,9 +2435,14 @@ bool TransportSource::tryWireStreamingResampler(juce::PositionableAudioSource& i
 // replaced, #411) is a multiply-copy loop with no lock, no allocation and no
 // I/O, so a preloaded source removes the mechanism outright instead of
 // shortening the hold.
-void TransportSource::wireReaderToTransport()
+// A WEM is the exception to "stream what does not fit": its decoder allocates
+// (libvorbis state, the packet buffers), and a streamed reader is decoded on the
+// read-ahead thread INSIDE the lock the callback takes, so the callback would
+// wait on it. A WEM that cannot be preloaded is refused instead (requirePreload).
+bool TransportSource::wireReaderToTransport(bool requirePreload)
 {
     const bool preloaded = tryPreloadIntoMemory();
+    if (! preloaded && requirePreload) return false;
 
     if (! preloaded)
     {
@@ -2535,6 +2550,7 @@ void TransportSource::wireReaderToTransport()
     }
     if (std::exchange(wasSongClock_, false))
         engine_.setSongClockSource(this);
+    return true;
 }
 
 juce::AudioSource* TransportSource::sourceForMixer() noexcept
@@ -3807,7 +3823,8 @@ void AudioEngine::prepareChartSourcesForDevice(double sampleRate, int maxBlock)
 }
 
 bool AudioEngine::setChartNotes(int player, const void* notes, int32_t count, int32_t stride,
-                                const dca_chart_bend_point* bends, int32_t bendCount, std::string& error)
+                                const dca_chart_bend_point* bends, int32_t bendCount, std::string& error,
+                                int64_t notesBytes)
 {
     error.clear();
     if (! validPlayer(player)) { error = "player out of range"; return false; }
@@ -3816,7 +3833,7 @@ bool AudioEngine::setChartNotes(int player, const void* notes, int32_t count, in
     std::unique_ptr<dcsynth::ChartNoteTable> next;
     if (count != 0)
     {
-        next = dcsynth::ChartNoteTable::build(notes, count, stride, bends, bendCount, error);
+        next = dcsynth::ChartNoteTable::build(notes, count, stride, bends, bendCount, error, notesBytes);
         if (next == nullptr) return false;
     }
     auto& cs = chart_[(size_t) player];

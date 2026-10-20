@@ -76,7 +76,7 @@ catch (JuceAbiMismatchException ex)
 }
 ```
 
-`NativeVersion` is a log string (`JuceSharp.Native 1.0.0 (ABI 47, JUCE 9.0.3)`
+`NativeVersion` is a log string (`JuceSharp.Native 1.1.0 (ABI 48, JUCE 9.0.3)`
 in shape). Do not parse it for compatibility — the constructor already decided.
 
 ## 3. Enumerate devices without opening one

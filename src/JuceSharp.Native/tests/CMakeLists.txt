@@ -166,6 +166,12 @@ if(DOTCHARTER_DSP_NEURAL)
     set_tests_properties(juce_sharp_nam_lifetime PROPERTIES TIMEOUT 180)
 endif()
 
+# dcabi::copyBlockOut (dca_plugin_save_state's size narrowing); header-only.
+add_executable(juce_sharp_abi_args_test abi_args_test.cpp)
+target_include_directories(juce_sharp_abi_args_test PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_compile_features(juce_sharp_abi_args_test PRIVATE cxx_std_17)
+add_test(NAME abi_args COMMAND juce_sharp_abi_args_test)
+
 # Pure routing mixer contract; no JUCE engine/device or native DLL required.
 add_executable(juce_sharp_lane_mixer_test lane_mixer_test.cpp)
 target_compile_features(juce_sharp_lane_mixer_test PRIVATE cxx_std_17)

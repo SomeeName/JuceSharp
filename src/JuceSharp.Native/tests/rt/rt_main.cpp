@@ -51,6 +51,7 @@
 #include "dsp/cores/dcdsp_tremolo.h"
 #include "dsp/cores/dcdsp_wah.h"
 #include "dsp/cores/dcdsp_looper.h"
+#include "wem/WemVorbisEncoder.h"
 // 2026-09 drive gear (src/dsp/gear/DriveGear.cpp).
 #include "dsp/cores/dcdsp_rat.h"
 #include "dsp/cores/dcdsp_ds1.h"
@@ -4236,6 +4237,74 @@ void scenarioPreloadedSourceHoldsSixteenBitPcm()
     RT_CHECK(dcrt::allocCount() == 0,
              "playing a 16-bit preload allocated " + std::to_string(dcrt::allocCount())
              + " time(s) on the callback");
+
+    endScenario();
+}
+
+// A .wem song is decoded into RAM on the load thread and NEVER streamed. Its
+// decoder allocates (libvorbis state, packet buffers), and a streamed reader is
+// decoded on the read-ahead thread inside the lock the callback takes, so the
+// callback would wait on an allocating decode. This pins both halves: a WEM that
+// fits preloads, holds no decoder and plays without allocating; a WEM that does
+// NOT fit the budget is refused rather than wired to the streaming path (a WAV in
+// the same position still streams -- RtPreloadedSourceAvoidsTheReadAheadLock).
+void scenarioWemSourceIsPreloadedNeverStreamed()
+{
+    beginScenario("RtWemSourceIsPreloadedNeverStreamed");
+    Fixture fx;
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+
+    const int frames = dcwem::kWemEncodeSampleRate * 2;
+    std::vector<float> pcm((size_t) frames * 2);
+    for (int i = 0; i < frames; ++i)
+        pcm[(size_t) i * 2] = pcm[(size_t) i * 2 + 1]
+            = 0.25f * (float) std::sin(2.0 * 3.14159265358979323846 * 220.0 * i / dcwem::kWemEncodeSampleRate);
+    std::vector<uint8_t> wem;
+    dcwem::WemEncodeStats stats;
+    std::string error;
+    if (! dcwem::encodeVorbisWem(pcm.data(), frames, dcwem::kWemEncodeChannels, dcwem::kWemEncodeSampleRate,
+                                 wem, stats, error))
+    { fail("could not encode a .wem fixture: " + error); endScenario(); return; }
+
+    TransportSource src(fx.engine());
+    const auto err = src.openMemory(wem.data(), wem.size(), "wem");
+    if (err.isNotEmpty()) { fail("openMemory(.wem) failed: " + err.toStdString()); endScenario(); return; }
+    RT_CHECK(src.isPreloaded(), "a 2 s .wem did not preload");
+    RT_CHECK(! src.holdsDecoder(), "a preloaded .wem still holds its (allocating) decoder");
+
+    src.play();
+    fx.pumpWarm(8);
+    auto* dev = nulldev::manualDevice();
+    if (dev == nullptr) { fail("no manual null device"); endScenario(); return; }
+    float peak = 0.0f;
+    dcrt::reset();
+    dcrt::arm();
+    for (int b = 0; b < 32; ++b)
+    {
+        dcrt::g_currentBlock.store((unsigned) b, std::memory_order_relaxed);
+        { dcrt::ScopedRtThread rt; nulldev::pump(1); }
+        for (float v : dev->manualOutputBuffers()[0]) peak = std::max(peak, std::abs(v));
+    }
+    dcrt::disarm();
+    reportHeap(".wem preload playback");
+    RT_CHECK(peak > 0.05f, "the .wem never became audible (peak " + std::to_string(peak)
+             + ") -- the allocation check below would be vacuous");
+    RT_CHECK(dcrt::allocCount() == 0,
+             "playing a .wem allocated " + std::to_string(dcrt::allocCount()) + " time(s) on the callback");
+
+    // Exhaust the budget: the next .wem must be REFUSED, not streamed.
+    const int64_t remaining = AudioEngine::preloadBudgetBytes() - src.preloadedBytes();
+    RT_CHECK(remaining > 0 && fx.engine().reservePreloadBytes(remaining),
+             "could not reserve the remaining preload budget");
+    {
+        TransportSource streamed(fx.engine());
+        const auto err2 = streamed.openMemory(wem.data(), wem.size(), "wem");
+        RT_CHECK(err2.isNotEmpty(), "a .wem that could not preload was opened anyway -- it is STREAMING, "
+                                    "i.e. decoded under the lock the callback takes");
+        RT_CHECK(! streamed.holdsDecoder(), "a refused .wem still holds its decoder");
+        RT_CHECK(! streamed.isPreloaded(), "a refused .wem claims a preload");
+    }
+    fx.engine().releasePreloadBytes(remaining);
 
     endScenario();
 }
@@ -12659,6 +12728,8 @@ int main(int argc, char** argv)
     run("RtSandboxMidiLandsOnItsSampleWithoutAllocating",       &scenarioSandboxMidiIsSampleAccurate);
     // ABI v47 (the external process insert), appended last.
     run("RtExternalProcessInsertExchangesWithoutAllocatingAndFallsBackDry", &scenarioExternalProcessInsert);
+    // A .wem is preloaded and never streamed (its decoder allocates), appended last.
+    run("RtWemSourceIsPreloadedNeverStreamed",                  &scenarioWemSourceIsPreloadedNeverStreamed);
 
     // --- meta: the run-list ORDER -----------------------------------------
     // Runs under `--only` as well, unlike the two meta-assertions below: it

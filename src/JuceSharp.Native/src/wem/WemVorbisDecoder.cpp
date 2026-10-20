@@ -564,6 +564,7 @@ std::unique_ptr<WemVorbisDecoder> WemVorbisDecoder::open(std::shared_ptr<const s
 {
     error.clear();
     if (! bytes || bytes->size() < 12) { error = "not a WEM file (too short)"; return nullptr; }
+    if (bytes->size() > kMaxWemBytes) { error = "WEM file larger than the 256 MiB cap"; return nullptr; }
 
     struct Attempt { Variant variant; ForcePackets force; };
     std::vector<Attempt> attempts;
@@ -973,7 +974,14 @@ void WemVorbisDecoder::startBatch(Batch& b, size_t first, bool async)
 {
     joinBatch(b);
     const size_t total = packets_.size();
-    const size_t end = std::min(total, first + (size_t) threads_ * (size_t) lanePackets_);
+    size_t end = std::min(total, first + (size_t) threads_ * (size_t) lanePackets_);
+    // The packet table is the file's own claim; keep a batch's PCM bounded
+    // whatever it says (one packet is at most 4096 frames, far below the cap).
+    const auto batchBytes = [&](size_t e) {
+        return (size_t) (outStartAt(e) - outStartAt(first)) * (size_t) info_.channels * sizeof(float);
+    };
+    while (end > first + 1 && batchBytes(end) > kMaxBatchPcmBytes)
+        end = first + (end - first) / 2;
     const size_t count = end - first;
     // A short tail uses fewer segments rather than slivers of a few packets.
     const size_t minSegment = std::max<size_t>(1, (size_t) lanePackets_ / 4);

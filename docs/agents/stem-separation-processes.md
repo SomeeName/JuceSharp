@@ -21,8 +21,8 @@ cache, the resource policy, the cache key) is
     default that is not a 40-hex SHA or a `v*` tag. Bump the SHA deliberately;
     never put a branch name back.
   - **pip is invoked through `ProcessStartInfo.ArgumentList`, one element per
-    argument** (`PythonEnvManager.BuildPipInstallArguments`; the get-pip
-    bootstrap too). The old `"{pkg}"` string concatenation broke on an embedded
+    argument** (`PythonEnvManager.BuildPipInstallArguments`; the pip-wheel
+    bootstrap too, `BuildPipBootstrapArguments`). The old `"{pkg}"` string concatenation broke on an embedded
     quote and on a wheel path ending in `\`. Pinned by
     `PythonEnvManagerPipArgumentTests`.
   - **The ONNX runtime is the DirectML build (`Microsoft.ML.OnnxRuntime.DirectML`
@@ -176,17 +176,18 @@ cache, the resource policy, the cache key) is
     `"Timed out after …"`. `SeparateTrackAsync` keeps its post-run
     `ThrowIfCancellationRequested()` as a backstop.
   - **The embed bootstrap is serialised CROSS-PROCESS** by
-    `PythonEnvManager.AcquireEnvLockAsync(root, ct)` — a named kernel semaphore
-    per root (`Global\JuceSharp.python-embed.<sha16>`, `Local\` fallback) taken
-    by all three `Ensure*`. It is NOT reentrant: `EnsurePackagesAsync` awaits
-    `EnsurePipAsync` before taking it. `StemSeparator`'s GPU gate is unrelated.
-    **A named `Semaphore` — unlike a `Mutex` — is NOT released when its owner
-    dies**, so the wait is bounded by `GlobalEnvLockTimeout` (30 min): on
-    expiry the manager logs at Warning and proceeds with the process-local gate
-    alone, and the handle it returns knows it never took the count (releasing
-    it anyway would raise the kernel semaphore to 2 for ever). Unbounded, one
-    killed `pip install` left every later `Ensure*` polling for ever with no
-    diagnostic.
+    `PythonEnvManager.AcquireEnvLockAsync(root, ct)` — an exclusive
+    (`FileShare.None`) handle on `<root>/.bootstrap.lock`
+    (`EnvLockFileName`), taken by all three `Ensure*`. It is NOT reentrant:
+    `EnsurePackagesAsync` awaits `EnsurePipAsync` before taking it.
+    `StemSeparator`'s GPU gate is unrelated. **Never put a named kernel object
+    back**: the old `Global\JuceSharp.python-embed.<hash-of-path>` semaphore was
+    nameable — and squattable — by any user, and a semaphore is not released
+    when its owner dies. The file carries the root's ACL and the OS drops the
+    handle on exit. The wait is still bounded by `CrossProcessEnvLockTimeout`
+    (30 min) for a LIVE owner that hangs: on expiry the manager logs at Warning
+    and proceeds with the process-local gate alone.
+    `PythonSupplyChainTests` lints both.
   - **"`python.exe` exists" is NOT "the interpreter is usable".** The extract is
     a per-file copy into `Root`, and `EnsureInterpreterAsync`'s fast path reads
     the result BEFORE taking the gate — so a peer could see `python.exe` land
@@ -238,8 +239,7 @@ cache, the resource policy, the cache key) is
     type (W4-S27). The entry RECORDS stay separate (different domain fields,
     different assemblies, public API) and each keeps its own `ValidateEntry`.
     **The two doors disagree about an unpinned fetch on PURPOSE** — a catalogue
-    refuses, the one-URL primitive warns, because get-pip has nothing stable to
-    pin — and a host that wants the catalogue's refusal for a single URL passes
+    refuses, the one-URL primitive warns (it has no table to consult) — and a host that wants the catalogue's refusal for a single URL passes
     `EnsureFileAsync(..., requireHash: true)` rather than either side changing.
   - **`DemucsGgmlModelCatalog` (`Runtime/`) is the NATIVE backend's table**, the
     ggml twin of `OnnxModelCatalog`, on the same door. Three entries, all
@@ -310,8 +310,8 @@ cache, the resource policy, the cache key) is
     produces `OperationCanceledException`.
   - **Length is checked BEFORE the rename, twice.** A clean early close makes
     `ReadAsync` return 0 and the loop exit normally, so a truncated body used
-    to be renamed into place and — for `get-pip.py`, whose hash is unset by
-    default — EXECUTED. The declared `Content-Length` is enforced at the end of
+    to be renamed into place and — for any caller without a hash — loaded or
+    executed. The declared `Content-Length` is enforced at the end of
     the read loop, and `OnnxModelEntry.SizeBytes` now travels into
     `DownloadAsync` as `expectedSizeBytes` instead of being checked after the
     file was already at the canonical path. The rename itself no longer
@@ -343,10 +343,40 @@ cache, the resource policy, the cache key) is
     GETs agreed.
   - **Downloads are checksum-verified before the atomic rename.** The 3.11.9
     embed zip is pinned (`PythonEnvManager.DefaultPythonEmbedSha256`) — bump it
-    whenever `DefaultPythonVersion` moves. `get-pip.py` cannot be pinned upstream
-    for a supported Python (pypa serves per-version copies only for EOL
-    interpreters); `GetPipSha256` / `GetPipUrl` are opt-in and an unset hash logs
-    a Warning.
+    whenever `DefaultPythonVersion` moves.
+  - **Everything the Python sidecar downloads is pinned by SHA-256 and fetched
+    over https** (`PythonSupplyChainTests`):
+    - **pip is a pinned WHEEL, not `get-pip.py`** (`DefaultPipWheelUrl` /
+      `DefaultPipWheelSha256`). get-pip.py could not be fixed by pinning it: the
+      script installs the LATEST pip (and setuptools/wheel on 3.11) from PyPI
+      with no hash. The wheel is verified, then pip installs itself from it with
+      `--no-index --no-deps`, run via `-c` with the wheel on `sys.path` (pip
+      refuses to modify itself when started as `<wheel>/pip` on Windows). A
+      blank or malformed `PipWheelSha256` and a non-https `PipWheelUrl` are
+      refused before any transfer.
+    - **Packages install from a HASH LOCK**: `PythonScripts/requirements-win_amd64-cp311.lock`,
+      embedded as a resource (`PythonPackageLock`), installed with
+      `--require-hashes --no-deps --only-binary :all:`. It is GENERATED from
+      `PythonPackagePins` by `tools/python-lock/generate_lock.py` (uv resolve for
+      cp311/win_amd64, then only the installable wheels' PyPI SHA-256s). Change a
+      pin ⇒ regenerate the lock in the same change; `PythonSupplyChainTests`
+      fails while a locked version does not satisfy its pin. `EnsurePackagesAsync`
+      refuses any spec that is not a `PythonPackagePins` value, and any
+      non-Windows platform. The lock digest is part of the package stamp.
+    - **Demucs weights never come from demucs.** demucs 4.1's `get_model` takes
+      the HuggingFace hub's latest revision with no hash (and imports the class
+      the file's metadata names), falling back to an 8-hex-digit (32-bit) prefix
+      check plus `weights_only=False`. `StemSeparator` fetches the bag through
+      `VerifiedDownload` (`requireHash: true`) from the revision and SHA-256 in
+      `DemucsWeightPins.g.cs` (generated by `tools/python-lock/generate_demucs_weights.py`,
+      which cross-checks each bag against the hash-locked demucs wheel) and passes
+      `--weights-dir`; `separate_track.py` refuses a Demucs model without it
+      (`PINNED_WEIGHTS_REQUIRED`), forces `HF_HUB_OFFLINE`, and only builds
+      classes from the `demucs.` package. A model name with no pin is an
+      `ArgumentException` before anything is provisioned.
+    - **No interpreter from PATH, and no non-Windows bootstrap.** The package
+      lock is win_amd64 and python.org ships no other embeddable build, so
+      `EnsureInterpreterAsync` throws `PlatformNotSupportedException` elsewhere.
   - **`Probe()` no longer spawns a process per call** (cache key: path + mtime +
     length); `ProbeAsync` / `StemSeparator.IsReadyAsync` exist for UI code.
     `ResetGlobalGateForTests` must never dispose the gate an in-flight separation

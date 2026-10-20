@@ -18,6 +18,7 @@
 //   shm=<mapping> req=<event> resp=<event> pipe=<pipe-name>
 //   sr=<sample-rate> block=<frames> parent=<pid>
 
+#include <limits>
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_events/juce_events.h>
@@ -992,6 +993,9 @@ private:
         if (slot == nullptr || slot->instance == nullptr) return false;
         juce::MemoryOutputStream decoded;
         if (! juce::Base64::convertFromBase64(decoded, base64)) return false;
+        // setStateInformation takes an int: refuse what does not fit rather than
+        // hand the plugin a negative size.
+        if (decoded.getDataSize() > (size_t) std::numeric_limits<int>::max()) return false;
         slot->instance->setStateInformation(decoded.getData(), (int) decoded.getDataSize());
         return true;
     }

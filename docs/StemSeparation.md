@@ -65,14 +65,14 @@ verbatim; run-time phases are emitted by `StemSeparator` itself.
 
 | Phase | Emitted by | What happens | Where the time goes (first run) |
 | ----- | ---------- | ------------ | ------------------------------- |
-| `system` | install | An existing system interpreter was accepted instead of downloading one. | — |
 | `download` | install | `python-3.11.9-embed-amd64.zip` fetched from python.org. | 5–15 s |
 | `extract` | install | The archive is unpacked and `._pth` patched. | 1–5 s |
-| `pip-download` | install | `get-pip.py` is fetched. | seconds |
-| `pip-install` | install | `pip install "torch>=2.1,<2.6" "torchaudio>=2.1,<2.6" "numpy<2" soundfile librosa "demucs>=4.0" "bs_roformer>=1.1.0" pyyaml` — **the bounds are load-bearing**, and `PythonPackagePins` is where they live. torch 2.6 flips `torch.load`'s default to `weights_only=True`, which breaks the demucs / RoFormer checkpoints as published; torchaudio must be co-pinned or pip resolves a build whose native DLLs are ABI-incompatible with the pinned torch (`OSError: [WinError 127]`); numpy 2 breaks the ABI every torch < 2.3 wheel was built against. If you pre-populate an environment by hand, use these strings verbatim. | 60–600 s (mostly torch) |
+| `pip-download` | install | The pinned pip wheel (`PythonEnvManager.DefaultPipWheelUrl`) is fetched over https and checked against its SHA-256; a mismatch is refused before anything runs. pip then installs itself from that file with `--no-index`. | seconds |
+| `pip-install` | install | `pip install --require-hashes --no-deps --only-binary :all: -r requirements-win_amd64-cp311.lock` — the hash-locked set generated from `PythonPackagePins` (`torch>=2.6,<2.9`, `torchaudio>=2.6,<2.9`, `numpy<2`, `soundfile`, `librosa`, `demucs>=4.1`, `bs_roformer>=1.1.0`, `pyyaml`, `safetensors>=0.4`, `onnx>=1.15`) by `tools/python-lock/generate_lock.py`: every wheel of the closure is pinned to one version and its SHA-256, so the index serves exactly those bytes or the install fails. **Windows x64 only**; other platforms are refused. **The bounds are load-bearing.** The torch floor is a security boundary: the scripts read checkpoints with `torch.load(weights_only=True)`, which could still run code from the file before torch 2.6 (CVE-2025-32434); demucs 4.0.x breaks under torch 2.6's new default; torchaudio must be co-pinned or pip resolves a build whose native DLLs are ABI-incompatible with the pinned torch (`OSError: [WinError 127]`); numpy 2 breaks the ABI every torch < 2.3 wheel was built against. If you pre-populate an environment by hand, install the same lock. | 60–600 s (mostly torch) |
 | `pip-installed` | install | The pip run finished. | — |
 | `pip-ready` | install | pip is present and usable. | — |
 | `ready` | install / run | The environment is usable; also emitted once the model is loaded. | — |
+| `weights` | run | Demucs only: the bag's pinned files are checked, and fetched when missing (see §7). | 0 s cached; seconds to minutes first time |
 | `queued` | run | Waiting on the process-global concurrency gate. | — |
 | `loading` | run | Sidecar process spawned, model + checkpoint loaded onto the chosen device. | 2–6 s |
 | `inference` | run | Audio streamed through the model in chunks, progress reported continuously. | depends on duration / GPU |
@@ -119,9 +119,9 @@ is unchanged. Either way, every report carries:
 
 ```csharp
 public readonly record struct StemSeparationProgress(
-    string  Phase,      // install: "system" | "download" | "extract"
+    string  Phase,      // install: "download" | "extract"
                         //   "pip-download" | "pip-install" | "pip-installed" | "pip-ready"
-                        // run: "queued" | "loading" | "ready" | "inference" | "stem" | "done"
+                        // run: "weights" | "queued" | "loading" | "ready" | "inference" | "stem" | "done"
     double  Fraction,   // 0..1 overall, OR -1 for sub-events with no fraction
     string  Message,    // Human-readable, fine for a status line
     string? Stem,       // Stem name if Phase == "stem", else null
@@ -348,16 +348,22 @@ if (!separator.IsReady())
 That is **LocalApplicationData**, not roaming `%APPDATA%`. Override it with the
 `rootDirectory` argument to `PythonEnvManager`.
 
-* `python.exe` (or `python3`) plus its standard library — CPython **3.11.9**
+* `python.exe` plus its standard library — CPython **3.11.9**
   (`PythonEnvManager.DefaultPythonVersion`).
 * `Lib/site-packages/` with torch, demucs, bs_roformer, …
 * Any `*.tmp.*` files in this directory are **partial downloads** from
   a crashed boot. They are swept automatically on the next
   `PythonEnvManager` construction.
 
-Model weights are downloaded by demucs / huggingface into their own
-caches (`~/.cache/torch/hub/`, `~/.cache/huggingface/`), **not** into
-the embed root.
+Demucs weights live in `demucs-weights/<model>/` under the embed root
+(or `StemSeparationOptions.DemucsWeightsDirectory`): `<model>.yaml` and one
+`<sig>.safetensors` per model of the bag, fetched by `StemSeparator` from ONE
+pinned HuggingFace revision with a full SHA-256 each (`DemucsWeightPins`,
+generated by `tools/python-lock/generate_demucs_weights.py`). Every file is
+re-hashed before use. The script loads that directory with the hub forced
+offline; demucs never downloads anything itself, because its own loader takes
+the hub's latest revision unverified, or unpickles a file checked only by a
+32-bit hash prefix.
 
 ---
 
@@ -392,15 +398,17 @@ Process isolation is the only honest answer. The line-protocol pipe is
 < 1 µs per update — it is transparent to the managed wrapper.
 
 **Q: Can I bring my own Python?**
-A: Yes. `PythonEnvManager.Executable` has an `internal` setter
-exposed via `InternalsVisibleTo("JuceSharp.Tests")`. For external
-consumers, simply pre-populate the embed root with a working
-interpreter and skip `EnsureInterpreterAsync`.
+A: Not through the public API. `PythonEnvManager.Executable` has an
+`internal` setter (tests use it), and the manager never searches PATH for an
+interpreter. An embed root you pre-populate yourself is adopted once it
+carries the `.interpreter-ready` stamp; install the same package lock into it
+and pass `SkipPackageBootstrap = true` with a `DemucsWeightsDirectory`.
 
 **Q: Where do model weights download from?**
-A: Demucs models come from `dl.fbaipublicfiles.com` via demucs'
-built-in downloader. RoFormer models come from the Hugging Face Hub.
-Both have their own atomic-swap and resume logic.
+A: Demucs bags come from `huggingface.co/adefossez/*` at a pinned revision,
+fetched and SHA-256-verified by `StemSeparator` (`DemucsWeightPins`) — never by
+demucs' own downloader. A model name with no pin is refused. RoFormer
+checkpoints are a file you pass in `ModelPath`.
 
 **Q: My GPU has 6 GB and `htdemucs_ft` OOMs. What now?**
 A: Catch `StemSeparationVramException`, retry with

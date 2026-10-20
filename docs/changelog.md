@@ -7,6 +7,41 @@ The version lives in `Directory.Build.props` at the repository root (one
 it requires, because the managed wrapper demands exact equality and refuses a
 stale `juce_sharp.dll`.
 
+## 1.1.0 (2026-10-20)
+
+**ABI v48.**
+
+- **Untrusted inputs bounded.** A NAM capture declaring an absurd sample rate
+  dry-bypasses (status `rateMismatch`) instead of terminating the host; `.wem`
+  input is capped at 256 MiB, read once, and a `.wem` song is never streamed
+  (it is refused when it does not fit the preload budget); a plugin state over
+  2 GiB is refused by `dca_plugin_save_state`; stem names from a model yaml must
+  be `[A-Za-z0-9_-]+` and stay inside `--out`.
+- **`dca_engine_chart_source_set_notes_for_player2`** — the chart note upload
+  with the byte length of the notes buffer; `JuceAudioEngine.SetChartNotes`
+  uses it.
+- **Python sidecar supply chain pinned end to end** (`JuceSharp.StemSeparation`).
+  pip is bootstrapped from a SHA-256-pinned wheel instead of `get-pip.py`
+  (`GetPipUrl` / `GetPipSha256` are replaced by `PipWheelUrl` /
+  `PipWheelSha256`, both required, https only). Packages install from a
+  generated hash lock with `--require-hashes --no-deps --only-binary :all:`;
+  `EnsurePackagesAsync` refuses specs outside `PythonPackagePins` and any
+  non-Windows platform. Demucs weights are fetched by `StemSeparator` from a
+  pinned HuggingFace revision with a full SHA-256 per file
+  (`StemSeparationOptions.DemucsWeightsDirectory`); unpinned model names are
+  refused and the script never lets demucs download. The interpreter is never
+  taken from PATH, and the bootstrap gate is a lock file in the root instead of
+  a machine-wide named semaphore. **Breaking:** no system-Python fallback on
+  Linux/macOS.
+- **Safe checkpoint loading** (`JuceSharp.StemSeparation`). torch is pinned to
+  >= 2.6 and checkpoints load with `weights_only=True` first; the full pickle
+  fallback (`CkptToOnnxConverter.AllowUnsafePickleFallback`) runs only when the
+  caller opts in. `.safetensors` never unpickles.
+- **CI on GitHub Actions** — the build and test workflow runs on the public
+  repository (SHA-pinned actions, read-only token, a virtual audio device for
+  the device tests); the private-submodule token is optional.
+- **Sponsor button** — `FUNDING.yml` (Ko-fi).
+
 ## 1.0.0 (2026-10-20): initial public release
 
 **ABI v47.**

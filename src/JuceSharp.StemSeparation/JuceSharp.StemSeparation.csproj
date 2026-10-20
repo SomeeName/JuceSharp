@@ -53,6 +53,14 @@
     </ItemGroup>
 
     <ItemGroup>
+        <!-- The hash-locked package set (tools/python-lock/generate_lock.py).
+             Compiled in rather than copied beside the scripts, so no delivery
+             route can drop it or hand pip a different file. -->
+        <EmbeddedResource Include="PythonScripts\requirements-win_amd64-cp311.lock"
+                          LogicalName="JuceSharp.StemSeparation.requirements-win_amd64-cp311.lock" />
+    </ItemGroup>
+
+    <ItemGroup>
         <InternalsVisibleTo Include="JuceSharp.Tests" />
         <!-- `DotCharter.Tests` was granted here and used nothing: its only
              mention of an internal of this project is the STRING

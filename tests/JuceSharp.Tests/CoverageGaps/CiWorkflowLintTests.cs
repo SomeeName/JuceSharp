@@ -72,6 +72,73 @@ public sealed class CiWorkflowLintTests
     }
 
     /// <summary>
+    /// The guard that keeps the PRIVATE dev repo manual-only. The public repo and
+    /// the private dev repo carry the same workflow; public runs on push and
+    /// pull_request cost nothing, private ones bill every minute. With this
+    /// <c>if:</c> on every job a push or PR on the private repo creates a run
+    /// whose jobs are all skipped, and the "Run workflow" button still runs it all.
+    /// </summary>
+    private const string PrivateRepoGate = "github.event_name == 'workflow_dispatch' || !github.event.repository.private";
+
+    private static List<string> JobsThatCanRunUnattendedOnThePrivateRepo(Dictionary<object, object> workflow)
+    {
+        Assert.True(workflow.TryGetValue("on", out var on), "workflow declares no triggers.");
+        var triggers = on switch
+        {
+            Dictionary<object, object> map => map.Keys.Select(k => (string)k).ToList(),
+            List<object> list => list.Select(t => (string)t).ToList(),
+            _ => new List<string> { (string)on! },
+        };
+        Assert.Contains("workflow_dispatch", triggers);
+        if (triggers.All(t => t == "workflow_dispatch")) return [];
+
+        const string suffix = $"&& ({PrivateRepoGate})";
+        var ungated = new List<string>();
+        foreach (var (id, job) in Jobs(workflow))
+        {
+            var condition = ((Dictionary<object, object>)job).TryGetValue("if", out var value) ? value as string : null;
+            var expression = condition ?? "";
+            if (expression.StartsWith("${{", StringComparison.Ordinal) && expression.EndsWith("}}", StringComparison.Ordinal))
+                expression = expression[3..^2].Trim();
+            var rest = expression == PrivateRepoGate ? ""
+                : expression.EndsWith(suffix, StringComparison.Ordinal) ? expression[..^suffix.Length]
+                : null;
+            if (rest is null || rest.Contains("||", StringComparison.Ordinal))
+                ungated.Add($"{id} (if: {condition ?? "<none>"})");
+        }
+        return ungated;
+    }
+
+    /// <summary>
+    /// A trigger besides <c>workflow_dispatch</c> is allowed only when EVERY job
+    /// is gated on <see cref="PrivateRepoGate"/> (alone, or AND-ed onto a
+    /// condition with no <c>||</c> of its own).
+    /// </summary>
+    [Fact]
+    public void Every_job_of_an_unattended_workflow_is_gated_off_the_private_repo()
+    {
+        foreach (var (name, doc) in Workflows())
+        {
+            var ungated = JobsThatCanRunUnattendedOnThePrivateRepo(doc);
+            Assert.True(ungated.Count == 0,
+                $"{name}: every job must carry `if: {PrivateRepoGate}` (or `${{{{ <condition> && ({PrivateRepoGate}) }}}}`) "
+                + $"so the private dev repo stays manual-only; ungated: {string.Join(", ", ungated)}");
+        }
+    }
+
+    /// <summary>The lint above reports an ungated push trigger and an OR-ed gate, and passes the gated shapes.</summary>
+    [Theory]
+    [InlineData("on:\n  push:\n  workflow_dispatch:\njobs:\n  a:\n    runs-on: x\n  b:\n    if: always()\n    runs-on: x\n", 2)]
+    [InlineData("on:\n  pull_request:\n  workflow_dispatch:\njobs:\n  a:\n    if: ${{ always() || (" + PrivateRepoGate + ") }}\n    runs-on: x\n", 1)]
+    [InlineData("on:\n  push:\n  workflow_dispatch:\njobs:\n  a:\n    if: " + PrivateRepoGate + "\n    runs-on: x\n  b:\n    if: ${{ always() && (" + PrivateRepoGate + ") }}\n    runs-on: x\n", 0)]
+    [InlineData("on:\n  workflow_dispatch:\njobs:\n  a:\n    runs-on: x\n", 0)]
+    public void The_private_repo_gate_lint_is_not_vacuous(string yaml, int expected)
+    {
+        var doc = new DeserializerBuilder().Build().Deserialize<Dictionary<object, object>>(yaml);
+        Assert.Equal(expected, JobsThatCanRunUnattendedOnThePrivateRepo(doc).Count);
+    }
+
+    /// <summary>
     /// The default <c>GITHUB_TOKEN</c> must be scoped by the workflow, not by
     /// whatever the repository settings happen to say. Declaring it at the
     /// TOP LEVEL is the part that matters: a per-job block leaves any job added
@@ -126,15 +193,19 @@ public sealed class CiWorkflowLintTests
     }
 
     /// <summary>
-    /// Every third-party action runs with the repository's token. A ref that is
-    /// a BRANCH ("@main") re-points under the workflow without a commit here.
-    /// A major tag or a full commit SHA are both acceptable; a branch is not.
+    /// Every third-party action runs with the repository's token. A branch
+    /// ("@main") re-points under the workflow without a commit here, and so can a
+    /// TAG: whoever controls the action's repo can move "v4". Only a full commit
+    /// SHA is immutable, so every <c>uses:</c> names one (with the version in a
+    /// comment). And no checkout leaves the token in <c>.git/config</c> for later
+    /// steps: <c>persist-credentials: false</c> on every <c>actions/checkout</c>.
     /// </summary>
     [Fact]
-    public void Every_action_is_pinned_to_a_tag_or_a_sha()
+    public void Every_action_is_pinned_to_a_commit_sha_and_no_checkout_persists_the_token()
     {
-        var pinned = new Regex(@"^[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+@(v\d+(\.\d+)*|[0-9a-f]{40})$");
+        var pinned = new Regex(@"^[A-Za-z0-9._-]+/[A-Za-z0-9._/-]+@[0-9a-f]{40}$");
         var seen = 0;
+        var checkouts = 0;
 
         foreach (var (name, doc) in Workflows())
             foreach (var (jobName, job) in Jobs(doc))
@@ -144,10 +215,31 @@ public sealed class CiWorkflowLintTests
                     seen++;
                     var reference = Assert.IsType<string>(uses);
                     Assert.True(pinned.IsMatch(reference),
-                        $"{name}:{jobName} uses '{reference}', which is not pinned to a version tag or a SHA.");
+                        $"{name}:{jobName} uses '{reference}', which is not pinned to a full commit SHA.");
+                    if (!reference.StartsWith("actions/checkout@", StringComparison.Ordinal)) continue;
+                    checkouts++;
+                    var with = step.TryGetValue("with", out var w) ? w as Dictionary<object, object> : null;
+                    Assert.True(with is not null && with.TryGetValue("persist-credentials", out var persist) && (string)persist == "false",
+                        $"{name}:{jobName} checks out without `persist-credentials: false`.");
                 }
 
         Assert.True(seen >= 4, $"only {seen} `uses:` steps found — has the workflow moved?");
+        Assert.True(checkouts >= 2, $"only {checkouts} checkouts found — has the workflow moved?");
+    }
+
+    /// <summary>
+    /// The event is part of the concurrency group, so a push run (all jobs
+    /// skipped on the private repo) can never cancel a manual run of the same ref.
+    /// </summary>
+    [Fact]
+    public void The_concurrency_group_is_per_event()
+    {
+        foreach (var (name, doc) in Workflows())
+        {
+            if (!doc.TryGetValue("concurrency", out var concurrency)) continue;
+            var group = Assert.IsType<string>(Assert.IsType<Dictionary<object, object>>(concurrency)[(object)"group"]);
+            Assert.Contains("github.event_name", group, StringComparison.Ordinal);
+        }
     }
 
     /// <summary>

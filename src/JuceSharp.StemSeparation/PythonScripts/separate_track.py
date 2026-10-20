@@ -15,15 +15,25 @@ failure. Exit code 0 == success.
 
 Supports two backends:
 
-  --model htdemucs|htdemucs_ft|htdemucs_6s|mdx_extra|...
-        Loads the corresponding pretrained Demucs bag and runs
-        `demucs.apply.apply_model`. No --model-path needed.
+  --model htdemucs|htdemucs_ft|htdemucs_6s|mdx_extra|...  --weights-dir <dir>
+        Loads the corresponding pretrained Demucs bag from <dir> and runs
+        `demucs.apply.apply_model`. The directory holds `<model>.yaml` and one
+        `<sig>.safetensors` per model of the bag, fetched and SHA-256-verified
+        by the host (JuceSharp's DemucsWeightPins). This script never lets
+        demucs fetch weights itself: demucs' own loader takes the HuggingFace
+        hub's latest revision unverified, or unpickles a file checked only by
+        a 32-bit hash prefix.
 
-  --model bs_roformer  --model-path <onnx-or-ckpt>  [--config <yaml>]
-        Loads a BS-RoFormer state_dict + yaml from disk.
+  --model bs_roformer  --model-path <ckpt-or-safetensors>  [--config <yaml>]
+        Loads a BS-RoFormer state_dict + yaml from disk. A .safetensors file
+        is read without pickle; anything else only with
+        torch.load(weights_only=True) on torch >= 2.6 — this script never
+        runs code contained in a checkpoint.
 """
 import argparse
+import json
 import os
+import re
 import sys
 import time
 import traceback
@@ -78,22 +88,93 @@ def _load_audio(path: str, sample_rate: int):
     return audio, sample_rate
 
 
+_STEM_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
+def _stem_path(out_dir: str, name) -> str:
+    """Where a stem is written. Stem names come from the model's yaml (a file
+    the user supplies), so a name is a bare token or it is refused, and the
+    resolved path must still be inside the output directory."""
+    if not isinstance(name, str) or not name or not all(c in _STEM_CHARS for c in name):
+        raise ValueError(f"INVALID_STEM_NAME: {name!r} is not [A-Za-z0-9_-]+.")
+    root = os.path.realpath(out_dir)
+    path = os.path.realpath(os.path.join(root, f"{name}.wav"))
+    if os.path.dirname(path) != root:
+        raise ValueError(f"INVALID_STEM_NAME: {name!r} resolves outside the output directory.")
+    return path
+
+
 def _save_stem(out_dir: str, name: str, audio, sample_rate: int) -> str:
     import soundfile as sf
     os.makedirs(out_dir, exist_ok=True)
-    path = os.path.join(out_dir, f"{name}.wav")
+    path = _stem_path(out_dir, name)
     sf.write(path, audio.T, sample_rate, subtype="FLOAT")
     return path
 
 
+_DEMUCS_MODEL = re.compile(r"^[A-Za-z0-9_]+$")
+_DEMUCS_SIG = re.compile(r"^[0-9a-f]{8}$")
+
+
+def _require_demucs_class(dotted) -> None:
+    """A safetensors bag names the class to build in its metadata, and demucs
+    imports and instantiates it. The files are hash-pinned; this is the second
+    line: only a class from the demucs package itself is ever built."""
+    if not isinstance(dotted, str) or not dotted.startswith("demucs.") or ".." in dotted:
+        raise ValueError(f"UNTRUSTED_MODEL_CLASS: {dotted!r} is not a demucs class.")
+
+
+def _check_structure_classes(node) -> None:
+    if isinstance(node, dict):
+        if "_class" in node:
+            _require_demucs_class(node["_class"])
+        for value in node.values():
+            _check_structure_classes(value)
+    elif isinstance(node, list):
+        for value in node:
+            _check_structure_classes(value)
+
+
+def _load_pinned_bag(model: str, weights_dir: str):
+    """The bag from the host's verified directory, with the hub forced offline."""
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    import yaml
+    from safetensors import safe_open
+    from demucs.apply import BagOfModels
+    from demucs.hf import load_safetensors_model
+
+    if not _DEMUCS_MODEL.match(model):
+        raise ValueError(f"Invalid Demucs model name {model!r}.")
+    with open(os.path.join(weights_dir, f"{model}.yaml"), "r", encoding="utf-8") as f:
+        spec = yaml.safe_load(f)
+    models = []
+    for sig in spec["models"]:
+        if not isinstance(sig, str) or not _DEMUCS_SIG.match(sig):
+            raise ValueError(f"Invalid model signature {sig!r} in {model}.yaml.")
+        path = os.path.join(weights_dir, f"{sig}.safetensors")
+        with safe_open(path, framework="pt") as fh:
+            meta = fh.metadata() or {}
+        _require_demucs_class(meta.get("klass"))
+        if "structure" in meta:
+            _check_structure_classes(json.loads(meta["structure"]))
+        models.append(load_safetensors_model(path))
+    bag = BagOfModels(models, spec.get("weights"), spec.get("segment"))
+    bag.eval()
+    return bag
+
+
 def _run_demucs(args) -> None:
+    if not args.weights_dir or not os.path.isdir(args.weights_dir):
+        raise FileNotFoundError(
+            "PINNED_WEIGHTS_REQUIRED: a Demucs model needs --weights-dir, a directory of "
+            f"hash-verified weights (got: {args.weights_dir!r}). This script never downloads weights."
+        )
     import numpy as np
     import torch
     from demucs.apply import apply_model
-    from demucs.pretrained import get_model
 
-    _progress(0.06, "Fetching Demucs bag…")
-    bag = get_model(args.model)
+    _progress(0.06, "Loading Demucs bag…")
+    bag = _load_pinned_bag(args.model, args.weights_dir)
     device = _pick_device(args.device)
     _emit(f"DEVICE {device}")
     bag.to(device)
@@ -134,9 +215,24 @@ def _run_demucs(args) -> None:
     _progress(1.0, "Done.")
 
 
-def _run_roformer(args) -> None:
-    import numpy as np
+def _load_state_dict_safely(path: str):
+    """Plain weights only: .safetensors without pickle, else a weights-only
+    torch.load, which is a real boundary from torch 2.6 (CVE-2025-32434)."""
+    if path.lower().endswith(".safetensors"):
+        from safetensors.torch import load_file
+        return load_file(path, device="cpu")
     import torch
+    major, minor = (int("".join(c for c in p if c.isdigit()) or 0)
+                    for p in torch.__version__.split("+")[0].split(".")[:2])
+    if (major, minor) < (2, 6):
+        raise RuntimeError(
+            f"UNSAFE_PICKLE_REFUSED: torch {torch.__version__} cannot load a "
+            f"checkpoint safely; torch >= 2.6 is required."
+        )
+    return torch.load(path, map_location="cpu", weights_only=True)
+
+
+def _run_roformer(args) -> None:
     import yaml
 
     if not args.model_path or not os.path.isfile(args.model_path):
@@ -153,10 +249,17 @@ def _run_roformer(args) -> None:
 
     model_kwargs = cfg.get("model") or cfg.get("roformer") or {}
     stems_cfg = list(model_kwargs.get("stems") or cfg.get("stems") or ["vocals", "other"])
+    # Every name is checked BEFORE torch is imported, the checkpoint loads or
+    # anything is written.
+    for name in stems_cfg:
+        _stem_path(args.out, name)
+
+    import numpy as np
+    import torch
     sample_rate = int(model_kwargs.get("sample_rate") or cfg.get("sample_rate") or 44100)
 
     _progress(0.06, "Loading RoFormer checkpoint…")
-    state = torch.load(args.model_path, map_location="cpu", weights_only=False)
+    state = _load_state_dict_safely(args.model_path)
     if isinstance(state, dict) and "state_dict" in state:
         state = state["state_dict"]
 
@@ -234,6 +337,7 @@ def main() -> int:
     ap.add_argument("--overlap", type=float, default=0.25)
     ap.add_argument("--model-path", dest="model_path", default=None)
     ap.add_argument("--config", default=None)
+    ap.add_argument("--weights-dir", dest="weights_dir", default=None)
     ap.add_argument("--stems", default=None)
     ap.add_argument("--selftest", action="store_true",
                     help="Validate argument parsing and emit a fake STEM line. "

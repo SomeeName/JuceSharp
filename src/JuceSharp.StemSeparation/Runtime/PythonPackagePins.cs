@@ -21,10 +21,12 @@ namespace JuceSharp.StemSeparation.Runtime;
 /// </summary>
 internal static class PythonPackagePins
 {
-    /// <summary>PyTorch. The upper bound is deliberate: 2.6 changed
-    /// <c>torch.load</c>'s default to <c>weights_only=True</c>, which breaks
-    /// loading the demucs / RoFormer checkpoints as they are published.</summary>
-    public const string Torch = "torch>=2.1,<2.6";
+    /// <summary>PyTorch. The floor is a security boundary: before 2.6.0
+    /// <c>torch.load(weights_only=True)</c> could still run code from the file
+    /// (CVE-2025-32434), and the scripts rely on it to read checkpoints
+    /// without executing them (DotCharter#105). The ceiling keeps the
+    /// range to releases the scripts and torchaudio were checked against.</summary>
+    public const string Torch = "torch>=2.6,<2.9";
 
     /// <summary>
     /// torchaudio must be co-pinned with <see cref="Torch"/>: demucs depends
@@ -33,9 +35,10 @@ internal static class PythonPackagePins
     /// <c>OSError: [WinError 127]</c> when torchaudio's
     /// <c>_extension/_torchaudio.pyd</c> binds to torch C++ symbols.
     /// </summary>
-    public const string TorchAudio = "torchaudio>=2.1,<2.6";
+    public const string TorchAudio = "torchaudio>=2.6,<2.9";
 
-    /// <summary>numpy 2 breaks the ABI every torch &lt; 2.3 wheel was built against.</summary>
+    /// <summary>numpy 2 broke the ABI every torch &lt; 2.3 wheel was built against; kept
+    /// for the rest of the stack (demucs, librosa) now that torch is 2.6+.</summary>
     public const string Numpy = "numpy<2";
 
     /// <summary>Config loading for the RoFormer family.</summary>
@@ -47,11 +50,23 @@ internal static class PythonPackagePins
     /// <summary>Resampling for the separator sidecar.</summary>
     public const string Librosa = "librosa";
 
-    /// <summary>htdemucs / mdx_extra families.</summary>
-    public const string Demucs = "demucs>=4.0";
+    /// <summary>htdemucs / mdx_extra families. 4.1 is the floor because 4.0.x
+    /// calls <c>torch.load</c> with the default torch 2.6 flipped to
+    /// <c>weights_only=True</c>.
+    /// <para>4.1's own weight loading is NOT a pin, checked in its source: it
+    /// tries the HuggingFace hub first with no revision and no hash, and falls
+    /// back to <c>dl.fbaipublicfiles.com</c> with <c>check_hash=True</c>, which
+    /// compares only the 8-hex-digit (32-bit) SHA-256 prefix in the file name
+    /// before an unpickle with <c>weights_only=False</c>. So the script never
+    /// lets demucs fetch: <see cref="DemucsWeightPins"/> does, with full
+    /// hashes.</para></summary>
+    public const string Demucs = "demucs>=4.1";
 
     /// <summary>BS-RoFormer family.</summary>
     public const string BsRoformer = "bs_roformer>=1.1.0";
+
+    /// <summary>Pickle-free <c>.safetensors</c> checkpoints, read by both scripts.</summary>
+    public const string SafeTensors = "safetensors>=0.4";
 
     /// <summary>ONNX graph export, converter only.</summary>
     public const string Onnx = "onnx>=1.15";
@@ -89,5 +104,6 @@ internal static class PythonPackagePins
             [Demucs] = "demucs",
             [BsRoformer] = "bs_roformer",
             [Onnx] = "onnx",
+            [SafeTensors] = "safetensors",
         };
 }

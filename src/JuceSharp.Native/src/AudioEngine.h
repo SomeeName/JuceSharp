@@ -344,8 +344,11 @@ public:
     bool forgetSongClockSource(TransportSource* source) noexcept;
     /// Validates and publishes a new note table (count 0 clears). False with
     /// `error` set when the list breaks a rule; the previous table then stays.
+    /// `notesBytes` is the size of the `notes` buffer (v48); -1 means the
+    /// caller did not say (the v38 export), and the count and stride are trusted.
     bool setChartNotes(int player, const void* notes, int32_t count, int32_t stride,
-                       const dca_chart_bend_point* bends, int32_t bendCount, std::string& error);
+                       const dca_chart_bend_point* bends, int32_t bendCount, std::string& error,
+                       int64_t notesBytes = -1);
     /// ON builds the selected voice (loading its pack) before it publishes the
     /// flag; OFF fades the voice out and RELEASES it — and with it the sample
     /// pack's memory — on the chart reaper thread once it is silent (#61).
@@ -3569,7 +3572,9 @@ public:
 private:
     /// Seek the transport and reset the stretcher(s) in front of it.
     void moveTransportTo(double seconds);
-    void wireReaderToTransport();
+    /// False only when `requirePreload` and the reader could not be decoded into
+    /// RAM; nothing is wired then (a WEM is never streamed, see the .cpp).
+    bool wireReaderToTransport(bool requirePreload);
     /// Decode the whole file into RAM and play from there. See the comment
     /// on wireReaderToTransport for why this is not merely an optimisation.
     bool tryPreloadIntoMemory();

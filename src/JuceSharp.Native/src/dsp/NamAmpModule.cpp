@@ -123,6 +123,16 @@ constexpr float kTrimMaxDb =  24.0f;
 // 32 frames is ~0.7 ms at 44.1 kHz and swamps a residue of ~3.
 constexpr int kSrcPrimeFrames = 32;
 
+// The capture rates the module will convert from. A .nam / .aidax names its own
+// rate, and a shared capture is untrusted input: a huge finite rate used to
+// overflow the frame arithmetic below and size buffers from the overflow.
+constexpr double kMinModelRate = 8000.0;
+constexpr double kMaxModelRate = 384000.0;
+// Upper bound on one block's frames at the MODEL rate. With the rates above and
+// any block the engine negotiates this is never reached; past it the capture
+// dry-bypasses instead of allocating.
+constexpr int kMaxModelFrames = 1 << 20;
+
 // How often the worker wakes to collect retired models while any are parked.
 // It only has to outlast one audio block, so this is generous.
 constexpr int kSweepIntervalMs = 4;
@@ -588,14 +598,31 @@ private:
 
             if (holder->model != nullptr)
             {
-                const bool ok = armRateAdaptation(*holder);
-                if (ok)
+                // Everything from here to the publish runs on this std::thread,
+                // where an escaping exception is std::terminate for the whole
+                // host. Arming allocates sizes that come from the capture file,
+                // so a failure there is a capture that dry-bypasses with
+                // "rateMismatch", never a crash.
+                bool ok = false;
+                try
                 {
-                    // The loader was told a default buffer size derived from an
-                    // assumed 48 kHz capture; re-size for what the capture
-                    // actually reported before it ever sees a block.
-                    holder->model->SetMaxAudioBufferSize(
-                        holder->resample ? holder->modelCap : holder->hostBlock);
+                    ok = armRateAdaptation(*holder);
+                    if (ok)
+                    {
+                        // The loader was told a default buffer size derived from an
+                        // assumed 48 kHz capture; re-size for what the capture
+                        // actually reported before it ever sees a block.
+                        holder->model->SetMaxAudioBufferSize(
+                            holder->resample ? holder->modelCap : holder->hostBlock);
+                    }
+                }
+                catch (...)
+                {
+                    ok = false;
+                    holder->resample = false;
+                    holder->latency  = 0;
+                    std::vector<float>().swap(holder->modelScratch);
+                    std::vector<float>().swap(holder->outFifo);
                 }
 #if DCA_NAM_TEST_HOOKS
                 if (namLoadTestHook) namLoadTestHook(1);
@@ -627,7 +654,7 @@ private:
     static bool armRateAdaptation(LoadedModel& lm)
     {
         const double model = (double) lm.sampleRate;
-        if (!(model > 1000.0) || !std::isfinite(model)) return false;
+        if (!std::isfinite(model) || model < kMinModelRate || model > kMaxModelRate) return false;
 
         if (std::fabs(lm.hostRate - model) <= 1.0)
         {
@@ -637,6 +664,7 @@ private:
             return true;
         }
 
+        if (modelFramesFor(lm.hostBlock, lm.hostRate, model) > (double) kMaxModelFrames) return false;
         lm.modelCap = maxModelFrames(lm.hostBlock, lm.hostRate, model);
         lm.toModel.prepare(lm.hostRate, model, lm.hostBlock);
         lm.toHost.prepare(model, lm.hostRate, lm.modelCap);
@@ -651,11 +679,21 @@ private:
         return true;
     }
 
+    /// One host block's frames at the model rate, in double so no rate can
+    /// overflow it.
+    static double modelFramesFor(int hostBlock, double hostRate, double modelRate)
+    {
+        if (!(hostRate > 0.0) || !(modelRate > 0.0) || !std::isfinite(hostRate) || !std::isfinite(modelRate))
+            return (double) hostBlock;
+        return std::ceil((double) hostBlock * (modelRate / hostRate)) + 32.0;
+    }
+
+    /// modelFramesFor, clamped to [1, kMaxModelFrames] before the cast.
     static int maxModelFrames(int hostBlock, double hostRate, double modelRate)
     {
-        if (!(hostRate > 0.0) || !(modelRate > 0.0)) return hostBlock;
-        const double ratio = modelRate / hostRate;
-        return (int) std::ceil((double) hostBlock * ratio) + 32;
+        const double frames = modelFramesFor(hostBlock, hostRate, modelRate);
+        if (!(frames >= 1.0)) return 1;
+        return frames >= (double) kMaxModelFrames ? kMaxModelFrames : (int) frames;
     }
 
     void shutdownWorker()

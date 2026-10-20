@@ -5,7 +5,7 @@ project(JuceSharpNative
     # sees. It sat at 0.3.0 for five releases while dca_version_string()
     # hard-coded the same stale number a second time; the string is generated
     # from this now, so there is one place to bump.
-    VERSION 1.0.0
+    VERSION 1.1.0
     DESCRIPTION "JuceSharp native audio engine (JUCE-based)"
     # C is required as of JUCE 8.0.15 (and by 9.x, which builds its zlib/FLAC as C) — its own CMakeLists hard-errors with
     # "A C compiler is required to build targets that depend on JUCE" when the
@@ -34,9 +34,9 @@ option(JUCESHARP_USE_SYSTEM_JUCE "Alias of DOTCHARTER_USE_SYSTEM_JUCE for the st
 if(JUCESHARP_USE_SYSTEM_JUCE)
     set(DOTCHARTER_USE_SYSTEM_JUCE ON)
 endif()
-# p1-13: pin to a tagged release. The tag is immutable in upstream JUCE so a
-# fresh FetchContent always resolves to the same tree. Override at configure
-# time via -DJUCE_TAG=... if you need a different release.
+# p1-13: pin to a tagged release, fetched by the commit that tag names
+# (JUCE_COMMIT below: a tag CAN be moved upstream, a commit cannot). Override at
+# configure time via -DJUCE_TAG=... -DJUCE_COMMIT=... for a different release.
 # 9.0.3 (2026-09). A PURE PORT from 8.0.15: same behaviour, no new feature. What
 # 9.0.x changes underneath THIS engine, read off `git diff 8.0.15 9.0.3`, and
 # what was done about each:
@@ -83,6 +83,11 @@ endif()
 # JUCESHARP_JUCE_TAG told dca_version_string() "8.0.15". The version check after
 # FetchContent_MakeAvailable below now refuses that mismatch at configure time.
 set(JUCE_TAG "9.0.3" CACHE STRING "JUCE git tag/branch to fetch")
+# The fetch is pinned by COMMIT, not by the tag (a tag can be moved upstream):
+# JUCE_COMMIT is the commit JUCE_TAG named when it was pinned. Override BOTH
+# together. JUCE_TAG stays the release name the version check below compares.
+# No GIT_SHALLOW: CMake can only shallow-clone a branch or tag, never a SHA.
+set(JUCE_COMMIT "be29c81492b6151c8ea8d14c840e1311963b3a83" CACHE STRING "JUCE commit of JUCE_TAG")
 if(JUCE_TAG MATCHES "^(main|master|develop|HEAD)$")
     message(WARNING "JuceSharp: JUCE_TAG='${JUCE_TAG}' is a mutable ref; builds are not reproducible. "
                     "Set -DJUCE_TAG=<tag-or-sha> for a pinned build.")
@@ -98,8 +103,7 @@ else()
     FetchContent_Declare(
         JUCE
         GIT_REPOSITORY https://github.com/juce-framework/JUCE.git
-        GIT_TAG        ${JUCE_TAG}
-        GIT_SHALLOW    TRUE)
+        GIT_TAG        ${JUCE_COMMIT})
     FetchContent_MakeAvailable(JUCE)
 endif()
 
@@ -141,6 +145,8 @@ endif()
 # requires the commercial Rubber Band licence — see
 # https://breakfastquay.com/rubberband/licensing.html
 set(RUBBERBAND_TAG "v4.0.0" CACHE STRING "Rubber Band git tag")
+# Fetched by the commit RUBBERBAND_TAG named when pinned (see JUCE_COMMIT).
+set(RUBBERBAND_COMMIT "1d95888bec3ae0a17c0c4af791810d5a63f6bc35" CACHE STRING "Rubber Band commit of RUBBERBAND_TAG")
 if(RUBBERBAND_TAG MATCHES "^(main|master|default-branch|HEAD)$")
     message(WARNING "JuceSharp: RUBBERBAND_TAG='${RUBBERBAND_TAG}' is a mutable ref; builds are not reproducible.")
 endif()
@@ -149,8 +155,7 @@ include(FetchContent)
 FetchContent_Declare(
     rubberband
     GIT_REPOSITORY https://github.com/breakfastquay/rubberband.git
-    GIT_TAG        ${RUBBERBAND_TAG}
-    GIT_SHALLOW    TRUE)
+    GIT_TAG        ${RUBBERBAND_COMMIT})
 FetchContent_MakeAvailable(rubberband)
 
 # ---------------------------------------------------------------------------
@@ -520,6 +525,8 @@ option(DOTCHARTER_DSP_NEURAL "Build the namamp neural-capture module (NeuralAudi
 # upstream tags v0.0.1..v0.1.3, and the old SHA sat 9 days and 15 commits
 # BEHIND v0.1.3.) Override with -DNEURALAUDIO_TAG=... if needed.
 set(NEURALAUDIO_TAG "v0.1.3" CACHE STRING "NeuralAudio git sha/tag to fetch")
+# Fetched by the commit NEURALAUDIO_TAG named when pinned (see JUCE_COMMIT).
+set(NEURALAUDIO_COMMIT "b1137e1db2d43670e7dcf6345ade7808613cac20" CACHE STRING "NeuralAudio commit of NEURALAUDIO_TAG")
 
 if(DOTCHARTER_DSP_NEURAL)
     include(FetchContent)
@@ -542,7 +549,7 @@ if(DOTCHARTER_DSP_NEURAL)
     FetchContent_Declare(
         neuralaudio
         GIT_REPOSITORY https://github.com/mikeoliphant/NeuralAudio.git
-        GIT_TAG        ${NEURALAUDIO_TAG}
+        GIT_TAG        ${NEURALAUDIO_COMMIT}
         GIT_SUBMODULES "deps/NeuralAmpModelerCore;deps/RTNeural;deps/math_approx"
         GIT_SUBMODULES_RECURSE OFF
         PATCH_COMMAND  git -C deps/RTNeural submodule update --init modules/xsimd

@@ -146,6 +146,7 @@ public sealed class NativeMethodsTests
     [InlineData(nameof(NativeMethods.EngineGetInputInjectionStatusForPlayer), "dca_engine_get_input_injection_status_for_player")]
     [InlineData(nameof(NativeMethods.EngineSetSongClockSource), "dca_engine_set_song_clock_source")]
     [InlineData(nameof(NativeMethods.EngineChartSourceSetNotesForPlayer), "dca_engine_chart_source_set_notes_for_player")]
+    [InlineData(nameof(NativeMethods.EngineChartSourceSetNotesForPlayer2), "dca_engine_chart_source_set_notes_for_player2")]
     [InlineData(nameof(NativeMethods.EngineChartSourceSetEnabledForPlayer), "dca_engine_chart_source_set_enabled_for_player")]
     [InlineData(nameof(NativeMethods.EngineChartSourceSetVoiceForPlayer), "dca_engine_chart_source_set_voice_for_player")]
     [InlineData(nameof(NativeMethods.EngineChartSourceSetParamsForPlayer), "dca_engine_chart_source_set_params_for_player")]

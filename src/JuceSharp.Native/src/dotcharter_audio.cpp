@@ -1634,6 +1634,30 @@ DCA_API dca_status DCA_CALL dca_engine_chart_source_set_notes_for_player(dca_eng
 });
 }
 
+DCA_API dca_status DCA_CALL dca_engine_chart_source_set_notes_for_player2(dca_engine_t handle,
+                                                                          int32_t player,
+                                                                          const dca_chart_note* notes,
+                                                                          int32_t note_count,
+                                                                          int32_t note_stride_bytes,
+                                                                          int64_t notes_byte_length,
+                                                                          const dca_chart_bend_point* bends,
+                                                                          int32_t bend_count)
+{
+    return guard("dca_engine_chart_source_set_notes_for_player2", [&]() -> dca_status {
+    auto* e = reinterpret_cast<Engine*>(handle);
+    if (!e || !dotcharter::AudioEngine::validPlayer((int) player)) return DCA_ERR_INVALID_ARG;
+    if (notes_byte_length < 0) return DCA_ERR_INVALID_ARG;
+    std::string error;
+    if (!e->impl.setChartNotes((int) player, notes, note_count, note_stride_bytes, bends, bend_count, error,
+                               notes_byte_length))
+    {
+        emitLog(DCA_LOG_WARN, ("chart_source_set_notes rejected: " + error).c_str());
+        return DCA_ERR_INVALID_ARG;
+    }
+    return DCA_OK;
+});
+}
+
 DCA_API dca_status DCA_CALL dca_engine_chart_source_set_enabled_for_player(dca_engine_t handle,
                                                                            int32_t player,
                                                                            int32_t enabled)
@@ -3322,10 +3346,19 @@ DCA_API dca_status DCA_CALL dca_wem_open_file(const char* path, int32_t variant,
             emitLog(DCA_LOG_ERROR, "wem_open_file: file not found");
             return DCA_ERR_DECODE;
         }
-        juce::MemoryBlock block;
-        if (!file.loadFileAsData(block) || block.getSize() == 0) return DCA_ERR_DECODE;
-        const auto* p = static_cast<const uint8_t*>(block.getData());
-        auto bytes = std::make_shared<std::vector<uint8_t>>(p, p + block.getSize());
+        // Capped before a byte is read, and read ONCE, straight into the
+        // buffer the decoder keeps (it used to go through a MemoryBlock first).
+        const juce::int64 size = file.getSize();
+        if (size <= 0) return DCA_ERR_DECODE;
+        if ((uint64_t) size > (uint64_t) dcwem::kMaxWemBytes)
+        {
+            emitLog(DCA_LOG_ERROR, "wem_open_file: file larger than the 256 MiB cap");
+            return DCA_ERR_DECODE;
+        }
+        juce::FileInputStream in(file);
+        if (in.failedToOpen()) return DCA_ERR_DECODE;
+        auto bytes = std::make_shared<std::vector<uint8_t>>((size_t) size);
+        if (in.read(bytes->data(), (int) size) != (int) size) return DCA_ERR_DECODE;
         return openWem(std::move(bytes), variant, out);
     });
 }
@@ -3335,6 +3368,11 @@ DCA_API dca_status DCA_CALL dca_wem_open_memory(const uint8_t* data, size_t leng
     if (out) *out = nullptr;
     if (!data || length == 0 || !out || !validWemVariant(variant)) return DCA_ERR_INVALID_ARG;
     return guard("dca_wem_open_memory", [&]() -> dca_status {
+        if (length > dcwem::kMaxWemBytes)
+        {
+            emitLog(DCA_LOG_ERROR, "wem_open_memory: buffer larger than the 256 MiB cap");
+            return DCA_ERR_DECODE;
+        }
         auto bytes = std::make_shared<std::vector<uint8_t>>(data, data + length);
         return openWem(std::move(bytes), variant, out);
     });
@@ -4042,11 +4080,12 @@ DCA_API dca_status DCA_CALL dca_plugin_save_state(dca_plugin_t handle, uint8_t* 
     {
         p->instance->getStateInformation(block);
     });
-    *out = (int32_t) block.getSize();
-    if (buffer != nullptr && capacity > 0)
+    // A state past INT32_MAX cannot be reported through the int32 out-param;
+    // the cast used to make it negative and memcpy then read it as a huge size.
+    if (! dcabi::copyBlockOut(block.getData(), block.getSize(), buffer, capacity, out))
     {
-        const int32_t n = std::min<int32_t>(capacity, (int32_t) block.getSize());
-        std::memcpy(buffer, block.getData(), (size_t) n);
+        emitLog(DCA_LOG_ERROR, "plugin_save_state: the plugin's state is larger than 2 GiB");
+        return DCA_ERR_PLUGIN;
     }
     return DCA_OK;
 });

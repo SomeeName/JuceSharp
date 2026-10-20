@@ -109,6 +109,34 @@ bounded and lossless; sustained back-pressure surfaces as `room == 0`, and the
 drop is accounted on the PRODUCER side (`dca_engine_get_midi_timing_stats`'
 `dropped`), which is where a diagnostician should look.
 
+## ABI v48 — the note upload names its byte length
+
+- **One additive export:** `dca_engine_chart_source_set_notes_for_player2(engine,
+  player, notes, note_count, note_stride_bytes, notes_byte_length, bends,
+  bend_count)`. `ChartNoteTable::build` rejects the list whole when
+  `note_count * note_stride_bytes` (int64) exceeds `notes_byte_length`; a negative
+  length is `DCA_ERR_INVALID_ARG`. The v38 export is unchanged and still trusts its
+  caller (it passes -1, "not said"). `JuceAudioEngine.SetChartNotes` calls the v48
+  one with `notes.Length * sizeof(DcaChartNote)`. `AbiV48Tests`.
+- **Untrusted-input caps that came with it (no ABI change):**
+  - `namamp` converts only from capture rates in [8 kHz, 384 kHz]; frame counts
+    are computed in double and capped (`kMaxModelFrames`); arming and the
+    buffer resize run inside a `try/catch` on the load worker, so a bad capture
+    publishes as `rateMismatch` (dry bypass) instead of `std::terminate`.
+    `juce_sharp_nam_lifetime` loads a capture declaring 1e12 Hz.
+  - `.wem` input is capped at 256 MiB (`dcwem::kMaxWemBytes`) in
+    `dca_wem_open_file` (checked before the read, read once), `dca_wem_open_memory`
+    (before the copy) and `WemAudioFormat` (declared length, then running total);
+    a parallel decode batch holds at most `kMaxBatchPcmBytes` of PCM whatever the
+    packet table claims. `Wem/WemInputCapTests`.
+  - **A `.wem` source is never streamed:** `TransportSource::wireReaderToTransport(requirePreload)`
+    refuses a WEM reader that does not fit the preload budget instead of putting
+    its allocating decoder behind the read-ahead lock the callback takes.
+    `RtWemSourceIsPreloadedNeverStreamed`.
+  - `dca_plugin_save_state` refuses a state over INT32_MAX with `DCA_ERR_PLUGIN`
+    (`dcabi::copyBlockOut`, native `abi_args` test); the VST host child refuses a
+    decoded state over `INT_MAX` before `setStateInformation`.
+
 ## ABI v47 — the external process insert
 
 - **Six additive exports, one struct, two appended statuses.**

@@ -45,9 +45,11 @@ python tools/check-doc-links.py
 
 CI is [`.github/workflows/build.yml`](.github/workflows/build.yml): it runs the
 native build, `ctest`, the managed suite (with `DCA_ENABLE_NULL_DEVICE=1` and
-`JUCESHARP_REQUIRE_NATIVE=1`), the doc-link check and `dotnet pack`. It is not a
-substitute for running the gates locally — the RT gate and the device-dependent
-tests behave differently on a runner with no sound card.
+`JUCESHARP_REQUIRE_NATIVE=1`), the doc-link check and `dotnet pack`. It runs on
+every push to `main` and every pull request here; the private development
+repository runs the same workflow only by hand (every job is gated on that). It
+is not a substitute for running the gates locally — the RT gate and the
+device-dependent tests behave differently on a runner with no sound card.
 
 ## The rules that bite hardest
 

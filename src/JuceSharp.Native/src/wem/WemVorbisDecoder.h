@@ -51,6 +51,16 @@
 namespace dcwem
 {
 
+/// The largest .wem any entry point accepts (dca_wem_open_*, the engine's
+/// juce::AudioFormat). A Rocksmith song is a few MB; past this the file is
+/// refused before it is buffered, rather than copied into memory on its own say-so.
+inline constexpr size_t kMaxWemBytes = (size_t) 256 << 20;
+
+/// Upper bound on the decoded PCM one parallel batch holds. Segment buffers are
+/// sized from the packet table, i.e. from the file; past this a batch is split
+/// into fewer packets instead of allocated.
+inline constexpr size_t kMaxBatchPcmBytes = (size_t) 64 << 20;
+
 /// Which codebook source / packet format to use. `Auto` tries DotCharter's
 /// variant list in order (see the file comment).
 enum class Variant : int

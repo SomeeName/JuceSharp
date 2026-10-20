@@ -129,9 +129,8 @@ public sealed class Wave2StemDownloadTests : IDisposable
 
     /// <summary>
     /// A response that DECLARES more than it delivers must never reach the
-    /// destination. This is the shipping <c>get-pip.py</c> shape — no pinned
-    /// hash, non-resumable — where the next thing that happens to the file is
-    /// that Python executes it.
+    /// destination. This is the unpinned, non-resumable shape, where the only
+    /// evidence of a short transfer is the declared length.
     /// </summary>
     [Fact]
     public async Task A_short_body_is_never_renamed_into_place_even_with_no_hash_to_check()
@@ -335,7 +334,7 @@ public sealed class Wave2StemDownloadTests : IDisposable
 /// Wave-2 fixes that need neither a socket nor a model file: the spectral
 /// decoders' output bounds (#14), the catalogue entry validation (#15), and the
 /// coverage gaps named in the audit (<c>ComputeSha256Async</c>, the pins,
-/// <c>GetPipUrl</c> / <c>GetPipSha256</c>).
+/// <c>PipWheelUrl</c> / <c>PipWheelSha256</c>).
 /// </summary>
 public sealed class Wave2StemUnitTests
 {
@@ -540,7 +539,7 @@ public sealed class Wave2StemUnitTests
         Assert.Equal("librosa", PythonPackagePins.Librosa);
         // htdemucs / mdx_extra need demucs 4; the 3.x CLI has a different
         // interface and no htdemucs.
-        Assert.Equal("demucs>=4.0", PythonPackagePins.Demucs);
+        Assert.Equal("demucs>=4.1", PythonPackagePins.Demucs);
         Assert.Equal("bs_roformer>=1.1.0", PythonPackagePins.BsRoformer);
         Assert.Equal("onnx>=1.15", PythonPackagePins.Onnx);
 
@@ -571,37 +570,26 @@ public sealed class Wave2StemUnitTests
             dir => Assert.Equal(dir, Path.GetFileName(dir)));
     }
 
-    // --------------------------------------------------- get-pip bootstrap gap
+    // ------------------------------------------------------ pip bootstrap
 
     /// <summary>
-    /// <c>get-pip.py</c> is DOWNLOADED AND EXECUTED, and neither of the two
-    /// properties that decide where from and whether it is checked had a single
-    /// test reference. The default URL being https is the load-bearing half:
-    /// pypa publishes no per-version pinned copy for a supported interpreter,
-    /// so for the shipping configuration TLS is the whole of the trust story.
+    /// The pip wheel is DOWNLOADED AND EXECUTED. Its source and pin are both
+    /// settable, because pointing at a mirror is legitimate; the pin is what
+    /// makes that safe, and <c>PythonSupplyChainTests</c> proves an unpinned or
+    /// non-https source is refused.
     /// </summary>
     [Fact]
-    public void The_get_pip_bootstrap_defaults_to_an_https_url_and_an_unset_hash()
+    public void The_pip_wheel_source_and_pin_are_settable_for_a_mirror()
     {
         var mgr = new PythonEnvManager(
             Path.Combine(Path.GetTempPath(), $"jsw2-env-{Guid.NewGuid():N}"));
         try
         {
-            Assert.Equal("https://bootstrap.pypa.io/pip/get-pip.py", mgr.GetPipUrl);
-            var uri = new Uri(mgr.GetPipUrl);
-            Assert.Equal(Uri.UriSchemeHttps, uri.Scheme);
-            Assert.False(uri.IsLoopback);
-
-            // Unset by design (there is nothing stable upstream to pin), which
-            // is why an unset hash LOGS rather than silently passing.
-            Assert.Null(mgr.GetPipSha256);
-
-            // Both are settable, because pinning a mirrored copy is the
-            // documented way out of the paragraph above.
-            mgr.GetPipUrl = "https://mirror.internal/get-pip.py";
-            mgr.GetPipSha256 = new string('a', 64);
-            Assert.Equal("https://mirror.internal/get-pip.py", mgr.GetPipUrl);
-            Assert.Equal(new string('a', 64), mgr.GetPipSha256);
+            Assert.Equal(PythonEnvManager.DefaultPipWheelUrl, mgr.PipWheelUrl);
+            mgr.PipWheelUrl = "https://mirror.internal/pip-26.2.1-py3-none-any.whl";
+            mgr.PipWheelSha256 = new string('a', 64);
+            Assert.Equal("https://mirror.internal/pip-26.2.1-py3-none-any.whl", mgr.PipWheelUrl);
+            Assert.Equal(new string('a', 64), mgr.PipWheelSha256);
         }
         finally
         {

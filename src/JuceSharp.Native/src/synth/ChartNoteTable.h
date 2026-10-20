@@ -107,9 +107,12 @@ struct ChartNoteTable
     /// Validate and copy an upload. Returns null and fills `error` when ANY rule
     /// is broken — a list is accepted whole or not at all. `stride` is the
     /// caller's element size (append-extensible, see dotcharter_audio.h).
+    /// `noteBytesLength` is the size of the buffer `noteBytes` points to (ABI
+    /// v48): count * stride must fit in it. -1 means the caller did not say (the
+    /// v38 export) and the count and stride are trusted.
     static std::unique_ptr<ChartNoteTable> build(const void* noteBytes, int32_t count, int32_t stride,
                                                  const dca_chart_bend_point* bendPts, int32_t bendCount,
-                                                 std::string& error)
+                                                 std::string& error, int64_t noteBytesLength = -1)
     {
         error.clear();
         if (count < 0 || count > kMaxChartNotes) { error = "note_count out of range"; return nullptr; }
@@ -117,6 +120,8 @@ struct ChartNoteTable
         if (count > 0 && noteBytes == nullptr) { error = "notes is null"; return nullptr; }
         if (bendCount > 0 && bendPts == nullptr) { error = "bends is null"; return nullptr; }
         if (stride < DCA_CHART_NOTE_V38_BYTES) { error = "note_stride_bytes below DCA_CHART_NOTE_V38_BYTES"; return nullptr; }
+        if (noteBytesLength >= 0 && (int64_t) count * (int64_t) stride > noteBytesLength)
+        { error = "note_count * note_stride_bytes exceeds notes_byte_length"; return nullptr; }
 
         auto t = std::make_unique<ChartNoteTable>();
         t->notes.resize((size_t) count);
