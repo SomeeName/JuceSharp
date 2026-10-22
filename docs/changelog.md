@@ -7,10 +7,14 @@ The version lives in `Directory.Build.props` at the repository root (one
 it requires, because the managed wrapper demands exact equality and refuses a
 stale `juce_sharp.dll`.
 
-## 1.1.0 (2026-10-20)
+## 1.2.0 (2026-10-22)
 
 **ABI v48.**
 
+- **Static MSVC runtime** — `juce_sharp.dll` and `juce_vst_host.exe` link the
+  C/C++ runtime statically (`JUCESHARP_STATIC_CRT`, default ON), so a release
+  zip loads on a Windows without the VC++ 2015-2022 x64 redistributable. Both
+  files import only Windows system DLLs.
 - **Untrusted inputs bounded.** A NAM capture declaring an absurd sample rate
   dry-bypasses (status `rateMismatch`) instead of terminating the host; `.wem`
   input is capped at 256 MiB, read once, and a `.wem` song is never streamed
@@ -37,6 +41,11 @@ stale `juce_sharp.dll`.
   >= 2.6 and checkpoints load with `weights_only=True` first; the full pickle
   fallback (`CkptToOnnxConverter.AllowUnsafePickleFallback`) runs only when the
   caller opts in. `.safetensors` never unpickles.
+
+## 1.1.0 (2026-10-20)
+
+**ABI v47** (unchanged).
+
 - **CI on GitHub Actions** — the build and test workflow runs on the public
   repository (SHA-pinned actions, read-only token, a virtual audio device for
   the device tests); the private-submodule token is optional.

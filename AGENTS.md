@@ -55,6 +55,18 @@ purpose — an import would re-load the bytes and defeat the point.
   prepared at the 0.25x floor. `RtSpeedCrossingUnityIsSeamless*`.
   → `rt-safety-and-tests.md`
 
+- **The shipped native pair links the MSVC runtime STATICALLY (#176):**
+  `juce_sharp.dll` and `juce_vst_host.exe` import only Windows system DLLs; a
+  dynamic CRT made v1.0.0 fail to load on a Windows without the VC++
+  redistributable. `CMAKE_MSVC_RUNTIME_LIBRARY` is set once, before any target
+  (`JUCESHARP_STATIC_CRT`, default ON), so JUCE, Rubber Band and NeuralAudio
+  follow it; a test that links the shipping NeuralAudio uses
+  `JUCESHARP_SHIPPING_CRT`, never a literal `MultiThreadedDLL`. The RT gate
+  keeps its own debug CRT. Memory the DLL allocates is freed by its own `dca_*`
+  export, never by the host (separate CRT heap). The guard lives in DotCharter
+  (`NativeImportAuditTests`, the release preflight).
+  → `docs/getting-started/installation.md`
+
 - **ABI v43 does the load-time UPSAMPLE once, into a file (DotCharter #435):**
   `dca_convert_audio_for_device` writes a song at the device rate with the
   preload's OWN decode, `upsampleDecodedBuffer` and `Int16PreloadSource`

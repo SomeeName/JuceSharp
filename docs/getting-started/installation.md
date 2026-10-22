@@ -56,7 +56,7 @@ dotnet add package JuceSharp
 | --- | --- |
 | Windows x64, Windows 10 1809 or later | The only platform that has ever been built. Drivers: WASAPI (default), DirectSound, ASIO. |
 | **.NET 10 Runtime** | On the target machine — or publish self-contained. |
-| **Visual C++ 2015–2022 x64 Redistributable** | `juce_sharp.dll` and `juce_vst_host.exe` link the DYNAMIC CRT (`MSVCP140.dll`, `VCRUNTIME140*.dll`, `api-ms-win-crt-*`). Without it the DLL fails to load and you get `DllNotFoundException` — which looks exactly like a missing DLL, so check this before you go hunting for the file. |
+| **Visual C++ 2015–2022 x64 Redistributable** | **Not needed by the engine.** `juce_sharp.dll` and `juce_vst_host.exe` link the C/C++ runtime STATICALLY (`JUCESHARP_STATIC_CRT`, default ON; DotCharter #176) and import only Windows system DLLs. A build made with `-DJUCESHARP_STATIC_CRT=OFF` links the dynamic CRT (`MSVCP140.dll`, `VCRUNTIME140*.dll`) and needs the redistributable. The ONNX stem backend (`JuceSharp.StemSeparation.Onnx`) loads ONNX Runtime, which is built against the dynamic runtime and does need it. |
 
 macOS and Linux are **not** in this table on purpose; see the note at the top of
 this page.
@@ -69,7 +69,7 @@ using JuceSharp;
 Console.WriteLine($"Native version: {JuceAudioEngine.NativeVersion}");
 ```
 
-If you see `JuceSharp.Native 1.1.0 (ABI 48, JUCE 9.0.3)` you're good to go. The
+If you see `JuceSharp.Native 1.2.0 (ABI 48, JUCE 9.0.3)` you're good to go. The
 string is generated from the CMake project version and `DCA_ABI_VERSION`, so the
 numbers here move with the tree — treat the SHAPE as the contract and check the
 ABI number against `include/dotcharter_audio.h`, not against this line. Use
@@ -80,7 +80,7 @@ need to reason about compatibility; the version string is for logs only.
 
 | Symptom | Cause |
 | --- | --- |
-| `DllNotFoundException` | Either the native DLL is not next to your executable (you skipped step 1, or the copy did not happen — check your build output and [Building the Native DLL](building-native.md)), **or** the DLL is there and the VC++ redistributable above is missing. Both surface as the same exception. |
+| `DllNotFoundException` | Either the native DLL is not next to your executable (you skipped step 1, or the copy did not happen — check your build output and [Building the Native DLL](building-native.md)), **or** the DLL is there and something it imports is missing (the default build imports only Windows DLLs; a `-DJUCESHARP_STATIC_CRT=OFF` build needs the VC++ redistributable above). Both surface as the same exception. |
 | `JuceAbiMismatchException` at `new JuceAudioEngine(...)` | A **stale** `juce_sharp.dll`: the managed wrapper's expected `DCA_ABI_VERSION` and the DLL's disagree. This is the likeliest first-run failure for a source consumer — rebuild the native side, do not chase the managed code. The check runs in the constructor, before anything opens a device. |
 
 ## Where to go next

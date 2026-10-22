@@ -9,7 +9,7 @@
 # KNOWN COVERAGE GAP: the namamp module is NOT in the gate.
 # ---------------------------------------------------------------------------
 # NeuralAudio is a FetchContent static library, and CMake builds it once, with
-# the release CRT that juce_sharp uses. The RT gate needs the DEBUG CRT for its
+# the release CRT that juce_sharp uses (static /MT since #176). The RT gate needs the DEBUG CRT for its
 # malloc hook, and one image cannot hold both (LNK2038 on RuntimeLibrary and
 # _ITERATOR_DEBUG_LEVEL — and mixing them really would give the process two
 # heaps). Forcing NeuralAudio to /MDd would change the SHIPPED DLL's CRT, which
@@ -148,7 +148,7 @@ add_test(NAME chart_scheduler COMMAND juce_sharp_chart_scheduler)
 set_tests_properties(chart_scheduler PROPERTIES TIMEOUT 120)
 
 # NAM loader ordering needs the real NeuralAudio model, but not the debug-CRT
-# allocation sentinel. Keep this small executable on the shipping /MD runtime.
+# allocation sentinel. Keep this small executable on the shipping runtime (JUCESHARP_SHIPPING_CRT).
 if(DOTCHARTER_DSP_NEURAL)
     add_executable(juce_sharp_nam_lifetime
         nam/nam_lifetime.cpp
@@ -159,7 +159,7 @@ if(DOTCHARTER_DSP_NEURAL)
         ${CMAKE_SOURCE_DIR}/src ${JUCESHARP_NEURAL_JSON_INCLUDE})
     target_link_libraries(juce_sharp_nam_lifetime PRIVATE NeuralAudio)
     if(MSVC)
-        set_property(TARGET juce_sharp_nam_lifetime PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+        set_property(TARGET juce_sharp_nam_lifetime PROPERTY MSVC_RUNTIME_LIBRARY "${JUCESHARP_SHIPPING_CRT}")
     endif()
     add_test(NAME juce_sharp_nam_lifetime COMMAND juce_sharp_nam_lifetime
         "${neuralaudio_SOURCE_DIR}/Utils/Models/BossLSTM-1x16.nam")
@@ -244,7 +244,7 @@ if(DOTCHARTER_DSP_NEURAL)
         juce::juce_recommended_config_flags)
     target_compile_definitions(juce_sharp_rig_idle_nam PRIVATE ${_JUCESHARP_SHIPPING_DEFINITIONS})
     if(MSVC)
-        set_property(TARGET juce_sharp_rig_idle_nam PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
+        set_property(TARGET juce_sharp_rig_idle_nam PROPERTY MSVC_RUNTIME_LIBRARY "${JUCESHARP_SHIPPING_CRT}")
     endif()
     add_test(NAME rig_idle_nam COMMAND juce_sharp_rig_idle_nam
         "${neuralaudio_SOURCE_DIR}/Utils/Models/BossLSTM-1x16.nam")

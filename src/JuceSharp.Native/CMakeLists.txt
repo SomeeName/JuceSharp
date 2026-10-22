@@ -5,7 +5,7 @@ project(JuceSharpNative
     # sees. It sat at 0.3.0 for five releases while dca_version_string()
     # hard-coded the same stale number a second time; the string is generated
     # from this now, so there is one place to bump.
-    VERSION 1.1.0
+    VERSION 1.2.0
     DESCRIPTION "JuceSharp native audio engine (JUCE-based)"
     # C is required as of JUCE 8.0.15 (and by 9.x, which builds its zlib/FLAC as C) — its own CMakeLists hard-errors with
     # "A C compiler is required to build targets that depend on JUCE" when the
@@ -25,6 +25,36 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 if(POLICY CMP0169)
     cmake_policy(SET CMP0169 OLD)
 endif()
+
+# ---------------------------------------------------------------------------
+# C++ runtime: linked STATICALLY (DotCharter #176)
+# ---------------------------------------------------------------------------
+# The DLL and juce_vst_host.exe used to link the DYNAMIC CRT (/MD), which made
+# them import VCRUNTIME140.dll, VCRUNTIME140_1.dll, MSVCP140.dll and
+# MSVCP140_ATOMIC_WAIT.dll. A release zip ships none of those, so on a Windows
+# without a recent VC++ 2015-2022 x64 redistributable (a clean install or VM)
+# the engine failed to load and there was no audio. /MT removes the dependency:
+# the only imports left are Windows system DLLs (the guard is DotCharter's
+# NativeImportAuditTests, over the runtimes/win-x64/native set this build deploys,
+# and its release preflight over the staged payload).
+#
+# Set BEFORE any target exists: it is the default for JUCE, Rubber Band and
+# NeuralAudio too (a static library built /MD cannot be linked into a /MT image:
+# LNK2038 RuntimeLibrary mismatch, and mixing would give the process two heaps).
+# Needs policy CMP0091 NEW (cmake_minimum_required >= 3.15 above).
+# What it changes for a consumer: this DLL has ITS OWN CRT heap, so memory it
+# allocates must be freed by an export of this DLL, never by the host's free()
+# (the ABI already works that way: every returned buffer has a dca_*_free).
+# Every target below that needs another CRT sets MSVC_RUNTIME_LIBRARY itself
+# (the RT gate's debug CRT); tests that link the shipping NeuralAudio use
+# JUCESHARP_SHIPPING_CRT so they follow this switch.
+option(JUCESHARP_STATIC_CRT "Link the MSVC C/C++ runtime statically (no VC++ redistributable needed)" ON)
+if(JUCESHARP_STATIC_CRT)
+    set(JUCESHARP_SHIPPING_CRT "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+else()
+    set(JUCESHARP_SHIPPING_CRT "MultiThreaded$<$<CONFIG:Debug>:Debug>DLL")
+endif()
+set(CMAKE_MSVC_RUNTIME_LIBRARY "${JUCESHARP_SHIPPING_CRT}")
 
 # ---------------------------------------------------------------------------
 # JUCE
