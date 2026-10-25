@@ -181,6 +181,8 @@ public sealed class NativeMethodsTests
     [InlineData(nameof(NativeMethods.EngineExtprocClose), "dca_engine_extproc_close")]
     [InlineData(nameof(NativeMethods.EngineExtprocGetStatsForPlayer), "dca_engine_extproc_get_stats_for_player")]
     [InlineData(nameof(NativeMethods.EngineExtprocGetStats), "dca_engine_extproc_get_stats")]
+    // v49: the open device's channel names
+    [InlineData(nameof(NativeMethods.EngineGetChannelNames), "dca_engine_get_channel_names")]
     public void EveryEngineWaveAndV35Export_HasABindingNamedAfterIt(string member, string entryPoint)
     {
         var m = typeof(NativeMethods).GetMethod(member, BindingFlags.NonPublic | BindingFlags.Static);
@@ -351,6 +353,7 @@ public sealed class NativeMethodsTests
     [InlineData("DCA_MAX_PLAYERS", NativeMethods.MaxPlayers)]
     [InlineData("DCA_PLAYER_NODE_ID_STRIDE", NativeMethods.PlayerNodeIdStride)]
     [InlineData("DCA_EQ_BAND_COUNT", JuceAudioEngine.EqBandCount)]
+    [InlineData("DCA_CHANNEL_NAME_BYTES", NativeMethods.ChannelNameBytes)]
     public void EveryMirroredHeaderConstant_EqualsTheHeader(string define, int managed)
     {
         var match = Regex.Match(File.ReadAllText(FindHeader()),

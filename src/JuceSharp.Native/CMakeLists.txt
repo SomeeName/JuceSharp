@@ -5,7 +5,7 @@ project(JuceSharpNative
     # sees. It sat at 0.3.0 for five releases while dca_version_string()
     # hard-coded the same stale number a second time; the string is generated
     # from this now, so there is one place to bump.
-    VERSION 1.2.0
+    VERSION 1.3.0
     DESCRIPTION "JuceSharp native audio engine (JUCE-based)"
     # C is required as of JUCE 8.0.15 (and by 9.x, which builds its zlib/FLAC as C) — its own CMakeLists hard-errors with
     # "A C compiler is required to build targets that depend on JUCE" when the

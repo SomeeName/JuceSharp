@@ -103,8 +103,15 @@ internal static class NativeMethods
     ///         appended status codes, <see cref="DcaStatus.SampleRate" /> and
     ///         <see cref="DcaStatus.NotFound" />.
     ///     </para>
+    ///     <para>
+    ///         v49 exports the open device's channel names:
+    ///         <c>dca_engine_get_channel_names</c> behind
+    ///         <see cref="JuceAudioEngine.GetChannelNames" />, so a host can label an
+    ///         output pair or an input jack the way the driver does. A one-output
+    ///         device also folds the stereo bus into its channel natively.
+    ///     </para>
     /// </summary>
-    internal const uint   ExpectedAbiVersion = 48;
+    internal const uint   ExpectedAbiVersion = 49;
 
     /// <summary>Mirrors <c>DCA_MAX_PLAYERS</c>: how many independent live-input
     /// rigs (seats) the native engine hosts. Each has its own DSP chain, VST3
@@ -643,6 +650,18 @@ internal static class NativeMethods
     [DllImport(LibName, EntryPoint = "dca_engine_enumerate_input_devices", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DcaStatus EngineEnumerateInputs(nint engine,
         [Out] DcaDeviceInfo[]? devices, int capacity, out int count);
+
+    /// <summary>Mirrors <c>DCA_CHANNEL_NAME_BYTES</c>: the stride of one name in the
+    /// <c>dca_engine_get_channel_names</c> buffer.</summary>
+    internal const int ChannelNameBytes = 64;
+
+    /// <summary>ABI v49. The open device's channel names, <see cref="ChannelNameBytes" />
+    /// per entry; <paramref name="count" /> is the device's total, possibly more
+    /// than <paramref name="capacityEntries" />.</summary>
+    [DllImport(LibName, EntryPoint = "dca_engine_get_channel_names", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DcaStatus EngineGetChannelNames(nint engine, int isInput,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? deviceName,
+        [Out] byte[]? names, int capacityEntries, out int count);
 
     [DllImport(LibName, EntryPoint = "dca_engine_set_mirror_device", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DcaStatus EngineSetMirrorDevice(nint engine,

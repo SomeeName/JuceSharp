@@ -8,8 +8,8 @@ namespace JuceSharp.Tests;
 /// An exception thrown out of an <c>extern "C"</c> export does not become an
 /// error code — it unwinds through the caller's C frames, which is undefined
 /// behaviour and in practice <c>std::terminate</c>. The ABI has a
-/// <c>guard()</c> helper for exactly this, and the list below names the 69 of the
-/// header's 231 exports that reach code which can throw. (Re-measure both numbers
+/// <c>guard()</c> helper for exactly this, and the list below names the 70 of the
+/// header's 232 exports that reach code which can throw. (Re-measure both numbers
 /// rather than carrying them forward — <see cref="TheHeaderExportCount_IsWhatThisFileClaims" />
 /// now does it for you. It was 23 of 148 when this lint was written and 36 of 162
 /// when the wave-2 audit corrected it, which was ALREADY stale the day it was
@@ -58,6 +58,8 @@ public sealed class AbiExceptionGuardLintTests
         "dca_engine_destroy",
         "dca_engine_enumerate_output_devices",
         "dca_engine_enumerate_input_devices",
+        // ABI v49: the channel names come from JUCE's device as a StringArray.
+        "dca_engine_get_channel_names",
         "dca_engine_set_mirror_device",
         // dca_engine_dsp_add_node is deliberately absent: it is a pure alias
         // for seat 0 and the guard lives in the export it delegates to.

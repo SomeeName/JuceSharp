@@ -7,6 +7,18 @@ The version lives in `Directory.Build.props` at the repository root (one
 it requires, because the managed wrapper demands exact equality and refuses a
 stale `juce_sharp.dll`.
 
+## 1.3.0 (2026-10-25)
+
+**ABI v49.**
+
+- **Device channel names** — `dca_engine_get_channel_names`
+  (`JuceAudioEngine.GetChannelNames`, also on `IJuceAudioEngine`) returns the
+  input or output channel names the OPEN device reports, entry i naming
+  channel i. A device that is not the open one on that side gets no names.
+- **A mono output hears both channels.** A device with one active output now
+  runs a two-wide master bus and writes (L + R) / 2 to its channel,
+  allocation-free; before, anything panned right never reached a mono out.
+
 ## 1.2.0 (2026-10-22)
 
 **ABI v48.**

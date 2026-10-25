@@ -26,7 +26,7 @@ it globally and run `juce-stems-diag`, which is the point: QA and on-site
 debugging need it without a checkout.
 
 **No csproj declares a `<Version>` at all.** All six packages take it from the
-one `<Version>` in `Directory.Build.props` at the repository root (**1.2.0**),
+one `<Version>` in `Directory.Build.props` at the repository root (**1.3.0**),
 with `AssemblyVersion` derived from it by the SDK, so every package always
 carries the same version. `PackagingLintTests` asserts both halves, and that
 `src/JuceSharp.Native/CMakeLists.txt` (which feeds `dca_version_string`) agrees.

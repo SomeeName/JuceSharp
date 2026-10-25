@@ -434,6 +434,8 @@ public:
     {
         int bus = 0, highPass = 0, lowPass = 0, bandPass = 0, songEq = 0, limiter = 0;
     };
+    /// True when the open device has one active output and the bus folds into it.
+    bool monoFoldActive() const noexcept { return monoFold_; }
     MasterBusWidths masterBusStageWidths() const noexcept
     {
         MasterBusWidths w;
@@ -517,6 +519,13 @@ public:
     { return enumerateDevicesLive(false, out, capacity); }
     int  enumerateInputDevicesLive (dca_device_info* out, int capacity)
     { return enumerateDevicesLive(true,  out, capacity); }
+
+    /// The OPEN device's channel names (ABI v49), DCA_CHANNEL_NAME_BYTES per
+    /// entry. Returns the device's total count; 0 when nothing is open or when
+    /// `deviceName` is non-empty and is not the open device on that side.
+    /// Message thread only: it dereferences getCurrentAudioDevice(), which
+    /// setAudioDeviceSetup deletes on that same thread.
+    int  channelNames(bool isInput, const char* deviceName, char* names, int capacityEntries);
 
     /// Open the ASIO control panel for the currently active device (Windows only,
     /// only when the active driver is ASIO). Returns empty string on success.
@@ -874,7 +883,10 @@ private:
 #endif
             try
             {
-                renderBlock(in, numInputChannels, out, numOutputChannels, numSamples, ctx);
+                if (owner_.monoFold_ && numOutputChannels == 1 && out != nullptr && out[0] != nullptr)
+                    renderFoldedToMono(in, numInputChannels, out[0], numSamples, ctx);
+                else
+                    renderBlock(in, numInputChannels, out, numOutputChannels, numSamples, ctx);
             }
             catch (...)
             {
@@ -889,6 +901,40 @@ private:
         }
 
     private:
+        /// One active output: render the stereo bus into the fold buffers and
+        /// write (L + R) / 2 to the device's channel. A callback longer than the
+        /// buffers is rendered in chunks, each with its inputs offset to match.
+        /// Allocation-free: the buffers are sized in prepareMasterBus.
+        void renderFoldedToMono(const float* const* in, int numInputChannels, float* mono,
+                                int numSamples, const juce::AudioIODeviceCallbackContext& ctx)
+        {
+            const int cap = (int) juce::jmin(owner_.foldL_.size(), owner_.foldR_.size());
+            if (cap <= 0)
+            {
+                juce::FloatVectorOperations::clear(mono, numSamples);
+                return;
+            }
+            float* two[2] = { owner_.foldL_.data(), owner_.foldR_.data() };
+            for (int done = 0; done < numSamples;)
+            {
+                const int n = juce::jmin(cap, numSamples - done);
+                const float* const* chunkIn = in;
+                int chunkInputs = numInputChannels;
+                if (done > 0 && in != nullptr)
+                {
+                    chunkInputs = juce::jmin(numInputChannels, (int) owner_.foldInputs_.size());
+                    for (int c = 0; c < chunkInputs; ++c)
+                        owner_.foldInputs_[(size_t) c] = in[c] != nullptr ? in[c] + done : nullptr;
+                    chunkIn = owner_.foldInputs_.data();
+                }
+                renderBlock(chunkIn, chunkInputs, two, 2, n, ctx);
+                float* dst = mono + done;
+                for (int i = 0; i < n; ++i)
+                    dst[i] = 0.5f * (two[0][i] + two[1][i]);
+                done += n;
+            }
+        }
+
         void renderBlock(const float* const* in,
                          int numInputChannels,
                          float* const* out,
@@ -2004,6 +2050,16 @@ private:
     /// so a block before it is skipped like any other over-wide block.
     /// Written only in prepareMasterBus (no callback in flight).
     int                        masterBusWidth_ = 0;
+    /// A device with ONE active output: the callback renders the usual stereo
+    /// bus into foldL_ / foldR_ and writes their average to that output, so a
+    /// song panned to R is not lost on a mono out. masterBusWidth_ is 2 then.
+    /// Written only in prepareMasterBus (no callback in flight); the buffers are
+    /// sized there and never grow on the audio thread.
+    bool                       monoFold_ = false;
+    std::vector<float>         foldL_, foldR_;
+    /// The input pointers of one chunk, when a callback is longer than the
+    /// fold buffers and is rendered in pieces.
+    std::array<const float*, 64> foldInputs_ {};
     /// Blocks the filter + song-EQ stages skipped for being wider than
     /// masterBusWidth_ (#31). Audio thread writes, anyone reads.
     std::atomic<unsigned long> masterBusSkipped_ { 0 };

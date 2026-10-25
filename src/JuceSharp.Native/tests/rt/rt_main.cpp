@@ -12311,6 +12311,89 @@ void scenarioExternalProcessInsert()
     endScenario();
 }
 
+/// A stereo WAV whose two channels differ only in level, so a fold of L and R
+/// is told apart from either channel alone by its peak.
+juce::MemoryBlock makeStereoWavBlob(double seconds, int sampleRate, double freqHz, float lAmp, float rAmp)
+{
+    const int frames = (int) (seconds * sampleRate);
+    juce::AudioBuffer<float> buf(2, frames);
+    const double inc = 2.0 * 3.14159265358979323846 * freqHz / (double) sampleRate;
+    double phase = 0.0;
+    for (int i = 0; i < frames; ++i)
+    {
+        const float s = (float) std::sin(phase);
+        phase += inc;
+        buf.setSample(0, i, lAmp * s);
+        buf.setSample(1, i, rAmp * s);
+    }
+    juce::MemoryBlock block;
+    {
+        juce::WavAudioFormat wav;
+        auto stream = std::make_unique<juce::MemoryOutputStream>(block, false);
+        std::unique_ptr<juce::AudioFormatWriter> writer(
+            wav.createWriterFor(stream.get(), (double) sampleRate, 2, 24, {}, 0));
+        if (writer != nullptr)
+        {
+            stream.release(); // writer owns it
+            writer->writeFromAudioSampleBuffer(buf, 0, frames);
+        }
+    }
+    return block;
+}
+
+/// Plays the L 0.4 / R 0.2 song on a fixture and returns the peak of each
+/// device output over 32 armed blocks, plus the allocations they cost.
+struct FoldProbe { std::vector<float> peaks; int allocs = -1; bool ok = false; };
+FoldProbe probeSongPeaks(uint32_t outputMask)
+{
+    FoldProbe r;
+    Fixture fx(48000, 256, 0, false, outputMask);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); return r; }
+    fx.engine().setMasterLimiter(false, -0.3f, 80.0f);
+    const auto blob = makeStereoWavBlob(6.0, 48000, 187.5, 0.4f, 0.2f);
+    TransportSource src(fx.engine());
+    if (src.openMemory(blob.getData(), blob.getSize(), "wav").isNotEmpty())
+    { fail("openMemory failed"); return r; }
+    src.play();
+    warmUpAndArm(fx);
+    auto* dev = nulldev::manualDevice();
+    r.peaks.assign(dev->manualOutputBuffers().size(), 0.0f);
+    for (int b = 0; b < 32; ++b)
+    {
+        fx.pumpArmed(1);
+        const auto& bufs = dev->manualOutputBuffers();
+        for (size_t c = 0; c < bufs.size() && c < r.peaks.size(); ++c)
+            for (float v : bufs[c]) r.peaks[c] = std::max(r.peaks[c], std::abs(v));
+    }
+    dcrt::disarm();
+    r.allocs = dcrt::allocCount();
+    const bool oneBit = outputMask != 0 && (outputMask & (outputMask - 1)) == 0;
+    r.ok = fx.engine().monoFoldActive() == oneBit;
+    return r;
+}
+
+void scenarioMonoOutputFoldsLAndR()
+{
+    beginScenario("RtMonoOutputFoldsLAndRWithoutAllocating");
+    // Reference: the default pair keeps L and R apart.
+    const auto stereo = probeSongPeaks(0);
+    // One output (output 3): the bus folds (L + R) / 2 into it.
+    const auto mono = probeSongPeaks(0b100u);
+    if (stereo.peaks.size() < 2 || mono.peaks.empty()) { fail("no output buffers to read"); endScenario(); return; }
+    note("stereo pair: L peak " + std::to_string(stereo.peaks[0]) + ", R peak " + std::to_string(stereo.peaks[1])
+         + "; one output: peak " + std::to_string(mono.peaks[0]));
+    RT_CHECK(stereo.ok && mono.ok, "monoFoldActive() does not follow the number of active outputs");
+    RT_CHECK(std::abs(stereo.peaks[0] - 0.4f) < 0.02f && std::abs(stereo.peaks[1] - 0.2f) < 0.02f,
+             "the stereo reference did not play L 0.4 / R 0.2 — the probe below is vacuous");
+    RT_CHECK(std::abs(mono.peaks[0] - 0.3f) < 0.02f,
+             "a one-output device did not get the average of L and R (peak " + std::to_string(mono.peaks[0])
+             + "; 0.4 is L alone, 0.3 the fold)");
+    RT_CHECK(stereo.allocs == 0 && mono.allocs == 0,
+             "the callback allocated (" + std::to_string(stereo.allocs) + " stereo, "
+             + std::to_string(mono.allocs) + " mono)");
+    endScenario();
+}
+
 void scenarioSparseOutputMaskMasterBus()
 {
     beginScenario("RtSparseOutputMaskIsPackedAndTheMasterBusKeepsLAndRApart");
@@ -12730,6 +12813,8 @@ int main(int argc, char** argv)
     run("RtExternalProcessInsertExchangesWithoutAllocatingAndFallsBackDry", &scenarioExternalProcessInsert);
     // A .wem is preloaded and never streamed (its decoder allocates), appended last.
     run("RtWemSourceIsPreloadedNeverStreamed",                  &scenarioWemSourceIsPreloadedNeverStreamed);
+    // ABI v49: a one-output device folds L and R into its channel, appended last.
+    run("RtMonoOutputFoldsLAndRWithoutAllocating",              &scenarioMonoOutputFoldsLAndR);
 
     // --- meta: the run-list ORDER -----------------------------------------
     // Runs under `--only` as well, unlike the two meta-assertions below: it

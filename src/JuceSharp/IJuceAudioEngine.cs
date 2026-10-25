@@ -311,6 +311,9 @@ public interface IJuceAudioEngine : IDisposable
     /// <inheritdoc cref="JuceAudioEngine.EnumerateInputDevicesLive" />
     IReadOnlyList<JuceAudioDevice> EnumerateInputDevicesLive();
 
+    /// <inheritdoc cref="JuceAudioEngine.GetChannelNames" />
+    IReadOnlyList<string> GetChannelNames(bool isInput, string? deviceName = null);
+
     // --- factories: interface in, interface out -------------------------
 
     /// <inheritdoc cref="JuceAudioEngine.GetDspChain(int)" />

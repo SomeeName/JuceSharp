@@ -2271,6 +2271,40 @@ public sealed partial class JuceAudioEngine : IDisposable
         finally { Release(); }
     }
 
+    /// <summary>
+    ///     The channel names the OPEN device reports, in physical order: entry i
+    ///     names output (or input) channel i, the bit i of the channel mask.
+    ///     <paramref name="deviceName" /> picks the side the caller means; when it is
+    ///     not the open device on that side the list is empty, never another
+    ///     device's. Empty too when no device is open or the engine is disposed.
+    ///     Runs on the JUCE message thread, so call it off the UI thread.
+    /// </summary>
+    public IReadOnlyList<string> GetChannelNames(bool isInput, string? deviceName = null)
+    {
+        var h = TryAcquire();
+        if (h == nint.Zero) return Array.Empty<string>();
+        try
+        {
+            var dir = isInput ? 1 : 0;
+            if (NativeMethods.EngineGetChannelNames(h, dir, deviceName, null, 0, out var count) != NativeMethods.DcaStatus.Ok
+                || count <= 0)
+                return Array.Empty<string>();
+            var buf = new byte[count * NativeMethods.ChannelNameBytes];
+            if (NativeMethods.EngineGetChannelNames(h, dir, deviceName, buf, count, out var actual) != NativeMethods.DcaStatus.Ok
+                || actual <= 0)
+                return Array.Empty<string>();
+            var list = new List<string>(Math.Min(count, actual));
+            for (var i = 0; i < Math.Min(count, actual); i++)
+            {
+                int off = i * NativeMethods.ChannelNameBytes, len = 0;
+                while (len < NativeMethods.ChannelNameBytes && buf[off + len] != 0) ++len;
+                list.Add(System.Text.Encoding.UTF8.GetString(buf, off, len));
+            }
+            return list;
+        }
+        finally { Release(); }
+    }
+
     /// <summary>Enumerate output devices across every available host (ASIO, WASAPI, DirectSound, CoreAudio, …).</summary>
     public static IReadOnlyList<JuceAudioDevice> EnumerateOutputDevices()
         => EnumerateDevices(isInput: false);

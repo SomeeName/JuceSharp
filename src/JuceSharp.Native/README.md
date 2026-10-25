@@ -29,8 +29,8 @@ cmake --build build --config Release
 Use the generator that matches the toolset you actually have — **VS 2022 or
 later**. On the maintainer's machine the only installed toolchain is Visual
 Studio Build Tools 2026, so the generator there is `"Visual Studio 18 2026"`,
-and neither `cmake` nor the VS tools are on `PATH` (CMake is CLion's bundled
-copy). See `AGENTS.md` § *Native rebuild* for the exact invocation used here.
+and neither `cmake` nor the VS tools are on `PATH` (use the CMake bundled with
+the Build Tools; CLion is not installed). See `AGENTS.md` § *Native rebuild* for the exact invocation used here.
 
 The build requires **C++17** (`CMAKE_CXX_STANDARD 17`) and CMake ≥ 3.22. The
 project declares `LANGUAGES C CXX`: JUCE 8.0.15+ hard-errors without a C

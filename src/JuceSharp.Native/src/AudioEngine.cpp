@@ -487,6 +487,25 @@ int AudioEngine::enumerateDevicesLive(bool isInput, dca_device_info* out, int ca
     return written;
 }
 
+int AudioEngine::channelNames(bool isInput, const char* deviceName, char* names, int capacityEntries)
+{
+    auto* device = deviceManager_.getCurrentAudioDevice();
+    if (device == nullptr) return 0;
+    if (deviceName != nullptr && *deviceName != '\0')
+    {
+        // The setup names the device on each SIDE; device->getName() is one
+        // name for the pair (WASAPI names it after the output).
+        const auto setup = deviceManager_.getAudioDeviceSetup();
+        const auto& open = isInput ? setup.inputDeviceName : setup.outputDeviceName;
+        if (! open.equalsIgnoreCase(juce::String::fromUTF8(deviceName))) return 0;
+    }
+    const auto list = isInput ? device->getInputChannelNames() : device->getOutputChannelNames();
+    if (names != nullptr)
+        for (int i = 0; i < list.size() && i < capacityEntries; ++i)
+            copyTruncated(names + (size_t) i * DCA_CHANNEL_NAME_BYTES, DCA_CHANNEL_NAME_BYTES, list[i]);
+    return list.size();
+}
+
 
 void AudioEngine::prepareMasterBus(juce::AudioIODevice* device)
 {
@@ -518,7 +537,17 @@ void AudioEngine::prepareMasterBus(juce::AudioIODevice* device)
     // (processMasterBus, MasterLimiter::process), never folded onto a shared
     // state. RtSparseOutputMaskIsPackedAndTheMasterBusKeepsLAndRApart reads the
     // pointers the callback is handed on a sparse mask and pins all of it.
-    masterBusWidth_ = device != nullptr ? juce::jmax(1, device->getActiveOutputChannels().countNumberOfSetBits()) : 2;
+    //
+    // ONE active output is the exception: the callback renders a two-wide bus
+    // and folds it into that output (renderFoldedToMono), so every stage here is
+    // prepared for 2. Without it the transport's sources render their L channel
+    // only, and anything panned to R never reaches a mono out.
+    const int activeOutputs = device != nullptr ? device->getActiveOutputChannels().countNumberOfSetBits() : 2;
+    monoFold_       = device != nullptr && activeOutputs == 1;
+    masterBusWidth_ = monoFold_ ? 2 : juce::jmax(1, activeOutputs);
+    const size_t foldFrames = monoFold_ ? (size_t) juce::jmax(2048, deviceBlock_ * 2) : 0;
+    foldL_.assign(foldFrames, 0.0f);
+    foldR_.assign(foldFrames, 0.0f);
     masterBusSkipped_.store(0, std::memory_order_relaxed);
 
     // A device session starts AT the published gains, never ramping up to them

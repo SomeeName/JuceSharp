@@ -152,6 +152,7 @@ public sealed class FakeJuceAudioEngine : IJuceAudioEngine
     public void SetInstrumentGain(float gain) => Record("SetInstrumentGain");
     public System.Collections.Generic.IReadOnlyList<JuceSharp.JuceAudioDevice> EnumerateOutputDevicesLive() { Record("EnumerateOutputDevicesLive"); return default; }
     public System.Collections.Generic.IReadOnlyList<JuceSharp.JuceAudioDevice> EnumerateInputDevicesLive() { Record("EnumerateInputDevicesLive"); return default; }
+    public System.Collections.Generic.IReadOnlyList<string> GetChannelNames(bool isInput, string deviceName = null) { Record("GetChannelNames"); return default; }
     public JuceSharp.Dsp.IJuceDspChain GetDspChain(int player) { Record("GetDspChain"); return default; }
     public JuceSharp.IJuceAudioSource OpenFile(string path)
     {

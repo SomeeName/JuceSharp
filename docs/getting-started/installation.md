@@ -69,7 +69,7 @@ using JuceSharp;
 Console.WriteLine($"Native version: {JuceAudioEngine.NativeVersion}");
 ```
 
-If you see `JuceSharp.Native 1.2.0 (ABI 48, JUCE 9.0.3)` you're good to go. The
+If you see `JuceSharp.Native 1.3.0 (ABI 49, JUCE 9.0.3)` you're good to go. The
 string is generated from the CMake project version and `DCA_ABI_VERSION`, so the
 numbers here move with the tree — treat the SHAPE as the contract and check the
 ABI number against `include/dotcharter_audio.h`, not against this line. Use

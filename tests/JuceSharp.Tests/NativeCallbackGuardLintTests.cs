@@ -117,9 +117,11 @@ public sealed class NativeCallbackGuardLintTests
 
     /// <summary>
     /// <c>getCurrentAudioDevice()</c> appears only where the raw pointer is
-    /// legitimately needed AND the caller is on the message thread. Four sites,
-    /// named explicitly — a fifth has to be argued for here rather than added
-    /// silently.
+    /// legitimately needed AND the caller is on the message thread. Five sites,
+    /// named explicitly — a sixth has to be argued for here rather than added
+    /// silently. The fifth is <c>channelNames</c> (ABI v49): the names are not
+    /// in the snapshot, they are a property of the device object, and its only
+    /// caller marshals onto the message thread (pinned below).
     /// </summary>
     [Fact]
     public void TheRawDevicePointer_IsOnlyReadAtTheSanctionedSites()
@@ -128,14 +130,17 @@ public sealed class NativeCallbackGuardLintTests
         var abi = StripComments(File.ReadAllText(FindRepoFile(AbiCpp)));
 
         // AudioEngine.cpp: start() (the belt-and-braces "did a device actually
-        // open" check, on the thread that just opened it) and
-        // showAsioControlPanel (which needs the DEVICE, and is marshalled — see
-        // the next assertion).
+        // open" check, on the thread that just opened it), showAsioControlPanel
+        // (which needs the DEVICE, and is marshalled — see the next assertion)
+        // and channelNames (the device's own names, read inside a callSync).
         var inEngine = Regex.Matches(engine, @"getCurrentAudioDevice\s*\(").Count;
-        Assert.True(inEngine == 2,
-            $"{EngineCpp} reads the raw device pointer at {inEngine} sites; two are sanctioned "
-            + "(start()'s open check and showAsioControlPanel). Every other reader takes "
+        Assert.True(inEngine == 3,
+            $"{EngineCpp} reads the raw device pointer at {inEngine} sites; three are sanctioned "
+            + "(start()'s open check, showAsioControlPanel and channelNames). Every other reader takes "
             + "deviceSnapshot(), because setAudioDeviceSetup DELETES what this returns.");
+        var names = StripComments(DefinitionBodyOf(File.ReadAllText(FindRepoFile(AbiCpp)), "dca_engine_get_channel_names"));
+        Assert.Contains("callSync", names, StringComparison.Ordinal);
+        Assert.Contains("channelNames(", names, StringComparison.Ordinal);
 
         // dotcharter_audio.cpp: only inside the two callSync bodies that
         // reconfigure the device and then confirm one is still open. The two

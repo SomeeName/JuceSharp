@@ -202,7 +202,12 @@ extern "C" {
 // BYTE LENGTH of the notes buffer, so the engine checks count * stride against
 // it instead of trusting the caller to have sized the buffer. One additive
 // export; the v38 entry point is unchanged. No struct or signature changed.
-#define DCA_ABI_VERSION 48
+// v49: the OPEN device's channel names (dca_engine_get_channel_names), so a host
+// can label an output pair or an input jack with what the driver calls it. One
+// additive export and the DCA_CHANNEL_NAME_BYTES stride. A one-output device now
+// runs a two-wide master bus and folds L and R into its one channel. No struct or
+// signature changed.
+#define DCA_ABI_VERSION 49
 
 // ---- Per-player live-input rigs (ABI v28) ---------------------------------
 // The engine hosts DCA_MAX_PLAYERS independent live-input rigs ("seats"). Each
@@ -1012,6 +1017,25 @@ DCA_API dca_status DCA_CALL dca_engine_read_eq_spectrum(dca_engine_t engine, flo
 // Per-engine enumeration (preferred: reuses the running AudioDeviceManager).
 DCA_API dca_status DCA_CALL dca_engine_enumerate_output_devices(dca_engine_t engine, dca_device_info* devices, int32_t capacity, int32_t* out_count);
 DCA_API dca_status DCA_CALL dca_engine_enumerate_input_devices (dca_engine_t engine, dca_device_info* devices, int32_t capacity, int32_t* out_count);
+
+// ABI v49: the channel names the OPEN device reports (JUCE
+// AudioIODevice::getOutputChannelNames / getInputChannelNames), in physical
+// order, so entry i names output (or input) channel i, the bit i of
+// output_channel_mask / input_channel_mask. `device_name` selects the side the
+// caller means: when it is non-empty and is not the open output (is_input == 0)
+// or input (is_input != 0) device, the answer is 0 names, never another device's
+// list. NULL or empty means "whatever is open". Each name takes
+// DCA_CHANNEL_NAME_BYTES bytes of `names`, NUL-terminated UTF-8 cut at a code
+// point. `*out_count` is the device's TOTAL count, which may exceed
+// `capacity_entries` (pass names == NULL, capacity 0 to ask for the count
+// first); only min(count, capacity) entries are written. No device open = 0.
+// Thread: any non-audio thread; the call runs on the JUCE message thread.
+// DCA_ERR_INVALID_ARG for a NULL engine, a NULL out_count, a negative capacity
+// or a NULL `names` with a positive capacity; *out_count is 0 on every failure.
+#define DCA_CHANNEL_NAME_BYTES 64
+DCA_API dca_status DCA_CALL dca_engine_get_channel_names(dca_engine_t engine, int32_t is_input,
+                                                         const char* device_name, char* names,
+                                                         int32_t capacity_entries, int32_t* out_count);
 
 // ---- Streaming mirror (parallel WASAPI output) --------------------------
 // Mirror the final master mix (including the post-VST guitar signal) to a

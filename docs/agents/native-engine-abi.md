@@ -109,6 +109,28 @@ bounded and lossless; sustained back-pressure surfaces as `room == 0`, and the
 drop is accounted on the PRODUCER side (`dca_engine_get_midi_timing_stats`'
 `dropped`), which is where a diagnostician should look.
 
+## ABI v49 — the open device's channel names, and a mono output folds L and R
+
+- **One additive export:** `dca_engine_get_channel_names(engine, is_input,
+  device_name, names, capacity_entries, out_count)`, entries of
+  `DCA_CHANNEL_NAME_BYTES` (64) NUL-terminated UTF-8, entry i naming channel i (the
+  mask's bit i). It answers for the OPEN device only, read on the message thread
+  (`AudioEngine::channelNames`, the only thread where `getCurrentAudioDevice()` is
+  stable): a non-empty `device_name` that is not the open device on that side gets
+  0 names, never another device's list. `*out_count` is the total; only
+  `min(count, capacity)` entries are written, so `names == NULL`, capacity 0 asks
+  for the count. A NULL engine, NULL out_count, negative capacity or NULL buffer
+  with a capacity is `DCA_ERR_INVALID_ARG` with `*out_count = 0`.
+  `JuceAudioEngine.GetChannelNames`. Nothing to replay on a rebuild: the names are
+  read from whatever device is open. `AbiV49Tests`.
+- **A one-output device folds the stereo bus into it (no struct change):** with one
+  active output `prepareMasterBus` sets `monoFold_`, prepares every master-bus stage
+  for 2 and sizes `foldL_` / `foldR_`; the callback renders the usual two-wide block
+  into them (`renderFoldedToMono`, in chunks when a callback is longer than the
+  buffers) and writes `(L + R) / 2` to the device's channel. Before it, the
+  transport's sources rendered their L channel only and a song's R never reached a
+  mono out. `RtMonoOutputFoldsLAndRWithoutAllocating`.
+
 ## ABI v48 — the note upload names its byte length
 
 - **One additive export:** `dca_engine_chart_source_set_notes_for_player2(engine,

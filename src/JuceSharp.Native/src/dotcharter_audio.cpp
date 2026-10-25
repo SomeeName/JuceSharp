@@ -2039,6 +2039,26 @@ DCA_API dca_status DCA_CALL dca_engine_enumerate_input_devices(dca_engine_t hand
 });
 }
 
+// ABI v49: the open device's channel names. On the message thread, because the
+// device pointer is only stable there (see AudioEngine::channelNames).
+DCA_API dca_status DCA_CALL dca_engine_get_channel_names(dca_engine_t handle, int32_t is_input,
+                                                         const char* device_name, char* names,
+                                                         int32_t capacity_entries, int32_t* out_count)
+{
+    if (!out_count) return DCA_ERR_INVALID_ARG;
+    *out_count = 0;
+    auto* e = reinterpret_cast<Engine*>(handle);
+    if (!e || capacity_entries < 0 || (names == nullptr && capacity_entries > 0)) return DCA_ERR_INVALID_ARG;
+    return guard("dca_engine_get_channel_names", [&]() -> dca_status {
+        int n = 0;
+        JuceHost::instance().callSync([&] {
+            n = e->impl.channelNames(is_input != 0, device_name, names, capacity_entries);
+        });
+        *out_count = n;
+        return DCA_OK;
+    });
+}
+
 DCA_API dca_status DCA_CALL dca_engine_set_mirror_device(dca_engine_t handle, const char* device_id)
 {
     return guard("dca_engine_set_mirror_device", [&]() -> dca_status {
