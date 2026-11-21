@@ -123,6 +123,10 @@ undo, no sync, no tempo, no multi-track.
   transport once the core has seen your write, and your own pending value until
   then, so a footswitch UI never shows "Recording" for a loop that is already
   playing.
+- **Only a write of `state` is a press.** Every write of `state` (even one that
+  repeats the value) is one transport press; a write of any other param is not,
+  so turning a knob after an auto-close keeps the take, and pressing Record again
+  starts a new one.
 - **`maxLoopS` is live, and lowering it below what is already recorded closes the
   pass immediately**, at the new cap. It used to WEDGE: the record branch was
   never entered again, the auto-close lived inside it, and the module neither

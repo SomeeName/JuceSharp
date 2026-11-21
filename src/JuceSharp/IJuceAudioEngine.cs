@@ -269,6 +269,18 @@ public interface IJuceAudioEngine : IDisposable
     /// <inheritdoc cref="JuceAudioEngine.GetInstrumentRoute" />
     int GetInstrumentRoute();
 
+    /// <inheritdoc cref="JuceAudioEngine.TrySetInstrumentRouteMask(uint)" />
+    bool TrySetInstrumentRouteMask(uint seatMask);
+
+    /// <inheritdoc cref="JuceAudioEngine.GetInstrumentRouteMask" />
+    uint GetInstrumentRouteMask();
+
+    /// <inheritdoc cref="JuceAudioEngine.TrySetChartRouteMask(int, uint)" />
+    bool TrySetChartRouteMask(int player, uint seatMask);
+
+    /// <inheritdoc cref="JuceAudioEngine.GetChartRouteMask(int)" />
+    uint GetChartRouteMask(int player);
+
     /// <inheritdoc cref="JuceAudioEngine.SetPlayerCount(int)" />
     void SetPlayerCount(int count);
 
@@ -298,6 +310,12 @@ public interface IJuceAudioEngine : IDisposable
 
     /// <inheritdoc cref="JuceAudioEngine.TryGetRemoteBridgeStats(out uint, out uint, out uint)" />
     bool TryGetRemoteBridgeStats(out uint processed, out uint timeouts, out uint heartbeat);
+
+    /// <inheritdoc cref="JuceAudioEngine.SetRemoteBridge(int, string, string, string, bool)" />
+    bool SetRemoteBridge(int player, string? shmName, string? requestEventName, string? responseEventName, bool enable);
+
+    /// <inheritdoc cref="JuceAudioEngine.TryGetRemoteBridgeStats(int, out uint, out uint, out uint)" />
+    bool TryGetRemoteBridgeStats(int player, out uint processed, out uint timeouts, out uint heartbeat);
 
     /// <inheritdoc cref="JuceAudioEngine.SendMidi(byte, byte, byte)" />
     void SendMidi(byte status, byte data1, byte data2);

@@ -158,6 +158,10 @@ public sealed class NativeMethodsTests
     [InlineData(nameof(NativeMethods.ChartVoicePackBytes), "dca_chart_voice_pack_bytes")]
     [InlineData(nameof(NativeMethods.EngineSetInstrumentRoute), "dca_engine_set_instrument_route")]
     [InlineData(nameof(NativeMethods.EngineGetInstrumentRoute), "dca_engine_get_instrument_route")]
+    [InlineData(nameof(NativeMethods.EngineSetInstrumentRouteMask), "dca_engine_set_instrument_route_mask")]
+    [InlineData(nameof(NativeMethods.EngineGetInstrumentRouteMask), "dca_engine_get_instrument_route_mask")]
+    [InlineData(nameof(NativeMethods.EngineChartSourceSetRouteMaskForPlayer), "dca_engine_chart_source_set_route_mask_for_player")]
+    [InlineData(nameof(NativeMethods.EngineChartSourceGetRouteMaskForPlayer), "dca_engine_chart_source_get_route_mask_for_player")]
     [InlineData(nameof(NativeMethods.WemOpenFile), "dca_wem_open_file")]
     [InlineData(nameof(NativeMethods.WemOpenMemory), "dca_wem_open_memory")]
     [InlineData(nameof(NativeMethods.WemGetInfo), "dca_wem_get_info")]
@@ -183,6 +187,9 @@ public sealed class NativeMethodsTests
     [InlineData(nameof(NativeMethods.EngineExtprocGetStats), "dca_engine_extproc_get_stats")]
     // v49: the open device's channel names
     [InlineData(nameof(NativeMethods.EngineGetChannelNames), "dca_engine_get_channel_names")]
+    // v50: one sandbox bridge per seat
+    [InlineData(nameof(NativeMethods.EngineSetRemoteBridgeForPlayer), "dca_engine_set_remote_bridge_for_player")]
+    [InlineData(nameof(NativeMethods.EngineGetRemoteBridgeStatsForPlayer), "dca_engine_get_remote_bridge_stats_for_player")]
     public void EveryEngineWaveAndV35Export_HasABindingNamedAfterIt(string member, string entryPoint)
     {
         var m = typeof(NativeMethods).GetMethod(member, BindingFlags.NonPublic | BindingFlags.Static);

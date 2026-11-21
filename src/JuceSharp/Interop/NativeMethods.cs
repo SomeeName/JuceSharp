@@ -110,8 +110,16 @@ internal static class NativeMethods
     ///         output pair or an input jack the way the driver does. A one-output
     ///         device also folds the stereo bus into its channel natively.
     ///     </para>
+    ///     <para>
+    ///         v50 gives every seat its own sandbox bridge (one child per seat):
+    ///         <c>dca_engine_set_remote_bridge_for_player</c> and
+    ///         <c>dca_engine_get_remote_bridge_stats_for_player</c> behind the
+    ///         player overloads of <see cref="JuceAudioEngine.SetRemoteBridge(int, string, string, string, bool)" />
+    ///         and <see cref="JuceAudioEngine.TryGetRemoteBridgeStats(int, out uint, out uint, out uint)" />.
+    ///         The v19 pair is seat 0's bridge.
+    ///     </para>
     /// </summary>
-    internal const uint   ExpectedAbiVersion = 49;
+    internal const uint   ExpectedAbiVersion = 51;
 
     /// <summary>Mirrors <c>DCA_MAX_PLAYERS</c>: how many independent live-input
     /// rigs (seats) the native engine hosts. Each has its own DSP chain, VST3
@@ -603,6 +611,19 @@ internal static class NativeMethods
     [DllImport(LibName, EntryPoint = "dca_engine_get_instrument_route", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DcaStatus EngineGetInstrumentRoute(nint engine, out int player);
 
+    // ABI v51 (DotCharter #751): seat routing masks, bit p = seat p.
+    [DllImport(LibName, EntryPoint = "dca_engine_set_instrument_route_mask", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DcaStatus EngineSetInstrumentRouteMask(nint engine, uint seatMask);
+
+    [DllImport(LibName, EntryPoint = "dca_engine_get_instrument_route_mask", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DcaStatus EngineGetInstrumentRouteMask(nint engine, out uint seatMask);
+
+    [DllImport(LibName, EntryPoint = "dca_engine_chart_source_set_route_mask_for_player", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DcaStatus EngineChartSourceSetRouteMaskForPlayer(nint engine, int player, uint seatMask);
+
+    [DllImport(LibName, EntryPoint = "dca_engine_chart_source_get_route_mask_for_player", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DcaStatus EngineChartSourceGetRouteMaskForPlayer(nint engine, int player, out uint seatMask);
+
     [DllImport(LibName, EntryPoint = "dca_engine_show_asio_panel",   CallingConvention = CallingConvention.Cdecl)]
     internal static extern DcaStatus EngineShowAsioPanel(nint engine, nint parent);
 
@@ -1015,6 +1036,19 @@ internal static class NativeMethods
 
     [DllImport(LibName, EntryPoint = "dca_engine_get_remote_bridge_stats", CallingConvention = CallingConvention.Cdecl)]
     internal static extern DcaStatus EngineGetRemoteBridgeStats(nint engine,
+        out uint processed, out uint timeouts, out uint heartbeat);
+
+    // --- ABI v50: one sandbox bridge per seat --------------------------------
+
+    [DllImport(LibName, EntryPoint = "dca_engine_set_remote_bridge_for_player", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DcaStatus EngineSetRemoteBridgeForPlayer(nint engine, int player,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? shmName,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? requestEventName,
+        [MarshalAs(UnmanagedType.LPUTF8Str)] string? responseEventName,
+        int enable);
+
+    [DllImport(LibName, EntryPoint = "dca_engine_get_remote_bridge_stats_for_player", CallingConvention = CallingConvention.Cdecl)]
+    internal static extern DcaStatus EngineGetRemoteBridgeStatsForPlayer(nint engine, int player,
         out uint processed, out uint timeouts, out uint heartbeat);
 
     [DllImport(LibName, EntryPoint = "dca_engine_send_midi_short",     CallingConvention = CallingConvention.Cdecl)]

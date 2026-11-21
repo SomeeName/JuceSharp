@@ -1926,42 +1926,68 @@ public sealed partial class JuceAudioEngine : IDisposable
     }
 
     /// <summary>
-    /// Arm / disarm the shared-memory bridge to the sandboxed out-of-process
-    /// VST host (ABI v19). While armed, the audio callback round-trips live
-    /// input, queued MIDI and the child's processed/rendered audio through
-    /// the named mapping once per block; on a missed deadline the input
-    /// passes through dry. Returns <c>true</c> on success. Additive ABI
-    /// v19+ — and, as everywhere on this boundary, not something an older
-    /// runtime can decline: the ABI check at open is an equality comparison.
+    /// Arm / disarm seat 0's shared-memory bridge to its sandboxed
+    /// out-of-process VST host (ABI v19). The same as
+    /// <see cref="SetRemoteBridge(int, string, string, string, bool)" /> with
+    /// player 0: while armed, the audio callback round-trips seat 0's live
+    /// input, the queued MIDI and the child's processed/rendered audio through
+    /// the named mapping once per block; on a missed deadline the input passes
+    /// through dry. Returns <c>true</c> on success. Additive ABI v19+ — and, as
+    /// everywhere on this boundary, not something an older runtime can decline:
+    /// the ABI check at open is an equality comparison.
     /// </summary>
     public bool SetRemoteBridge(string? shmName, string? requestEventName, string? responseEventName, bool enable)
+        => SetRemoteBridge(0, shmName, requestEventName, responseEventName, enable);
+
+    /// <summary>
+    /// Arm / disarm <paramref name="player" />'s own sandbox bridge (ABI v50:
+    /// one child per seat). Each seat's bridge has its own mapping, events and
+    /// child and carries only that seat's chain; the MIDI and the sandboxed
+    /// instrument stay on seat 0's. A seat with no armed bridge makes no round
+    /// trip. Arming or disarming one seat never touches another seat's bridge,
+    /// and an overloaded seat drops only its own chain. Returns <c>false</c> for
+    /// a player outside [0, <see cref="MaxPlayers" />) or when the native side
+    /// could not create the kernel objects.
+    /// </summary>
+    public bool SetRemoteBridge(int player, string? shmName, string? requestEventName, string? responseEventName, bool enable)
     {
         var h = TryAcquire();
         if (h == nint.Zero) return false;
         try
         {
-            var status = NativeMethods.EngineSetRemoteBridge(h,
+            var status = NativeMethods.EngineSetRemoteBridgeForPlayer(h, player,
                 shmName, requestEventName, responseEventName, enable ? 1 : 0);
             if (status != NativeMethods.DcaStatus.Ok)
-                _log.LogWarning("[native] engine_set_remote_bridge(enable={Enable}) returned {Status}", enable, status);
+                _log.LogWarning("[native] engine_set_remote_bridge_for_player(player={Player}, enable={Enable}) returned {Status}",
+                    player, enable, status);
             return status == NativeMethods.DcaStatus.Ok;
         }
         finally { Release(); }
     }
 
     /// <summary>
-    /// Health counters for the out-of-process VST bridge: cumulative blocks
-    /// processed / timed out plus the child's free-running heartbeat counter
-    /// (stalls when the child dies). All zero while the bridge is disabled.
+    /// Health counters for seat 0's out-of-process VST bridge: cumulative
+    /// blocks processed / timed out plus the child's free-running heartbeat
+    /// counter (stalls when the child dies; zero while the bridge is disabled).
+    /// The same as <see cref="TryGetRemoteBridgeStats(int, out uint, out uint, out uint)" />
+    /// with player 0.
     /// </summary>
     public bool TryGetRemoteBridgeStats(out uint processed, out uint timeouts, out uint heartbeat)
+        => TryGetRemoteBridgeStats(0, out processed, out timeouts, out heartbeat);
+
+    /// <summary>
+    /// Health counters for <paramref name="player" />'s own sandbox bridge (ABI
+    /// v50). <c>false</c>, with every counter zero, for a player outside
+    /// [0, <see cref="MaxPlayers" />).
+    /// </summary>
+    public bool TryGetRemoteBridgeStats(int player, out uint processed, out uint timeouts, out uint heartbeat)
     {
         processed = timeouts = heartbeat = 0;
         var h = TryAcquire();
         if (h == nint.Zero) return false;
         try
         {
-            return NativeMethods.EngineGetRemoteBridgeStats(h, out processed, out timeouts, out heartbeat)
+            return NativeMethods.EngineGetRemoteBridgeStatsForPlayer(h, player, out processed, out timeouts, out heartbeat)
                    == NativeMethods.DcaStatus.Ok;
         }
         finally { Release(); }
@@ -2255,15 +2281,11 @@ public sealed partial class JuceAudioEngine : IDisposable
         if (h == nint.Zero) return Array.Empty<JuceAudioDevice>();
         try
         {
-            var probe = isInput
-                ? NativeMethods.EngineEnumerateInputs (h, null, 0, out var probeCount)
-                : NativeMethods.EngineEnumerateOutputs(h, null, 0, out probeCount);
-            if (probe != NativeMethods.DcaStatus.Ok || probeCount <= 0) return Array.Empty<JuceAudioDevice>();
-            var buffer = new NativeMethods.DcaDeviceInfo[probeCount];
-            var status = isInput
-                ? NativeMethods.EngineEnumerateInputs (h, buffer, probeCount, out var actual)
-                : NativeMethods.EngineEnumerateOutputs(h, buffer, probeCount, out actual);
-            if (status != NativeMethods.DcaStatus.Ok || actual <= 0) return Array.Empty<JuceAudioDevice>();
+            var (buffer, actual) = CountedReads.Read<NativeMethods.DcaDeviceInfo>(
+                (NativeMethods.DcaDeviceInfo[]? buf, int cap, out int n) => isInput
+                    ? NativeMethods.EngineEnumerateInputs (h, buf, cap, out n)
+                    : NativeMethods.EngineEnumerateOutputs(h, buf, cap, out n));
+            if (actual <= 0) return Array.Empty<JuceAudioDevice>();
             var list = new List<JuceAudioDevice>(actual);
             for (var i = 0; i < actual; i++) list.Add(JuceAudioDevice.FromNative(buffer[i]));
             return list;
@@ -2315,19 +2337,11 @@ public sealed partial class JuceAudioEngine : IDisposable
 
     private static IReadOnlyList<JuceAudioDevice> EnumerateDevices(bool isInput)
     {
-        var status = isInput
-            ? NativeMethods.EnumerateInputDevices(null, 0, out var probeCount)
-            : NativeMethods.EnumerateOutputDevices(null, 0, out probeCount);
-        if (status != NativeMethods.DcaStatus.Ok || probeCount <= 0)
-            return Array.Empty<JuceAudioDevice>();
-
-        var buffer = new NativeMethods.DcaDeviceInfo[probeCount];
-        status = isInput
-            ? NativeMethods.EnumerateInputDevices(buffer, probeCount, out var actual)
-            : NativeMethods.EnumerateOutputDevices(buffer, probeCount, out actual);
-        if (status != NativeMethods.DcaStatus.Ok || actual <= 0)
-            return Array.Empty<JuceAudioDevice>();
-
+        var (buffer, actual) = CountedReads.Read<NativeMethods.DcaDeviceInfo>(
+            (NativeMethods.DcaDeviceInfo[]? buf, int cap, out int n) => isInput
+                ? NativeMethods.EnumerateInputDevices (buf, cap, out n)
+                : NativeMethods.EnumerateOutputDevices(buf, cap, out n));
+        if (actual <= 0) return Array.Empty<JuceAudioDevice>();
         var list = new List<JuceAudioDevice>(actual);
         for (var i = 0; i < actual; i++) list.Add(JuceAudioDevice.FromNative(buffer[i]));
         return list;

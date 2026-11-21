@@ -24,9 +24,18 @@ public static class Windows
 {
     private static readonly ConcurrentDictionary<(int N, bool Periodic), float[]> Cache = new();
 
+    /// <summary>The most bytes of windows the process-wide cache keeps (8 MiB).</summary>
+    internal const long MaxRetainedBytes = 8L * 1024 * 1024;
+
+    /// <summary>The longest window the cache keeps (64 Ki samples); longer ones are built per call.</summary>
+    internal const int MaxCachedWindowSamples = 64 * 1024;
+
+    private static long s_retainedBytes;
+
     /// <summary>
     /// Hann window of length <paramref name="n"/>, built once per
-    /// <c>(length, periodic)</c> pair and then served from a process-wide cache.
+    /// <c>(length, periodic)</c> pair and then served from a process-wide cache that keeps
+    /// at most 8 MiB of windows: a length over 64 Ki samples, or one that does not fit the rest of that budget, is built for each call.
     /// <para><b>The returned array is SHARED — treat it as read-only.</b> Window by
     /// multiplying into your own scratch; writing into it corrupts every later transform
     /// of the same length, in every thread.</para>
@@ -42,13 +51,38 @@ public static class Windows
     /// one whose squared overlap sums to a constant at hop = n/4 — so it, not the
     /// default, is the correct choice for a RECONSTRUCTING STFT.
     /// </param>
-    /// <returns>The cached, shared window of length <paramref name="n"/>.</returns>
+    /// <returns>The cached (or, past the cache budget, fresh) window of length <paramref name="n"/>.</returns>
     /// <exception cref="ArgumentOutOfRangeException"><paramref name="n"/> is not
     /// positive.</exception>
     public static float[] Hann(int n, bool periodic = false)
     {
         if (n <= 0) throw new ArgumentOutOfRangeException(nameof(n));
-        return Cache.GetOrAdd((n, periodic), static key => Build(key.N, key.Periodic));
+        var key = (n, periodic);
+        if (Cache.TryGetValue(key, out var cached)) return cached;
+
+        var window = Build(n, periodic);
+        if (n > MaxCachedWindowSamples) return window;
+        // Window lengths can follow the length of the audio, so the cache keeps a bounded
+        // number of bytes; a window that does not fit the rest is handed out without being kept.
+        var bytes = (long)n * sizeof(float);
+        if (Interlocked.Add(ref s_retainedBytes, bytes) > MaxRetainedBytes)
+        {
+            Interlocked.Add(ref s_retainedBytes, -bytes);
+            return window;
+        }
+
+        var kept = Cache.GetOrAdd(key, window);
+        if (!ReferenceEquals(kept, window))
+            Interlocked.Add(ref s_retainedBytes, -bytes);   // another thread cached this length first
+        return kept;
+    }
+
+    /// <summary>Test hook: the bytes the cache holds right now.</summary>
+    internal static long RetainedBytesForTest()
+    {
+        long total = 0;
+        foreach (var w in Cache.Values) total += (long)w.Length * sizeof(float);
+        return total;
     }
 
     private static float[] Build(int n, bool periodic)

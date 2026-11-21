@@ -5,7 +5,7 @@ project(JuceSharpNative
     # sees. It sat at 0.3.0 for five releases while dca_version_string()
     # hard-coded the same stale number a second time; the string is generated
     # from this now, so there is one place to bump.
-    VERSION 1.3.0
+    VERSION 1.4.0
     DESCRIPTION "JuceSharp native audio engine (JUCE-based)"
     # C is required as of JUCE 8.0.15 (and by 9.x, which builds its zlib/FLAC as C) — its own CMakeLists hard-errors with
     # "A C compiler is required to build targets that depend on JUCE" when the
@@ -248,6 +248,8 @@ set(JUCESHARP_CORE_HEADERS
     ${CMAKE_CURRENT_SOURCE_DIR}/src/Utf8Truncate.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/AudioEngine.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/RtDiag.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/SeqlockClock.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/SyncCall.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/DspModule.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/DspChain.h
     ${CMAKE_CURRENT_SOURCE_DIR}/src/dsp/IdleSleep.h

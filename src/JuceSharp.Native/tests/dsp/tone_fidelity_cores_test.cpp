@@ -226,6 +226,21 @@ void convAndTapeCuts()
     check(std::fabs((c16 - c12) - want) < 0.3,
           "convreverb high cut 16 vs 12 kHz at 14 kHz: " + f2(c16 - c12) + " dB apart, RBJ says " + f2(want));
 
+    {
+        // An IR shorter than the 8-tap floor is kept whole: the snapshot never claims taps
+        // the converted IR does not have (it would read past the end of the working copy).
+        dcdsp::ConvReverbCore c; dcdsp::ConvReverbParams p;
+        c.prepare(48000.0, 480, 2); c.setParams(p);
+        const float unit[1] = { 1.f };
+        c.setIr(unit, 1, 48000.0);
+        check(c.activeTapsForTest() == 1, "a one-sample IR publishes one tap, not the 8-tap floor (" + std::to_string(c.activeTapsForTest()) + ")");
+        const float three[3] = { 1.f, 0.5f, 0.25f };
+        c.setIr(three, 3, 48000.0);
+        check(c.activeTapsForTest() == 3, "a three-sample IR publishes three taps (" + std::to_string(c.activeTapsForTest()) + ")");
+        c.setLengthPct(10.f);
+        check(c.activeTapsForTest() == 3, "truncating a three-sample IR keeps what exists (" + std::to_string(c.activeTapsForTest()) + ")");
+    }
+
     auto tape = [](float khz) {
         dcdsp::TapeSatCore t; dcdsp::TapeSatParams p;
         p.drive = 0.f; p.bias = 0.5f; p.hiss = 0.f; p.mix = 1.f; p.hfRolloffKHz = khz;

@@ -567,7 +567,8 @@ private:
         work_.assign(conv_.begin(), conv_.begin() + taps);
 
         // 2. truncate with a fade, so a shortened IR ends rather than stops
-        const int kept = std::max(8, std::min(taps,
+        // An 8-tap floor, but never more taps than the IR has.
+        const int kept = std::min(taps, std::max(8,
             (int) std::lround((double) taps * (double) lengthPct_ * 0.01)));
         if (kept < taps)
         {

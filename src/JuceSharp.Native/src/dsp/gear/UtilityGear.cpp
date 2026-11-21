@@ -120,13 +120,15 @@ public:
     bool setParam(const char* id, float v) override
     {
         if (! finite(v)) return false;
-        if (!std::strcmp(id, "state")) p_.state = (float) std::lround(v);
+        // Every write of `state` is a footswitch PRESS (a new sequence), even
+        // one that repeats the stored value; no other write is a press at all.
+        if (!std::strcmp(id, "state")) { p_.state = (float) std::lround(v); ++p_.stateSeq; }
         else if (!std::strcmp(id, "maxLoopS")) p_.maxLoopS = (float) std::lround(v);
         else if (!std::strcmp(id, "loopLevel")) p_.loopLevel = v;
         else if (!std::strcmp(id, "overdubDecay")) p_.overdubDecay = v;
         else if (!std::strcmp(id, "reverse")) p_.reverse = (float) std::lround(v);
         else if (!std::strcmp(id, "halfSpeed")) p_.halfSpeed = (float) std::lround(v);
-        else if (!std::strcmp(id, "undo")) { if (v >= 0.5f) p_.undoSeq += 1.0f; }
+        else if (!std::strcmp(id, "undo")) { if (v >= 0.5f) ++p_.undoSeq; }
         else if (!std::strcmp(id, "mix")) p_.mix = v;
         else return false;
         mail_.publish(p_); return true;
@@ -141,7 +143,7 @@ public:
         // that could say otherwise. So: the player's own pending request until
         // the core has APPLIED it, and the live transport after that.
         if (!std::strcmp(id, "state"))
-            out = (core_.lastSeenRequest() == (int) std::lround(p_.state))
+            out = (core_.lastSeenStateSeq() == p_.stateSeq)
                 ? (float) core_.transportState()
                 : p_.state;
         else if (!std::strcmp(id, "maxLoopS")) out = p_.maxLoopS;

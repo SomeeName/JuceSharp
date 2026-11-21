@@ -64,7 +64,9 @@ their source is committed to this repository.
   modified in two files to silence clang-tidy warnings),
   <https://github.com/steinbergmedia/vst3sdk>
 - Copyright (c) 2025, Steinberg Media Technologies GmbH
-- Linked into: `juce_sharp.dll` and `juce_vst_host.exe` (VST3 hosting)
+- Linked into: `juce_sharp.dll` and `juce_vst_host.exe` (VST3 hosting), and the
+  test-only `DcTestHalfGain.vst3` the native test configuration builds into its
+  build folder (never shipped)
 - Licence: **MIT** (the SDK's `LICENSE.txt`; the text is reproduced in
   [§ 6](#6-licence-texts)).
 

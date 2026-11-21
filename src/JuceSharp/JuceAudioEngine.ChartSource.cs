@@ -325,4 +325,55 @@ public sealed partial class JuceAudioEngine
         try { return NativeMethods.EngineGetInstrumentRoute(h, out var p) == NativeMethods.DcaStatus.Ok ? p : -1; }
         finally { Release(); }
     }
+
+    /// <summary>
+    ///     ABI v51: routes the in-process instrument into EVERY seat whose bit is set
+    ///     in <paramref name="seatMask" /> (bit p = seat p), or back onto the master
+    ///     with 0, the engine-start value (<c>dca_engine_set_instrument_route_mask</c>).
+    ///     A seat that is not live is skipped; with none live it stays on the master.
+    ///     False when a bit names no seat or the engine is gone. Control thread.
+    /// </summary>
+    public bool TrySetInstrumentRouteMask(uint seatMask)
+    {
+        var h = TryAcquire();
+        if (h == nint.Zero) return false;
+        try { return NativeMethods.EngineSetInstrumentRouteMask(h, seatMask) == NativeMethods.DcaStatus.Ok; }
+        finally { Release(); }
+    }
+
+    /// <summary>The instrument's seat mask, 0 for the master (also on a disposed
+    /// engine) (<c>dca_engine_get_instrument_route_mask</c>).</summary>
+    public uint GetInstrumentRouteMask()
+    {
+        var h = TryAcquire();
+        if (h == nint.Zero) return 0;
+        try { return NativeMethods.EngineGetInstrumentRouteMask(h, out var m) == NativeMethods.DcaStatus.Ok ? m : 0; }
+        finally { Release(); }
+    }
+
+    /// <summary>
+    ///     ABI v51: the seats whose rigs take seat <paramref name="player" />'s chart
+    ///     source (bit p = seat p); 0, the engine-start value, is its own seat only
+    ///     (<c>dca_engine_chart_source_set_route_mask_for_player</c>). A seat that is
+    ///     not live is skipped; with none live the source plays into its own seat.
+    ///     False for a bad player or bit, or a gone engine. Control thread.
+    /// </summary>
+    public bool TrySetChartRouteMask(int player, uint seatMask)
+    {
+        var h = TryAcquire();
+        if (h == nint.Zero) return false;
+        try { return NativeMethods.EngineChartSourceSetRouteMaskForPlayer(h, player, seatMask) == NativeMethods.DcaStatus.Ok; }
+        finally { Release(); }
+    }
+
+    /// <summary>The EFFECTIVE chart route of <paramref name="player" /> (0 reads back
+    /// as the own seat's bit); 0 for a bad player or a gone engine
+    /// (<c>dca_engine_chart_source_get_route_mask_for_player</c>).</summary>
+    public uint GetChartRouteMask(int player)
+    {
+        var h = TryAcquire();
+        if (h == nint.Zero) return 0;
+        try { return NativeMethods.EngineChartSourceGetRouteMaskForPlayer(h, player, out var m) == NativeMethods.DcaStatus.Ok ? m : 0; }
+        finally { Release(); }
+    }
 }

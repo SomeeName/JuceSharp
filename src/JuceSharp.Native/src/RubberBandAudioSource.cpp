@@ -51,7 +51,7 @@ void RubberBandAudioSource::prepareToPlay(int blockSize, double sampleRate)
         inner_->prepareToPlay(blockSize, sampleRate);
 
     std::lock_guard<std::mutex> lk(stretcherMutex_);
-    readAheadOut_.store(0, std::memory_order_release);
+    publishReadAhead(0);
     stretching_       = false;
     discardRemaining_ = 0;
 
@@ -101,7 +101,7 @@ void RubberBandAudioSource::releaseResources()
     // the position poll: this runs on the device thread at every device
     // change, which is exactly when the other two are busiest.
     std::lock_guard<std::mutex> lk(stretcherMutex_);
-    readAheadOut_.store(0, std::memory_order_release);
+    publishReadAhead(0);
     stretcher_.reset();
     stretching_       = false;
     discardRemaining_ = 0;
@@ -153,7 +153,7 @@ void RubberBandAudioSource::getNextAudioBlock(const juce::AudioSourceChannelInfo
 
     if (! stretcher_ || inner_ == nullptr || info.numSamples <= 0)
     {
-        readAheadOut_.store(0, std::memory_order_release);
+        publishReadAhead(0);
         if (info.buffer != nullptr) info.clearActiveBufferRegion();
         return;
     }
@@ -162,7 +162,7 @@ void RubberBandAudioSource::getNextAudioBlock(const juce::AudioSourceChannelInfo
     // whole group, so pass straight through. setBypass reset the stretcher.
     if (bypass_.load(std::memory_order_acquire))
     {
-        readAheadOut_.store(0, std::memory_order_release);
+        publishReadAhead(0);
         inner_->getNextAudioBlock(info);
         return;
     }
@@ -193,7 +193,7 @@ void RubberBandAudioSource::getNextAudioBlock(const juce::AudioSourceChannelInfo
     {
         // Nothing is being fed to the stretcher on this path, so there is no
         // read-ahead to compensate for.
-        readAheadOut_.store(0, std::memory_order_release);
+        publishReadAhead(0);
         inner_->getNextAudioBlock(info);
         return;
     }
@@ -208,7 +208,7 @@ void RubberBandAudioSource::getNextAudioBlock(const juce::AudioSourceChannelInfo
 
     // Publish for the position poll, which must never touch stretcher_ itself.
     const int avail = stretcher_->available();
-    readAheadOut_.store(avail > 0 ? avail : 0, std::memory_order_release);
+    publishReadAhead(avail > 0 ? avail : 0);
 }
 
 int RubberBandAudioSource::pullBlockSize() const noexcept
@@ -221,7 +221,7 @@ void RubberBandAudioSource::resetStretcherLocked()
     if (stretcher_ && stretching_) stretcher_->reset();
     stretching_       = false;
     discardRemaining_ = 0;
-    readAheadOut_.store(0, std::memory_order_release);
+    publishReadAhead(0);
 }
 
 void RubberBandAudioSource::setBypass(bool bypassed)

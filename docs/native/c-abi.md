@@ -354,7 +354,7 @@ unchanged; only its DETECTOR reads somewhere else.
 |---|---|
 | `DCA_DSP_SIDECHAIN_NONE` (0) | The module's own input. Default, and byte-for-byte the pre-v34 behaviour. |
 | `DCA_DSP_SIDECHAIN_INPUT` (1) | The seat's DRY input — this chain's input block — so a pedal late in the chain follows the pick, not what the drive left of it produced. |
-| `DCA_DSP_SIDECHAIN_SONG` (2) | The song / master mix as it stands when this seat is processed (the transport output after the master bus, plus the monitor of any seat processed earlier in the same callback). Ducks the rig under the backing track. |
+| `DCA_DSP_SIDECHAIN_SONG` (2) | The song mix: the transport output after the master bus, without any seat's monitor (every seat's rig runs before the monitor mix). Ducks the rig under the backing track. |
 
 REJECTED with `DCA_ERR_INVALID_ARG` for an unknown node, a source outside 0..2,
 or a module whose `dca_dsp_module_type_flags` does not carry
@@ -542,6 +542,8 @@ while grouped.
 |---|:--:|---|
 | `dca_engine_set_remote_bridge` | v19 | Attach / detach the shared-memory bridge to `juce_vst_host.exe`. |
 | `dca_engine_get_remote_bridge_stats` | v19 | Blocks processed, timeouts, heartbeat. |
+| `dca_engine_set_remote_bridge_for_player` | v50 | The same for ONE seat's bridge: every seat owns its own mapping, events and child; the v19 export is seat 0's. |
+| `dca_engine_get_remote_bridge_stats_for_player` | v50 | One seat's bridge counters; the v19 export reads seat 0's. |
 
 ## VST3 plugin parameters (ABI v4)
 

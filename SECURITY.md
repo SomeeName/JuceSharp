@@ -9,7 +9,7 @@ and will refuse a mismatched `juce_sharp.dll`.
 
 | Version | Supported |
 |---|---|
-| `main` (currently 1.3.0, ABI v49) | ✅ |
+| `main` (currently 1.4.0, ABI v51) | ✅ |
 | Anything older | ❌ — upgrade |
 
 ## Reporting a vulnerability

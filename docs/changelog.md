@@ -7,6 +7,20 @@ The version lives in `Directory.Build.props` at the repository root (one
 it requires, because the managed wrapper demands exact equality and refuses a
 stale `juce_sharp.dll`.
 
+## 1.4.0 (2026-11-21)
+
+**ABI v51.**
+
+- **Sandboxed VST per seat (ABI v50)** — each player seat runs its sandboxed
+  plug-in in its own child process, and all seats share one collection
+  deadline, so one stalled plug-in no longer holds the others.
+- **Seat routing for the chart sound (ABI v51)** — routing masks send the
+  chart sound to any set of seats; each route plays at one shared level.
+- **Chart gain above unity** boosts the seat's monitor mix after the rig.
+- **Render-to-wav and transport fixes** — the resampling source is read only
+  inside its length, failures are reported, a replaced clock source is drained,
+  and a replaced voice finishes its cross-fade on an input-less device.
+
 ## 1.3.0 (2026-10-25)
 
 **ABI v49.**

@@ -114,6 +114,7 @@ struct HostedPlugin
     std::unique_ptr<juce::AudioPluginInstance>  instance;
     std::unique_ptr<HostEditorWindow>           editor;   // MM thread only
     std::atomic<bool>                           bypass{false};
+    int                                         seat = 0; // bridge v4 (#646): whose chain this slot is in
 };
 
 // ---------------------------------------------------------------------------
@@ -228,7 +229,7 @@ private:
         if (view_ == nullptr)
         {
             // An existing mapping keeps the size it was CREATED with, so a
-            // parent built against a shorter layout (v2 has no MIDI-timing
+            // parent built against a shorter layout (v3 has no seat-routing
             // block) cannot be viewed at this build's size. Say so with the
             // version it carries instead of a bare "failed to open".
             if (void* head = ::MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, dcvb::kHeaderBytes))
@@ -279,10 +280,30 @@ private:
         const int blk = (int) h->prepareBlockFrames.load(std::memory_order_relaxed);
         if (sr  > 0) sampleRate_ = sr;
         if (blk > 0) blockSize_  = blk;
+        // A restarted child attaches to the parent's surviving mapping: the
+        // seat mask the previous child published names plugins this one has
+        // not loaded yet, so start from what this process actually holds.
+        {
+            std::lock_guard<std::mutex> lk(graphMutex_);
+            publishSeatMaskLocked();
+        }
         return true;
        #else
         return false;
        #endif
+    }
+
+    /// Bridge v4 (#646): tells the parent which seats hold a chain plugin, so
+    /// it skips the round trip for a seat with nothing to run. Caller holds
+    /// graphMutex_; called after every change to chainOrder_.
+    void publishSeatMaskLocked()
+    {
+        if (view_ == nullptr) return;
+        uint32_t mask = 0;
+        for (auto* slot : chainOrder_)
+            if (slot != nullptr && slot->seat >= 0 && slot->seat < dcvb::kMaxSeats)
+                mask |= 1u << (uint32_t) slot->seat;
+        dcvb::seatRouting(view_)->seatChainMask.store(mask, std::memory_order_release);
     }
 
     void closeBridge()
@@ -372,50 +393,67 @@ private:
                 }
             }
 
-            const uint32_t seq = h->requestSeq.load(std::memory_order_acquire);
-            if (seq == lastSeq) continue;
-            lastSeq = seq;
-
-            const int n  = (int) std::min<uint32_t>(h->blockFrames, dcvb::kMaxBlockFrames);
-            const int ic = (int) std::min<uint32_t>(h->inputChannels, dcvb::kMaxChannels);
-            // A re-prepare is in flight: answer, but with nothing active. The
-            // alternative is running plugins whose prepared block size no
-            // longer matches the one they are being handed.
-            if (n <= 0 || repreparing_.load(std::memory_order_acquire))
-            {
-                h->chainActive = 0;
-                h->instrumentActive = 0;
-                h->responseSeq.store(seq, std::memory_order_release);
-               #if defined(_WIN32)
-                ::SetEvent((HANDLE) respEvent_);
-               #endif
-                continue;
-            }
-
-            // Copy the request payload out of the mapping first.
-            for (int ch = 0; ch < dcvb::kMaxChannels; ++ch)
-            {
-                float* dst = chainBuf.getWritePointer(ch);
-                if (ch < ic)
-                    std::memcpy(dst, dcvb::inputChannel(view_, ch), (size_t) n * sizeof(float));
-                else if (ic > 0)
-                    std::memcpy(dst, dcvb::inputChannel(view_, ic - 1), (size_t) n * sizeof(float));
-                else
-                    juce::FloatVectorOperations::clear(dst, n);
-            }
-            midi.clear();
-            const int midiCount = (int) std::min<uint32_t>(h->midiCount, dcvb::kMaxMidiEvents);
-            for (int i = 0; i < midiCount; ++i)
-            {
-                const uint32_t p = h->midi[i];
-                const juce::uint8 bytes[3] = { (juce::uint8)(p & 0xFF),
-                                               (juce::uint8)((p >> 8) & 0xFF),
-                                               (juce::uint8)((p >> 16) & 0xFF) };
-                // Bridge v3 (JuceSharp #28): at the sample the parent placed it
-                // on, not at the head of the block. MidiBuffer keeps events
-                // sorted by position, so carry order does not matter.
-                midi.addEvent(bytes, 3, dcvb::midiSampleOffset(timing, i, n));
-            }
+            // Bridge v4 (#646): takeRequest reads the seat this block belongs
+            // to right after the acquire and drops a request the parent
+            // overwrote while it was being copied (a late child must never run
+            // one seat's plugins over another seat's input; see the header).
+            // Only the request's seat's slots run, and only seat 0's trip
+            // renders the instrument (seat 0 carries the MIDI; a later seat's
+            // trip must leave the instrument output seat 0 just published
+            // alone). An out-of-range seat runs nothing.
+            uint32_t seq = 0, requestSeat = 0;
+            int n = 0;
+            const auto take = dcvb::takeRequest(view_, lastSeq, seq, requestSeat,
+                [&]
+                {
+                    n = (int) std::min<uint32_t>(h->blockFrames, dcvb::kMaxBlockFrames);
+                    // A re-prepare is in flight: answer, but with nothing
+                    // active. The alternative is running plugins whose prepared
+                    // block size no longer matches the one they are handed.
+                    if (n > 0 && ! repreparing_.load(std::memory_order_acquire)) return true;
+                    // Only while the request is still current: one the parent
+                    // began overwriting gets no answer (dcvb::answerInactive).
+                    if (dcvb::answerInactive(h, seq))
+                    {
+                       #if defined(_WIN32)
+                        ::SetEvent((HANDLE) respEvent_);
+                       #endif
+                    }
+                    return false;
+                },
+                [&]
+                {
+                    // Copy the request payload out of the mapping first.
+                    const int ic = (int) std::min<uint32_t>(h->inputChannels, dcvb::kMaxChannels);
+                    for (int ch = 0; ch < dcvb::kMaxChannels; ++ch)
+                    {
+                        float* dst = chainBuf.getWritePointer(ch);
+                        if (ch < ic)
+                            std::memcpy(dst, dcvb::inputChannel(view_, ch), (size_t) n * sizeof(float));
+                        else if (ic > 0)
+                            std::memcpy(dst, dcvb::inputChannel(view_, ic - 1), (size_t) n * sizeof(float));
+                        else
+                            juce::FloatVectorOperations::clear(dst, n);
+                    }
+                    midi.clear();
+                    const int midiCount = (int) std::min<uint32_t>(h->midiCount, dcvb::kMaxMidiEvents);
+                    for (int i = 0; i < midiCount; ++i)
+                    {
+                        const uint32_t p = h->midi[i];
+                        const juce::uint8 bytes[3] = { (juce::uint8)(p & 0xFF),
+                                                       (juce::uint8)((p >> 8) & 0xFF),
+                                                       (juce::uint8)((p >> 16) & 0xFF) };
+                        // Bridge v3 (JuceSharp #28): at the sample the parent
+                        // placed it on, not at the head of the block. MidiBuffer
+                        // keeps events sorted by position, so carry order does
+                        // not matter.
+                        midi.addEvent(bytes, 3, dcvb::midiSampleOffset(timing, i, n));
+                    }
+                });
+            // Dropped: nothing runs and nothing is published; the parent gave
+            // up on that request before it overwrote it, so it already counts
+            // as a missed trip there. The newer request's event is pending.
+            if (take != dcvb::RequestTake::Taken) continue;
 
             bool chainActive = false;
             bool instrActive = false;
@@ -430,6 +468,7 @@ private:
                 {
                     if (slot == nullptr || slot->instance == nullptr) continue;
                     if (slot->bypass.load(std::memory_order_relaxed)) continue;
+                    if ((uint32_t) slot->seat != requestSeat) continue;
                     slot->instance->processBlock(sub, emptyMidi);
                     chainActive = true;
                 }
@@ -441,7 +480,7 @@ private:
                 // proxy). The channel guard is belt-and-braces: it can only
                 // fire if a load somehow raced, and skipping one block beats
                 // allocating.
-                if (auto* instr = instrument_.get(); instr != nullptr && instr->instance != nullptr
+                if (auto* instr = instrument_.get(); requestSeat == 0 && instr != nullptr && instr->instance != nullptr
                     && instrBuf_.getNumChannels() >= std::max(1, instrumentChannels_))
                 {
                     const int outCh = std::max(1, instrumentChannels_);
@@ -465,6 +504,10 @@ private:
 
             h->chainActive      = chainActive ? 1u : 0u;
             h->instrumentActive = instrActive ? 1u : 0u;
+            // Published even when the parent overwrote the slot while the
+            // plugins ran: the parent matches the exact sequence it waits for,
+            // so this answer never stands in for a newer request, whose output
+            // is written over this one before its own sequence is published.
             h->responseSeq.store(seq, std::memory_order_release);
            #if defined(_WIN32)
             ::SetEvent((HANDLE) respEvent_);
@@ -665,9 +708,18 @@ private:
                 // protocol is JSON, so this is NOT a shared-memory layout
                 // change and kBridgeVersion does not move.
                 const int          component = (int) obj->getProperty("component");
+                // Bridge v4 (#646): the seat whose input this slot processes.
+                // Absent parses to 0 (seat 0); anything out of range is
+                // refused, never clamped onto another player's chain.
+                const int          seat = (int) obj->getProperty("seat");
                 juce::String err, name;
                 int latency = 0;
-                onMessageThread([&] { err = loadChainSlot(slot, path, bypass, latency, name, component); });
+                if (seat < 0 || seat >= dcvb::kMaxSeats)
+                {
+                    reply(false, nullptr, "seat " + juce::String(seat) + " is out of range");
+                    return;
+                }
+                onMessageThread([&] { err = loadChainSlot(slot, path, bypass, latency, name, component, seat); });
                 reply(err.isEmpty(), [&](juce::DynamicObject& r)
                 {
                     r.setProperty("latency", latency);
@@ -781,7 +833,7 @@ private:
 
     juce::String loadChainSlot(const juce::String& slotId, const juce::String& path,
                                bool bypass, int& latencyOut, juce::String& nameOut,
-                               int component = 0)
+                               int component = 0, int seat = 0)
     {
         unloadChainSlot(slotId); // replace-in-place semantics
 
@@ -802,6 +854,7 @@ private:
         slot->path   = path;
         slot->instance = std::move(inst);
         slot->bypass.store(bypass, std::memory_order_relaxed);
+        slot->seat = seat;
         latencyOut = std::max(0, slot->instance->getLatencySamples());
         nameOut    = slot->instance->getName();
 
@@ -809,6 +862,7 @@ private:
             std::lock_guard<std::mutex> lk(graphMutex_);
             chainOrder_.push_back(slot.get());
             slots_[slotId] = std::move(slot);
+            publishSeatMaskLocked();
         }
         logLine("chain slot loaded: " + nameOut + " (" + slotId + ")");
         return {};
@@ -825,6 +879,7 @@ private:
                               chainOrder_.end());
             victim = std::move(it->second);
             slots_.erase(it);
+            publishSeatMaskLocked();
         }
         // Editor first, then instance (strict order — BIAS/Helix crash otherwise).
         victim->editor.reset();
@@ -846,6 +901,7 @@ private:
         for (auto* p : chainOrder_)
             if (std::find(next.begin(), next.end(), p) == next.end()) next.push_back(p);
         chainOrder_ = std::move(next);
+        publishSeatMaskLocked();
     }
 
     juce::String loadInstrument(const juce::String& path, int& latencyOut, juce::String& nameOut,
@@ -1004,6 +1060,7 @@ private:
     {
         std::lock_guard<std::mutex> lk(graphMutex_);
         chainOrder_.clear();
+        publishSeatMaskLocked();
         for (auto& kv : slots_)
         {
             try

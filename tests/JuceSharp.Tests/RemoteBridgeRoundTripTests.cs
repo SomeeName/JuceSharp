@@ -29,9 +29,14 @@ public sealed class RemoteBridgeRoundTripTests : IDisposable
     private readonly NullDeviceScope _scope = new();
     public void Dispose() => _scope.Dispose();
 
-    // dcvb layout (bridge version 3).
-    private const int TotalBytes = 197704;
+    // dcvb layout (bridge version 4).
+    private const int TotalBytes = 197712;
     private const int V2TotalBytes = 197184;          // v2 had no MIDI-timing block
+    private const int V3TotalBytes = 197704;          // v3 had no seat-routing block
+    private const int OffRequestSeat = 197704;        // v4: uint32 seat this request is for
+    private const int OffSeatChainMask = 197708;      // v4: uint32, bit s = seat s has a chain
+    private const int InputOffset = 576;
+    private const int ChainOutOffset = 66112;
     private const int OffMagic = 0;
     private const int OffVersion = 4;
     private const int OffMidiTiming = 197184;         // v3: int64 blockStartFrame, uint32 offset[128]
@@ -40,6 +45,9 @@ public sealed class RemoteBridgeRoundTripTests : IDisposable
     private const int OffPrepareBlockFrames = 44;   // was reserved0 in v1
     private const int OffPrepareGeneration = 572;   // was reserved1 in v1
     private const int OffRequestSeq = 16;
+    // dcvb::kRequestWriting: the parent is mid-way through writing the next
+    // request, so there is nothing to read yet (its event comes after the publish).
+    private const uint RequestWriting = 0xFFFFFFFFu;
     private const int OffResponseSeq = 20;
     private const int OffHeartbeat = 24;
     private const int OffBlockFrames = 32;
@@ -84,7 +92,7 @@ public sealed class RemoteBridgeRoundTripTests : IDisposable
                 reqEvent.WaitOne(50);
                 acc.Write(OffHeartbeat, ++beat);
                 var seq = acc.ReadUInt32(OffRequestSeq);
-                if (seq == last) continue;
+                if (seq == last || seq == RequestWriting) continue;
                 last = seq;
 
                 var midiCount = Math.Min(acc.ReadUInt32(OffMidiCount), 128u);
@@ -252,7 +260,7 @@ public sealed class RemoteBridgeRoundTripTests : IDisposable
                 reqEvent.WaitOne(50);
                 acc.Write(OffHeartbeat, ++beat);
                 var seq = acc.ReadUInt32(OffRequestSeq);
-                if (seq == last) continue;
+                if (seq == last || seq == RequestWriting) continue;
                 last = seq;
 
                 var frames = acc.ReadUInt32(OffBlockFrames);
@@ -367,6 +375,20 @@ public sealed class RemoteBridgeRoundTripTests : IDisposable
         Assert.False(engine.SetRemoteBridge(shm3, "dcvb_v3x_req_" + suffix, "dcvb_v3x_resp_" + suffix, enable: true),
             "the parent armed a bridge over a mapping stamped bridge v2");
 
+        // ...and so is a v3-SIZED mapping (#646: a v3 child ignores the seat).
+        var shmV3 = "dcvb_v3_shm_" + suffix;
+        using var mmfV3 = MemoryMappedFile.CreateOrOpen(shmV3, V3TotalBytes);
+        using (var acc = mmfV3.CreateViewAccessor(0, V3TotalBytes))
+        {
+            acc.Write(OffMagic, 0x44435642u);
+            acc.Write(OffVersion, 3u);
+            acc.Write(8, 8192u);
+            acc.Write(12, 2u);
+        }
+
+        Assert.False(engine.SetRemoteBridge(shmV3, "dcvb_v3_req_" + suffix, "dcvb_v3_resp_" + suffix, enable: true),
+            "the parent armed a bridge over a v3-sized mapping");
+
         // Non-vacuity: the same engine DOES arm over a fresh mapping.
         var ok = "dcvb_ok_shm_" + suffix;
         try
@@ -377,6 +399,217 @@ public sealed class RemoteBridgeRoundTripTests : IDisposable
         {
             engine.SetRemoteBridge(null, null, null, enable: false);
         }
+    }
+
+    /// <summary>
+    /// DotCharter #646 / #696 (ABI v50): a sandboxed effect belongs to its seat,
+    /// and every seat's chain has a child of its OWN. Each seat round-trips with
+    /// its own input and its seat number to its own child, but only once that
+    /// child says the seat holds a chain plugin; seat 0 keeps its own trip, its
+    /// own input and all the MIDI. Seat 1's fake child processes a seat-1
+    /// request (it halves it) and seat 0's leaves seat 0 dry, so seat 1 is heard
+    /// processed and seat 0 unchanged. A child's mask lives in its mapping, so a
+    /// FRESH engine re-armed over both (an engine rebuild) routes seat 1 again
+    /// with no word from the child.
+    /// </summary>
+    [NativeAvailableFact]
+    public void EachSeatRoundTripsItsOwnInputToItsOwnChild_OnlyWhenThatChildHoldsAChainForIt_AndAgainAfterARebuild()
+    {
+        var suffix = Guid.NewGuid().ToString("N");
+        using var child0 = new FakeSeatChild("dcvb_seat0_" + suffix, chainSeat: 0);
+        using var child1 = new FakeSeatChild("dcvb_seat1_" + suffix, chainSeat: 1);
+
+        using (var engine = ArmTwoSeats(child0, child1))
+        {
+            // No chain for seat 1 yet: only seat 0's trips, carrying seat 0's
+            // input to seat 0's child, and both seats are heard dry.
+            Assert.True(SpinUntil(() => child0.Count(0) >= 20), "seat 0 never round-tripped to its child");
+            Assert.Equal(0, child1.Count(0) + child1.Count(1));
+            AssertSeatsSettleAt(engine, Seat0Amplitude, Seat1Amplitude);
+
+            // Seat 1's child loads a plugin on seat 1 and publishes it. MIDI keeps
+            // flowing, and only seat 0's trip may carry it.
+            child1.PublishSeatMask(0b10u);
+            Assert.True(SpinUntil(() =>
+            {
+                engine.SendMidi(0x90, 60, 100);
+                return child1.Count(1) >= 20 && child0.MidiTrips(0) > 0;
+            }), "seat 1 never round-tripped once its child held a chain, or no MIDI reached seat 0's trip");
+            AssertEachChildCarriedOnlyItsSeat(child0, child1);
+            // Seat 1 is processed (its child's chain halves it); seat 0 is unchanged.
+            AssertSeatsSettleAt(engine, Seat0Amplitude, Seat1Amplitude * 0.5f);
+        }
+
+        child0.Clear();
+        child1.Clear();
+
+        // Rebuild: a fresh engine over the surviving mappings and children.
+        using (var rebuilt = ArmTwoSeats(child0, child1))
+        {
+            Assert.True(SpinUntil(() => child1.Count(1) >= 20 && child0.Count(0) >= 20),
+                "a seat stopped round-tripping to its child after the engine was rebuilt");
+            AssertEachChildCarriedOnlyItsSeat(child0, child1);
+            AssertSeatsSettleAt(rebuilt, Seat0Amplitude, Seat1Amplitude * 0.5f);
+        }
+    }
+
+    // Seat 0 hears a 0.1 sine, seat 1 a 0.4 one: a trip that carried the wrong
+    // seat's input shows up as the wrong peak.
+    private const float Seat0Amplitude = 0.1f;
+    private const float Seat1Amplitude = 0.4f;
+
+    private static JuceAudioEngine ArmTwoSeats(FakeSeatChild child0, FakeSeatChild child1)
+    {
+        var engine = NullDevice.CreateEngine(sampleRate: 48000, bufferFrames: 256);
+        engine.SetPlayerCount(2);
+        foreach (var (seat, amplitude) in new[] { (0, Seat0Amplitude), (1, Seat1Amplitude) })
+        {
+            var take = new float[4800];
+            for (var i = 0; i < take.Length; i++) take[i] = amplitude * MathF.Sin(2f * MathF.PI * 1000f * i / 48000f);
+            engine.SetInputInjection(seat, take, loop: true);
+            Assert.True(engine.SetInputInjectionPlaying(seat, true), $"seat {seat} has no take to play");
+        }
+
+        Assert.True(engine.SetRemoteBridge(0, child0.Shm, child0.Request, child0.Response, enable: true), "seat 0's bridge enable failed");
+        Assert.True(engine.SetRemoteBridge(1, child1.Shm, child1.Request, child1.Response, enable: true), "seat 1's bridge enable failed");
+        return engine;
+    }
+
+    private static void AssertEachChildCarriedOnlyItsSeat(FakeSeatChild child0, FakeSeatChild child1)
+    {
+        var seen0 = child0.Snapshot();
+        var seen1 = child1.Snapshot();
+        Assert.All(seen0, r => Assert.True(r.Seat == 0, $"seat 0's child received a request for seat {r.Seat}"));
+        Assert.All(seen1, r => Assert.True(r.Seat == 1, $"seat 1's child received a request for seat {r.Seat}"));
+        // Only seat 0's trip carries MIDI: the instrument is seat 0's.
+        Assert.All(seen1, r => Assert.Equal(0u, r.MidiCount));
+        // Skip the 5 ms play ramp: from the tenth trip of a seat its input is at full level.
+        foreach (var (seen, amplitude) in new[] { (seen0, Seat0Amplitude), (seen1, Seat1Amplitude) })
+        {
+            var settled = seen.Skip(10).ToList();
+            Assert.NotEmpty(settled);
+            Assert.All(settled, r => Assert.InRange(r.Peak, amplitude * 0.8f, amplitude * 1.05f));
+        }
+    }
+
+    /// <summary>
+    /// A managed fake of ONE seat's sandbox child: its own mapping and events,
+    /// the child side of the bridge handshake, a log of the requests it served,
+    /// and a "chain" that halves the requests of <c>chainSeat</c> once its seat
+    /// mask names that seat. Requests for any other seat come back inactive (dry).
+    /// </summary>
+    private sealed class FakeSeatChild : IDisposable
+    {
+        private readonly MemoryMappedFile _mmf;
+        private readonly MemoryMappedViewAccessor _acc;
+        private readonly EventWaitHandle _req;
+        private readonly EventWaitHandle _resp;
+        private readonly Thread _thread;
+        private readonly List<(uint Seat, uint MidiCount, float Peak)> _requests = [];
+        private readonly uint _chainSeat;
+        private volatile bool _stop;
+
+        public FakeSeatChild(string prefix, uint chainSeat)
+        {
+            Shm = prefix + "_shm";
+            Request = prefix + "_req";
+            Response = prefix + "_resp";
+            _chainSeat = chainSeat;
+            _mmf = MemoryMappedFile.CreateOrOpen(Shm, TotalBytes);
+            _acc = _mmf.CreateViewAccessor(0, TotalBytes);
+            _req = new EventWaitHandle(false, EventResetMode.AutoReset, Request);
+            _resp = new EventWaitHandle(false, EventResetMode.AutoReset, Response);
+            _thread = new Thread(Loop) { IsBackground = true };
+            _thread.Start();
+        }
+
+        public string Shm { get; }
+        public string Request { get; }
+        public string Response { get; }
+
+        public void PublishSeatMask(uint mask) => _acc.Write(OffSeatChainMask, mask);
+
+        public int Count(uint seat)
+        {
+            lock (_requests) return _requests.Count(r => r.Seat == seat);
+        }
+
+        public int MidiTrips(uint seat)
+        {
+            lock (_requests) return _requests.Count(r => r.Seat == seat && r.MidiCount > 0);
+        }
+
+        public List<(uint Seat, uint MidiCount, float Peak)> Snapshot()
+        {
+            lock (_requests) return [.. _requests];
+        }
+
+        public void Clear()
+        {
+            lock (_requests) _requests.Clear();
+        }
+
+        private void Loop()
+        {
+            var block = new float[8192];
+            uint last = _acc.ReadUInt32(OffRequestSeq);
+            uint beat = 0;
+            while (!_stop)
+            {
+                _req.WaitOne(50);
+                _acc.Write(OffHeartbeat, ++beat);
+                var seq = _acc.ReadUInt32(OffRequestSeq);
+                if (seq == last || seq == RequestWriting) continue;
+                last = seq;
+
+                var seat = _acc.ReadUInt32(OffRequestSeat);
+                var frames = (int)Math.Min(_acc.ReadUInt32(OffBlockFrames), 8192u);
+                _acc.ReadArray(InputOffset, block, 0, frames);
+                var peak = 0f;
+                for (var i = 0; i < frames; i++) peak = MathF.Max(peak, MathF.Abs(block[i]));
+                lock (_requests) _requests.Add((seat, _acc.ReadUInt32(OffMidiCount), peak));
+
+                var chain = seat == _chainSeat && (_acc.ReadUInt32(OffSeatChainMask) & (1u << (int)seat)) != 0;
+                if (chain)
+                {
+                    for (var i = 0; i < frames; i++) block[i] *= 0.5f;
+                    _acc.WriteArray(ChainOutOffset, block, 0, frames);
+                    _acc.WriteArray(ChainOutOffset + ChannelBytes, block, 0, frames);
+                }
+
+                _acc.Write(OffChainActive, chain ? 1u : 0u);
+                _acc.Write(OffInstrumentActive, 0u);
+                _acc.Write(OffResponseSeq, seq);
+                _resp.Set();
+            }
+        }
+
+        public void Dispose()
+        {
+            _stop = true;
+            _thread.Join();
+            _req.Dispose();
+            _resp.Dispose();
+            _acc.Dispose();
+            _mmf.Dispose();
+        }
+    }
+
+    // What each seat is HEARD at: the per-seat post-chain peak, which the bridge's
+    // answer feeds. One round trip that misses its block leaves that block dry,
+    // so this waits for a clean read window instead of trusting the first one.
+    private static void AssertSeatsSettleAt(JuceAudioEngine engine, float seat0, float seat1)
+    {
+        float p0 = 0f, p1 = 0f;
+        _ = engine.GetAndResetPlayerInputPeak(0);
+        _ = engine.GetAndResetPlayerInputPeak(1);
+        var settled = SpinUntil(() =>
+        {
+            p0 = engine.GetAndResetPlayerInputPeak(0);
+            p1 = engine.GetAndResetPlayerInputPeak(1);
+            return p0 >= seat0 * 0.9f && p0 <= seat0 * 1.05f && p1 >= seat1 * 0.9f && p1 <= seat1 * 1.05f;
+        });
+        Assert.True(settled, $"seat 0 heard at {p0} (want {seat0}), seat 1 at {p1} (want {seat1})");
     }
 
     private static bool SpinUntil(Func<bool> condition)
@@ -404,7 +637,7 @@ public sealed class RemoteBridgeRoundTripTests : IDisposable
 [Collection("NativeEngine")]
 public sealed class RemoteBridgeRealDeviceSmokeTests
 {
-    private const int TotalBytes = 197704;
+    private const int TotalBytes = 197712;
 
     /// <summary>
     ///     Deadlock detector for the two condition waits below — NOT a budget

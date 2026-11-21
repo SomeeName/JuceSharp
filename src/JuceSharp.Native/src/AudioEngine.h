@@ -17,6 +17,7 @@
 #include "MirrorOutput.h"
 #include "RemoteVstBridge.h"
 #include "RtDiag.h"
+#include "SeqlockClock.h"
 #include "dotcharter_vst_bridge.h"
 #include "dsp/DspChain.h"
 #include "dsp/DspModuleFactory.h"
@@ -62,6 +63,8 @@ public:
     /// byte-for-byte — that is deliberate: a single-player user must not pay for,
     /// or hear any change from, a feature they are not using.
     static constexpr int kMaxPlayers = 4;
+    static_assert(dcvb::kMaxSeats >= kMaxPlayers,
+                  "the sandbox bridge must route every seat the engine can run (bridge v4)");
 
     /// Node ids are unique per ENGINE, not per chain: player `p`'s chain hands
     /// out `p * kPlayerNodeIdStride + local`. That is what lets every NODE-scoped
@@ -154,8 +157,15 @@ public:
     float  stemGroupPitchSemitones()  const noexcept { return stemGroupPitch_.load(std::memory_order_relaxed); }
     /// Read-ahead samples sitting in the shared group stretcher (in
     /// device-rate output samples). 0 when no group is active or when no
-    /// audio has been pulled yet. Used by the host playhead compensation.
+    /// audio has been pulled yet. Control thread only (takes stemGroupMutex_):
+    /// it asks the stretcher directly, so the RT scenarios read it as the
+    /// reference value for the mirrored stemGroupReadAheadRt below. The
+    /// engine's own position paths read stemGroupReadAheadRt, not this.
     int    stemGroupReadAheadSamples() const noexcept;
+    /// The same read-ahead as the group stretcher last published it, mirrored
+    /// into this engine: lock-free, any thread including the audio thread (the
+    /// song clock), and 0 while no group is active.
+    int    stemGroupReadAheadRt() const noexcept { return stemGroupReadAhead_.load(std::memory_order_acquire); }
     /// A grouped stem was seeked: the shared stretcher's read-ahead is no
     /// longer the song's continuation (JuceSharp #32). Control thread; the
     /// stems move one by one, so this cannot be one step with their seeks.
@@ -338,8 +348,13 @@ public:
     /// Binds the song clock every seat's chart source follows; null unbinds.
     /// False when `source` is not one of this engine's attached sources.
     bool setSongClockSource(TransportSource* source);
-    /// Unbinds `source` if it is the clock and waits until no callback can
-    /// still be reading it. Called by TransportSource before it tears its
+    /// Unbinds `source` if it is the clock and, when it was published as the
+    /// clock since its last completed drain (a source replaced as the clock may
+    /// still be read by a callback that loaded it earlier), waits until no
+    /// callback can still be reading it. A source never published since then
+    /// returns without waiting: the reader only dereferences what it loaded
+    /// from songClockSource_. Called by
+    /// TransportSource before it tears its
     /// wiring down. Returns whether it WAS the clock.
     bool forgetSongClockSource(TransportSource* source) noexcept;
     /// Validates and publishes a new note table (count 0 clears). False with
@@ -370,8 +385,21 @@ public:
     bool getChartStatus(int player, dca_chart_source_status& out);
 
     /// -1 = after the master (engine start), else that seat's rig input.
+    /// Since v51 a one-seat view of the route MASK below.
     bool setInstrumentRoute(int player) noexcept;
-    int  instrumentRoute() const noexcept { return instrumentRoute_.load(std::memory_order_relaxed); }
+    int  instrumentRoute() const noexcept;
+    /// ABI v51: the seats whose rigs take the in-process instrument (bit p =
+    /// seat p); 0 = after the master (engine start). Bits past kMaxPlayers are
+    /// refused. A bit naming a seat that is not live is skipped; with no live
+    /// seat left the instrument stays on the master.
+    bool     setInstrumentRouteMask(uint32_t seatMask) noexcept;
+    uint32_t instrumentRouteMask() const noexcept { return instrumentRouteMask_.load(std::memory_order_relaxed); }
+    /// ABI v51: the seats whose rigs take seat `player`'s chart source. 0 (engine
+    /// start) = its own seat only. A bit naming a seat that is not live is
+    /// skipped; with none left the source plays into its own seat, never nowhere.
+    bool     setChartRouteMask(int player, uint32_t seatMask) noexcept;
+    /// The EFFECTIVE mask (0 reads as the own seat's bit); 0 = invalid player.
+    uint32_t chartRouteMask(int player) const noexcept;
 
     // --- Master / filter bus ---------------------------------------------
     /// Master output gain applied AFTER the mixer + before the input monitor mix.
@@ -551,10 +579,15 @@ public:
     /// prepared with the current device sample rate / block size before being
     /// inserted, so it is safe to call from any thread.
     /// Returns true on success. `player` defaults to 0 (the pre-v28 chain).
-    bool attachInputPlugin(juce::AudioPluginInstance* plugin, int player = 0);
+    /// `position` is the index the plugin takes in that chain (0 = processed
+    /// first, clamped to the chain's length); -1 appends.
+    bool attachInputPlugin(juce::AudioPluginInstance* plugin, int player = 0, int position = -1);
     /// Detach from EVERY player chain — a plugin instance is about to be
     /// destroyed and the caller does not have to remember where it went.
     void detachInputPlugin(juce::AudioPluginInstance* plugin);
+    /// Where `plugin` sits in `player`'s input chain (0 = processed first), or
+    /// -1 when that chain does not hold it. Any thread.
+    int inputChainIndexOf(const juce::AudioPluginInstance* plugin, int player) const;
     /// Rubber Band engine quality for THIS engine's stretchers: 0 = Finer
     /// (default), 1 = Faster. Flipped by the host when several stems are
     /// loaded. It was a process-global until 2026-09-10, so
@@ -634,23 +667,49 @@ public:
     bool attachInstrumentPlugin(juce::AudioPluginInstance* plugin);
     void detachInstrumentPlugin(juce::AudioPluginInstance* plugin);
     bool hasInstrument() const noexcept { return instrumentPlugin_.load(std::memory_order_acquire) != nullptr; }
+    /// The plugin in the instrument slot right now (nullptr = empty). The C ABI
+    /// decides attach / detach by this, not by its own per-plugin flags: a
+    /// second attach REPLACES the slot, so "I attached it once" says nothing
+    /// about who holds it now.
+    juce::AudioPluginInstance* instrumentPlugin() const noexcept { return instrumentPlugin_.load(std::memory_order_acquire); }
 
-    // --- Out-of-process VST bridge (ABI v19) -------------------------------
-    /// Arm / disarm the shared-memory bridge to the sandboxed VST host
-    /// process. While armed, the audio callback runs one bounded round trip
-    /// per block: live input goes out for FX-chain processing, queued MIDI
-    /// shorts go out for the remote instrument, and the child's processed
-    /// chain / rendered instrument audio come back. Safe to call from any
-    /// non-audio thread; disable waits out any in-flight block before
-    /// closing the kernel objects.
-    bool setRemoteBridge(const char* shmName, const char* requestEventName,
+    // --- Out-of-process VST bridge (ABI v19; one per seat since ABI v50) ----
+    /// Arm / disarm `seat`'s shared-memory bridge to ITS sandboxed VST host
+    /// process (ABI v50, DotCharter #696: one child per seat). While armed,
+    /// the audio callback runs one bounded round trip per block for that
+    /// seat: its live input goes out for FX-chain processing and the child's
+    /// processed chain comes back; seat 0's trip also carries the queued MIDI
+    /// shorts for the remote instrument and brings its rendered audio back.
+    /// A seat with no armed bridge makes no trip. Arming or disarming one seat
+    /// never touches another seat's mapping, events, sequences or miss state.
+    /// Safe to call from any non-audio thread; disable waits out any in-flight
+    /// block before closing the kernel objects. Returns false for a seat
+    /// outside [0, kMaxPlayers) or when a kernel object could not be created.
+    bool setRemoteBridge(int seat, const char* shmName, const char* requestEventName,
                          const char* responseEventName, bool enable);
+    /// The seat-0 entry point (ABI v19): seat 0's bridge.
+    bool setRemoteBridge(const char* shmName, const char* requestEventName,
+                         const char* responseEventName, bool enable)
+    {
+        return setRemoteBridge(0, shmName, requestEventName, responseEventName, enable);
+    }
+    /// `seat`'s bridge counters; false (and zeros) for a seat out of range.
+    bool getRemoteBridgeStats(int seat, uint32_t& processed, uint32_t& timeouts,
+                              uint32_t& heartbeat) const noexcept
+    {
+        processed = timeouts = heartbeat = 0;
+        if (seat < 0 || seat >= kMaxPlayers) return false;
+        const auto& b = remoteBridges_[(size_t) seat];
+        processed = b.processedBlocks();
+        timeouts  = b.timeoutBlocks();
+        heartbeat = b.lastHeartbeat();
+        return true;
+    }
+    /// The seat-0 entry point (ABI v19): seat 0's bridge counters.
     void getRemoteBridgeStats(uint32_t& processed, uint32_t& timeouts,
                               uint32_t& heartbeat) const noexcept
     {
-        processed = remoteBridge_.processedBlocks();
-        timeouts  = remoteBridge_.timeoutBlocks();
-        heartbeat = remoteBridge_.lastHeartbeat();
+        (void) getRemoteBridgeStats(0, processed, timeouts, heartbeat);
     }
     void setInstrumentGain(float g) noexcept { instrumentGain_.store(g, std::memory_order_relaxed); }
     /// Queue a 3-byte MIDI short message for the instrument. Lock-free; drops
@@ -690,8 +749,9 @@ public:
 
     // --- Click bus (metronome + clap) -------------------------------------
     /// Trigger a synthesised click on the audio thread. Type: 0 = beat tick,
-    /// 1 = measure tick (higher pitch), 2 = clap (noise burst). Lock-free,
-    /// safe to call from UI or worker threads. The voice starts at the head of
+    /// 1 = measure tick (higher pitch), 2 = clap (noise burst). Safe to call
+    /// from UI or worker threads, never the audio thread: producers serialize
+    /// on a spin lock the audio thread does not take. The voice starts at the head of
     /// the next audio block, so the trigger jitters by up to one block plus
     /// whatever quantum the caller's clock has. Use scheduleClick when the
     /// click has to land ON a known point of the output timeline.
@@ -700,7 +760,8 @@ public:
     /// ABI v26. Schedule a click to start at an ABSOLUTE frame on the engine's
     /// output render clock (see getRenderClock). The audio thread starts the
     /// voice at that exact sample OFFSET inside whichever block contains it —
-    /// no block-boundary jitter. Lock-free, safe from any thread.
+    /// no block-boundary jitter. Any thread but the audio thread (producers
+    /// serialize on a spin lock the audio thread does not take).
     ///
     /// A frame that has already been rendered fires at the head of the current
     /// block (never worse than triggerClick) unless it is stale by more than
@@ -709,8 +770,9 @@ public:
     void scheduleClick(int type, int64_t renderFrame) noexcept;
 
     /// Drop every scheduled-but-not-yet-sounded click. Ordered against
-    /// scheduleClick (both travel through the same FIFO), so a clear issued
-    /// after a schedule always cancels it. Call on seek / pause / stop / speed
+    /// scheduleClick by a clear generation (out of band, so a full schedule
+    /// FIFO cannot drop it): a clear issued after a schedule always cancels it,
+    /// a schedule issued after a clear always survives it. Call on seek / pause / stop / speed
     /// change — the render clock keeps running while the transport does not,
     /// so a stale queue would otherwise fire into silence.
     void clearScheduledClicks() noexcept;
@@ -752,6 +814,41 @@ public:
                                           int capacity);
 
 #if DCA_RTCHECK
+    /// Instrument-slot seam: named points on the render pass (audio thread,
+    /// under instrumentMutex_, right after the plugin pointer is loaded) and on
+    /// the attaching thread (before it publishes, and right before it blocks on
+    /// instrumentMutex_), so a scenario can hold a thread at a known point.
+    /// InputAttachAfterPublish is the one input-chain point: attachInputPlugin
+    /// has published the new chain and passed its barrier, so a seam that
+    /// throws there is a failure after the publish.
+    enum class InstrumentSeam { RenderLoadedPlugin, AttachBeforePublish, AttachAboutToBlock, InputAttachAfterPublish,
+                                AttachAfterPublish };
+    using InstrumentSeamFn = void (*)(InstrumentSeam, void*);
+    void setInstrumentSeamForTest(InstrumentSeamFn fn, void* user) noexcept
+    {
+        instrumentSeam_     = fn;
+        instrumentSeamUser_ = user;
+    }
+    /// Song-clock seam: on the audio thread inside sampleSongClock right after
+    /// it loaded the clock source (its busy flag raised), and on the unbinding
+    /// thread right before forgetSongClockSource drains the readers.
+    enum class SongClockSeam { ReaderLoadedSource, ForgetAboutToDrain };
+    using SongClockSeamFn = void (*)(SongClockSeam, void*);
+    void setSongClockSeamForTest(SongClockSeamFn fn, void* user) noexcept
+    {
+        songClockSeam_     = fn;
+        songClockSeamUser_ = user;
+    }
+    /// Click-producer seam: a producer (triggerClick, scheduleClick,
+    /// clearScheduledClicks) holds a prepared FIFO slot, or is about to wait
+    /// because another producer is inside its write.
+    enum class ClickSeam { ProducerHoldsSlot, ProducerWaiting };
+    using ClickSeamFn = void (*)(ClickSeam, void*);
+    void setClickSeamForTest(ClickSeamFn fn, void* user) noexcept
+    {
+        clickSeam_     = fn;
+        clickSeamUser_ = user;
+    }
     // Internal gate seam: supply JUCE's legal sparse channel pointers directly.
     void renderForTest(const float* const* in, int inputs, float* const* out, int outputs, int frames)
     { callback_.audioDeviceIOCallbackWithContext(in, inputs, out, outputs, frames, {}); }
@@ -955,13 +1052,19 @@ private:
             // bookkeeping (audio-thread-only fields).
             owner_.bridgeRanThisBlock_      = false;
             owner_.bridgeInstrumentActive_  = false;
+            owner_.bridgePosted_            = false;
+            owner_.bridgeSeatZeroPosted_    = false;
+            owner_.bridgeCollected_         = false;
+            // Names this callback to every bridge: one request per bridge per
+            // callback, one miss per callback (bridge v4, ABI v50).
+            ++owner_.bridgeCallbackSerial_;
 
             // The output-timeline index of out[..][0]. Scheduled clicks are
             // placed against exactly this clock.
-            const int64_t blockStartFrame = owner_.renderFrames_;
+            const int64_t blockStartFrame = owner_.renderClock_.lastCount();
             // The sandbox bridge places its MIDI against the same clock (bridge
             // v3), from inside the seat loop where blockStartFrame is not in
-            // scope and renderFrames_ has already moved on.
+            // scope and the render clock has already moved on.
             owner_.bridgeBlockStartFrame_ = blockStartFrame;
 
             // Playback output first.
@@ -997,6 +1100,9 @@ private:
             // and track peak.
             const float mon = owner_.monitorGain_.load(std::memory_order_relaxed);
             const float ing = owner_.inputGain_  .load(std::memory_order_relaxed);
+            // A seat that skips this block drops its ramp history.
+            const auto previousChartBoost = owner_.chartMonitorBoostCurrent_;
+            owner_.chartMonitorBoostCurrent_.fill(1.0f);
             // Re-amp (ABI v37): a seat with an injected take runs its rig even
             // on a device with no input at all. Nobody injecting = the pre-v37
             // condition exactly.
@@ -1004,30 +1110,54 @@ private:
             // Chart source / routed instrument (ABI v38): a seat with a
             // generator runs its rig even on a device with no input. Nobody
             // using either = the pre-v38 condition exactly.
-            int instrumentSeat = owner_.instrumentRoute_.load(std::memory_order_relaxed);
-            if (instrumentSeat >= 0 && owner_.instrumentPlugin_.load(std::memory_order_acquire) == nullptr)
-                instrumentSeat = -1;
-            const bool anyGenerator = owner_.chartActive_.load(std::memory_order_relaxed) > 0
-                                   || instrumentSeat >= 0;
+            uint32_t instrumentMask = owner_.instrumentRouteMask_.load(std::memory_order_relaxed);
+            if (instrumentMask != 0 && owner_.instrumentPlugin_.load(std::memory_order_acquire) == nullptr)
+                instrumentMask = 0;
+            // ONE read of the player count for this block: the generator check
+            // below and the seat loop agree on which seats are live.
+            const int players = juce::jlimit(1, kMaxPlayers,
+                                             owner_.playerCount_.load(std::memory_order_relaxed));
+            // A route naming only seats that are not live this block stays on
+            // the master (renderInstrumentBus below).
+            instrumentMask &= (1u << players) - 1u;
+            // Only live seats render their chart source, so a seat outside the
+            // live range can never finish a fade. Its source state is cleared
+            // HERE, by the audio thread that owns runState: the seat goes
+            // silent at once, and when it comes back it starts clean (enabled:
+            // the switch-on resync; disabled: silence, no old tail).
+            for (int p = players; p < kMaxPlayers; ++p)
+                if (owner_.chart_[(size_t) p].runState != 0) owner_.quiesceChartSeat(p);
+            // A live seat with a chart source on, one still rendering its choke
+            // fade (runState 2), or one whose replaced voice is still
+            // cross-fading out keeps the seat loop running: stopping on the
+            // enable alone cuts the fade on an input-less device.
+            bool anyGenerator = instrumentMask != 0;
+            for (int p = 0; ! anyGenerator && p < players; ++p)
+            {
+                const auto& cs = owner_.chart_[(size_t) p];
+                anyGenerator = cs.enabled.load(std::memory_order_relaxed) || cs.runState != 0 || cs.fadeRendering;
+            }
             if ((numInputChannels > 0 && in != nullptr) || anyInjection || anyGenerator)
             {
+#if DCA_RTCHECK
+                ++owner_.seatLoopBlocks_;
+#endif
                 // ---- Per-player rigs (ABI v28) -------------------------------
                 // ONE seat (the pre-v28 path) or N seats, each reading its own
                 // hardware input channel out of the SAME open device. Two
                 // guitars into a 2-in interface is the shipping case; nothing
                 // here ever opens a second device.
-                const int players = juce::jlimit(1, kMaxPlayers,
-                                                 owner_.playerCount_.load(std::memory_order_relaxed));
 
-                // The routed instrument renders BEFORE the seats so its seat can
-                // take it into the rig; a route naming a seat that is not live
-                // this block stays on the master (renderInstrumentBus below).
-                if (instrumentSeat >= players) instrumentSeat = -1;
-                if (instrumentSeat >= 0)
+                // The routed instrument renders BEFORE the seats so its seats can
+                // take it into their rigs.
+                if (instrumentMask != 0)
                 {
                     owner_.instrumentWorkChannels_    = owner_.renderInstrumentWork(numSamples, blockStartFrame);
                     owner_.instrumentRenderedForSeat_ = true;
                 }
+                // ABI v51: every generator renders ONCE, before the seats, so a
+                // source routed to another seat (or to several) is ready there.
+                owner_.renderSeatGeneratorsRt(players, numSamples, instrumentMask);
 
                 // ABI v29. The guitar banks need their OWN dirty flag: the song
                 // bus consumed filterDirty_ in processMasterBus above, which runs
@@ -1045,7 +1175,35 @@ private:
                 }
 
 
-                for (int p = 0; p < players; ++p)
+                // ---- Sandbox: post every seat, collect once (ABI v50, #696) ----
+                // Each seat's sandboxed chain has a child of its own. The seats
+                // run in two passes: every seat's FRONT pass (input, rig, VST
+                // chain) first, then every seat's BACK pass (everything after
+                // the sandbox: scrub, EQ, meter, monitor mix, idle sleep) on the
+                // chain buffer the answer was written into. With any seat's
+                // bridge armed the front pass ends by POSTING the seat's
+                // request without waiting, and every request is collected
+                // between the passes against ONE one-block deadline
+                // (collectRemoteBridges), so the children work at the same time
+                // and an overloaded seat drops only its own chain. A seat's rig
+                // keys its song-mix sidechain on `out`, and no monitor is mixed
+                // into `out` before the back passes: the key is the song only,
+                // armed bridge or not. The split costs no copy: each seat
+                // already owns its chain buffer, and SeatBack is a few scalars.
+                const bool bridgesArmed = owner_.anyRemoteBridgeArmed();
+                struct SeatBack
+                {
+                    bool  ready           = false;
+                    bool  extEngaged      = false;
+                    bool  inputPluginsRan = false;
+                    bool  bridgeSeatRan   = false;
+                    float pmonNow         = 0.0f;
+                    float chartBoost      = 1.0f;
+                };
+                std::array<SeatBack, kMaxPlayers> seatBack{};
+
+                // Returns false when the seat has nothing to run this block.
+                auto seatFront = [&](int p) -> bool
                 {
                     // Which samples this seat hears: the raw device input, or
                     // this seat's OWN drop-tuned copy of it.
@@ -1195,15 +1353,14 @@ private:
                             pNch = 1;
                         }
                     }
-                    // ABI v38: a seat with a chart source (or a fading one) or
-                    // the routed instrument runs its rig with no input at all.
-                    const bool seatGenerator = owner_.chart_[(size_t) p].enabled.load(std::memory_order_relaxed)
-                                            || owner_.chart_[(size_t) p].runState != 0
-                                            || p == instrumentSeat;
+                    // ABI v38: a seat with a chart source (or a fading one, or a
+                    // replaced voice still cross-fading out) or the routed
+                    // instrument runs its rig with no input at all.
+                    const bool seatGenerator = (owner_.generatorSeatsRt_ & (1u << p)) != 0;
                     const bool haveInput = pIn != nullptr && pNch > 0;
                     // Only reachable on a device with no input, for a seat with
                     // no take and no generator: nothing to capture, run or monitor.
-                    if (! haveInput && ! seatGenerator) continue;
+                    if (! haveInput && ! seatGenerator) return false;
 
                     // Capture the (possibly shifted) pre-gain, pre-chain input
                     // into this seat's SPSC ring — this is what FFT / tuner /
@@ -1227,7 +1384,7 @@ private:
                     auto& chainBuf = owner_.chainBuffer_[(size_t) p];
                     const bool chainOk = chainBuf.getNumChannels() >= chainChannels
                                       && chainBuf.getNumSamples() >= numSamples;
-                    if (! chainOk) continue;
+                    if (! chainOk) return false;
 
                     // WHICH samples become L/R.
                     //   players == 1 AND <= 2 physical inputs : unchanged from
@@ -1333,8 +1490,9 @@ private:
                     // ABI v38: the chart source and the routed instrument enter
                     // the rig HERE — after the capture ring and the input trim,
                     // before the in-house rig, the VST chain and the sandbox.
-                    if (seatGenerator)
-                        owner_.mixSeatGenerators(p, chainBuf, numSamples, p == instrumentSeat);
+                    const float chartBoost = seatGenerator
+                        ? owner_.mixSeatGenerators(p, chainBuf, numSamples)
+                        : 1.0f;
 
                     // In-house DSP tone rig (0.16 Phase 0): the reorderable
                     // gate/drive/amp/cab/mod chain, run over the gained input
@@ -1358,6 +1516,7 @@ private:
                     auto& extProc = owner_.extProc_[(size_t) p];
                     const bool extEngaged = extProc.beginBlock();
                     bool inputPluginsRan = false;
+                    bool bridgeSeatRan   = false;   // a seat above 0 round-tripped (bridge v4)
                     if (extEngaged)
                     {
                         // The mono the other side hears follows the rule the
@@ -1384,13 +1543,13 @@ private:
                         idleCtx.chainGeneration      = owner_.dspRigs_[(size_t) p].rtEditGeneration();
                         idleCtx.inputChainGeneration = owner_.inputChainGeneration_.load(std::memory_order_acquire);
                         idleCtx.inputGain            = ing;
-                        idleCtx.monitorGain          = pmonNow;
+                        idleCtx.monitorGain          = pmonNow * chartBoost;
                         idleCtx.eqTrim               = owner_.eqTrimLin_.load(std::memory_order_relaxed);
                         idleCtx.eqRoute              = owner_.eqRoute_.load(std::memory_order_relaxed);
                         idleCtx.captureChannel       = owner_.inputCaptureChannel_[(size_t) p]
                                                            .load(std::memory_order_relaxed);
                         idleCtx.players              = players;
-                        idleCtx.bridgeEnabled        = (p == 0 && owner_.remoteBridge_.isEnabled()) ? 1 : 0;
+                        idleCtx.bridgeEnabled        = owner_.remoteBridges_[(size_t) p].isEnabled() ? 1 : 0;
                         owner_.processDspRigLive(p, chainBuf, numSamples, out, numOutputChannels,
                                                  idleCtx, eqRetune);
                     }
@@ -1399,15 +1558,35 @@ private:
                     // plugins are not hot-swapped per block in normal use).
                     inputPluginsRan = owner_.processInputChain(p, chainBuf, numSamples);
 
-                    // Out-of-process chain: round-trip the (gained) input through
-                    // the sandbox child. On success chainBuf holds the child's
-                    // processed output; on timeout it stays DRY (passthrough).
-                    // SEAT 0 ONLY — the shared-memory bridge carries exactly one
-                    // stereo stream per block, so a second seat would need a
-                    // second child process and a second bridge. Player 2's
-                    // in-process rig and VST chain are unaffected.
-                    if (p == 0) owner_.processRemoteBridge(chainBuf, numSamples);
+                    // Out-of-process chain (ABI v50, #696): POST this seat's
+                    // (gained) input to the seat's own sandbox child, without
+                    // waiting. collectRemoteBridges() writes the child's
+                    // processed output into chainBuf when it answers in time;
+                    // otherwise chainBuf stays DRY (passthrough). The child runs
+                    // only the chain loaded for the seat the request names
+                    // (bridge v4); seat 0's request also carries the
+                    // instrument's MIDI, and a seat above 0 posts only while its
+                    // child holds a plugin for it.
+                    if (bridgesArmed)
+                        bridgeSeatRan = owner_.postRemoteBridgeSeat(p, chainBuf, numSamples);
                     }
+                    seatBack[(size_t) p] = { true, extEngaged, inputPluginsRan, bridgeSeatRan, pmonNow, chartBoost };
+                    return true;
+                };
+
+                // Everything after the sandbox, on the chain buffer the
+                // child's answer was written into (or the dry one).
+                auto seatBackPass = [&](int p)
+                {
+                    const SeatBack& done            = seatBack[(size_t) p];
+                    const bool      extEngaged      = done.extEngaged;
+                    const bool      inputPluginsRan = done.inputPluginsRan;
+                    const bool      bridgeSeatRan   = done.bridgeSeatRan;
+                    const float     pmonNow         = done.pmonNow;
+                    const int       chainChannels   = kChainChannels;
+                    auto& chainBuf = owner_.chainBuffer_[(size_t) p];
+                    auto& extProc  = owner_.extProc_[(size_t) p];
+
                     // The dip a session change runs through (a no-op in the
                     // steady state), over whichever path made this block.
                     {
@@ -1489,13 +1668,14 @@ private:
 
                     // Sum this seat into the monitor mix. The per-player trim
                     // defaults to 1.0, so a single-player mix is unchanged.
-                    const float pmon = pmonNow;
+                    const float pmon = pmonNow * done.chartBoost;
+                    owner_.chartMonitorBoostCurrent_[(size_t) p] = done.chartBoost;
                     // `|| pmonPrev > 0` matters: the old guard skipped the mix
                     // outright the moment the monitor reached zero, which is a
                     // full-amplitude cut in one sample — a CLICK, and the one
                     // gesture guaranteed to produce it is muting the monitor.
                     // The ramp has to run for the block that arrives at zero.
-                    const float pmonPrev = owner_.monitorGainCurrent_[(size_t) p];
+                    const float pmonPrev = owner_.monitorGainCurrent_[(size_t) p] * previousChartBoost[(size_t) p];
                     if ((pmon > 0.0f || pmonPrev > 0.0f) && numOutputChannels > 0 && out != nullptr)
                     {
                         for (int ch = 0; ch < numOutputChannels; ++ch)
@@ -1506,7 +1686,7 @@ private:
                             if (dst == nullptr) continue;
                             rampOrScaleAdd(dst, src, numSamples, pmonPrev, pmon);
                         }
-                        owner_.monitorGainCurrent_[(size_t) p] = pmon;
+                        owner_.monitorGainCurrent_[(size_t) p] = pmonNow;
                     }
 
                     // Idle sleep bookkeeping for this seat: what the rig put on
@@ -1516,9 +1696,22 @@ private:
                         const float g = juce::jmax(1.0f, juce::jmax(pmon, pmonPrev));
                         owner_.rigIdleEndBlock(p, localPeak * g, numSamples,
                                                inputPluginsRan || extEngaged
-                                                   || (p == 0 && owner_.bridgeRanThisBlock_));
+                                                   || (p == 0 ? owner_.bridgeRanThisBlock_ : bridgeSeatRan));
                     }
+                };
+
+                for (int p = 0; p < players; ++p)
+                    seatFront(p);
+                if (bridgesArmed)
+                {
+                    // The instrument's zero-input request (when no seat-0 trip
+                    // was posted) goes out with the seats', then ONE collection
+                    // for all of them.
+                    owner_.postRemoteInstrumentIfIdle(numSamples);
+                    owner_.collectRemoteBridges();
                 }
+                for (int p = 0; p < players; ++p)
+                    if (seatBack[(size_t) p].ready) seatBackPass(p);
             }
 
             // Click bus: synthesised metronome + clap mixed AFTER master bus
@@ -1610,8 +1803,9 @@ private:
             // from this, the way reprepareAttachedPlugins does for the
             // in-process ones. Publishing only the rate left every sandboxed
             // VST3 on the configuration the child was launched with.
-            owner_.remoteBridge_.setDevicePrepare((int) device->getCurrentSampleRate(),
-                                                  device->getCurrentBufferSizeSamples());
+            for (auto& bridge : owner_.remoteBridges_)
+                bridge.setDevicePrepare((int) device->getCurrentSampleRate(),
+                                        device->getCurrentBufferSizeSamples());
             {
                 const int maxBlock = device->getCurrentBufferSizeSamples();
                 // EVERY seat's shifter is prepared, not just the live ones
@@ -1719,6 +1913,9 @@ private:
     std::unique_ptr<class RubberBandAudioSource>     stemGroupStretcher_;
     std::unordered_set<TransportSource*>             stemSources_;
     std::atomic<float>                               stemGroupTempo_  { 1.0f };
+    // Written by stemGroupStretcher_'s audio-thread publish (its read-ahead
+    // mirror) while the group exists; 0 otherwise.
+    std::atomic<int>                                 stemGroupReadAhead_ { 0 };
     std::atomic<float>                               stemGroupPitch_  { 0.0f };
     std::atomic<bool>          started_{false};
     // Set by a stop() that actually stopped. start() then REFUSES (#27): stop()
@@ -1734,6 +1931,7 @@ private:
     /// Audio-thread-only; reseeded by prepareMasterBus, which runs with no
     /// callback in flight.
     std::array<float, kMaxPlayers> monitorGainCurrent_{};
+    std::array<float, kMaxPlayers> chartMonitorBoostCurrent_{};
     std::array<float, kMaxPlayers> inputGainCurrent_{};
     // Drop-tune pedal (CSVD — dsp/cores/dcdsp_droptune.h). One engine; the "mode"
     // now only picks its splice-lag ceiling.
@@ -1788,11 +1986,8 @@ private:
         // don't disturb the windowed API (and vice versa).
         std::atomic<uint64_t> streamRead{0};
         // Seqlock-published {captured-total, host QPC ticks} pair, written once
-        // per audio callback right after the capture block lands (ABI v16). Odd
-        // sequence = writer in flight; readers retry.
-        std::atomic<uint32_t> syncSeq{0};
-        uint64_t              syncSamples = 0;
-        int64_t               syncTicks   = 0;
+        // per audio callback right after the capture block lands (ABI v16).
+        SeqlockClock<uint64_t> sync;
     };
     std::array<InputCaptureRing, kMaxPlayers> captureRings_{};
     std::array<std::atomic<int>, kMaxPlayers> inputCaptureChannel_{};
@@ -1900,13 +2095,30 @@ private:
         std::atomic<float>   gain    { 1.0f };
         std::atomic<double>  offset  { 0.0 };
         std::atomic<int>     mode    { DCA_CHART_SOURCE_MIX };
+        // ABI v51: seats whose rigs take this source; 0 = its own seat.
+        std::atomic<uint32_t> routeMask { 0 };
         // Audio thread only from here on.
         dcsynth::ChartScheduler scheduler;
         std::vector<float>   scratch;        // sized in aboutToStart (2x headroom)
         float                gainCurrent = 0.0f;
         int                  runState    = 0;    // 0 off, 1 on, 2 fading out after a disable
+        // The replaced voice (`fading`) rendered sound in the last block and
+        // has not finished its cross-fade.
+        bool                 fadeRendering = false;
+        // ABI v51, this block's render (renderSeatGeneratorsRt): `scratch` holds
+        // the gained mono source, mixed into every seat in `targetsRt`.
+        bool                 renderedRt = false;
+        bool                 replaceRt  = false;
+        float                boostRt    = 1.0f;
+        uint32_t             targetsRt  = 0;
+        // 1 / (seats in targetsRt): a source entering N rigs enters each at 1/N,
+        // so the master hears the level of the one-seat route (design D).
+        float                shareRt    = 1.0f;
     };
     std::array<ChartSourceSeat, kMaxPlayers> chart_;
+#if DCA_RTCHECK
+    uint64_t              seatLoopBlocks_ = 0;      // audio thread only (seatLoopBlocksForTest)
+#endif
     std::atomic<bool>     chartBusy_   { false };
     std::atomic<int>      chartActive_ { 0 };       // seats enabled
     std::atomic<bool>     chartZonePreload_ { true };   // see setChartZonePreloadForTesting
@@ -1922,19 +2134,37 @@ private:
     std::mutex                    songClockMutex_;  // bind / forget
     dcsynth::SongClockSample      songClock_;       // audio thread
 
-    // Instrument route (ABI v38): -1 = after the master (the pre-v38 path).
-    std::atomic<int> instrumentRoute_ { -1 };
+    // Instrument route (ABI v38, a seat MASK since v51): 0 = after the master
+    // (the pre-v38 path).
+    std::atomic<uint32_t> instrumentRouteMask_ { 0 };
     /// Audio thread: the instrument was already rendered into a seat this block.
     bool             instrumentRenderedForSeat_ = false;
     int              instrumentWorkChannels_    = 0;
+    /// Audio thread (v51): the routed instrument summed to mono and gained ONCE
+    /// per block, then mixed into every target seat. Sized with the chart scratch.
+    std::vector<float> instrumentMono_;
+    uint32_t           instrumentTargetsRt_ = 0;
+    float              instrumentBoostRt_   = 1.0f;
+    float              instrumentShareRt_   = 1.0f;   // 1 / seats it enters
+    /// Audio thread (v51): the seats a generator enters this block.
+    uint32_t           generatorSeatsRt_    = 0;
 
     /// Audio thread. Samples the song clock for this block.
     void sampleSongClock() noexcept;
-    /// Audio thread. Renders seat `player`'s chart source (and the routed
-    /// instrument, when it is routed here) into its chain buffer, after the
-    /// input fill. `instrumentHere` = the instrument was rendered for this seat.
-    void mixSeatGenerators(int player, juce::AudioBuffer<float>& chainBuf, int numSamples,
-                           bool instrumentHere) noexcept;
+    /// Audio thread (v51). Renders every live seat's chart source into its own
+    /// scratch and the routed instrument into instrumentMono_, ONCE each, and
+    /// resolves which seats each one enters (generatorSeatsRt_). `instrumentMask`
+    /// is the route already limited to live seats (0 = not routed this block).
+    void renderSeatGeneratorsRt(int players, int numSamples, uint32_t instrumentMask) noexcept;
+    /// Audio thread. Mixes every generator routed to seat `player` this block
+    /// into its chain buffer, after the input fill; returns the monitor boost.
+    float mixSeatGenerators(int player, juce::AudioBuffer<float>& chainBuf, int numSamples) noexcept;
+    /// Audio thread. Renders one seat's chart source into its scratch.
+    void renderChartSeatRt(int player, int numSamples) noexcept;
+    /// Audio thread. Seat `player` is outside the live range: its voice is
+    /// reset (no tail survives to its return), a replaced voice is handed to
+    /// the reaper, and runState returns to 0.
+    void quiesceChartSeat(int player) noexcept;
     /// Audio thread. Drains the MIDI queue and runs the in-process instrument
     /// into instrumentBuffer_; returns the channels rendered (0 = none).
     int  renderInstrumentWork(int numSamples, int64_t blockStartFrame) noexcept;
@@ -2064,6 +2294,12 @@ private:
     /// masterBusWidth_ (#31). Audio thread writes, anyone reads.
     std::atomic<unsigned long> masterBusSkipped_ { 0 };
 #if DCA_RTCHECK
+    InstrumentSeamFn instrumentSeam_     = nullptr;
+    void*            instrumentSeamUser_ = nullptr;
+    SongClockSeamFn  songClockSeam_      = nullptr;
+    void*            songClockSeamUser_  = nullptr;
+    ClickSeamFn      clickSeam_          = nullptr;
+    void*            clickSeamUser_      = nullptr;
     int      rtLastOutChannels_ = -1;
     uint32_t rtLastOutNullMask_ = 0;
 #endif
@@ -2195,6 +2431,14 @@ private:
     // dedicated mutex around prepareToPlay/releaseResources so the audio
     // thread never observes a half-prepared plugin.
     std::atomic<juce::AudioPluginInstance*>       instrumentPlugin_ { nullptr };
+    /// Instrument fault latch (renderInstrumentWork): the generation is bumped
+    /// by every attach and re-prepare, always under instrumentMutex_ and, on
+    /// attach, together with the plugin pointer; the audio thread drops its
+    /// latch when it sees a new one. The latch and the generation it belongs to
+    /// are AUDIO THREAD ONLY, like inputChainFaulted_.
+    std::atomic<uint64_t>                         instrumentGeneration_ { 1 };
+    uint64_t                                      instrumentFaultGen_   = 0;
+    bool                                          instrumentFaulted_    = false;
     std::mutex                                    instrumentMutex_;
     juce::AudioBuffer<float>                      instrumentBuffer_;
     int                                           instrumentChannels_ { 2 };
@@ -2216,7 +2460,7 @@ private:
     // that justified it said the queue "would need to carry (event,
     // sampleOffset) pairs synthesised from the host's monotonic clock, and we'd
     // need a free-running sample counter on the audio thread" — and ABI v26
-    // shipped exactly that counter (renderFrames_) two years later without
+    // shipped exactly that counter (the render clock) two years later without
     // anyone coming back here. So the skew stayed at up to one whole buffer,
     // 5-10 ms, on every note of a charted performance.
     //
@@ -2279,12 +2523,15 @@ private:
     std::atomic<int64_t> midiLateEvents_      { 0 };
     std::atomic<int64_t> midiDroppedEvents_   { 0 };
 
-    // --- Out-of-process VST bridge ----------------------------------------
-    // remoteBridgeMutex_ guards every audio-thread touch of the bridge and
-    // doubles as the disable-side wait-one-block barrier (same pattern as
-    // inputChainProcessMutex_). remoteBridgeConfigMutex_ serializes
+    // --- Out-of-process VST bridges ---------------------------------------
+    // One bridge per seat (ABI v50, DotCharter #696), each with its own
+    // mapping, events and child, in fixed storage. remoteBridgeMutex_ guards
+    // every audio-thread touch of ANY of them and doubles as the disable-side
+    // wait-one-block barrier (same pattern as inputChainProcessMutex_), so a
+    // second bridge adds no lock site. remoteBridgeConfigMutex_ serializes
     // enable/disable calls against each other.
-    RemoteVstBridge            remoteBridge_;
+    static_assert(kMaxPlayers == dcvb::kMaxSeats, "one sandbox bridge per seat the layout can name");
+    std::array<RemoteVstBridge, kMaxPlayers> remoteBridges_;
     /// See DeviceLifecycleLock. Message/caller threads only; try-locked on both
     /// sides so neither an offline render nor a device open ever WAITS.
     std::mutex                 deviceLifecycleMutex_;
@@ -2292,6 +2539,17 @@ private:
     std::mutex                 remoteBridgeConfigMutex_;
     // Audio-thread-only per-callback state.
     bool                       bridgeRanThisBlock_     = false;
+    /// AUDIO THREAD ONLY. Bumped once per callback and handed to every bridge
+    /// request: a bridge posts at most one request per callback and counts a
+    /// callback's miss once (bridge v4).
+    uint32_t                   bridgeCallbackSerial_   = 0;
+    /// AUDIO THREAD ONLY, per callback (ABI v50, #696): some bridge posted a
+    /// request; seat 0's bridge posted one (and how many MIDI events it
+    /// carried); collectRemoteBridges() already ran.
+    bool                       bridgePosted_           = false;
+    bool                       bridgeSeatZeroPosted_   = false;
+    bool                       bridgeCollected_        = false;
+    int                        bridgeMidiPosted_       = 0;
     bool                       bridgeInstrumentActive_ = false;
     const float*               bridgeInstrL_ = nullptr;
     const float*               bridgeInstrR_ = nullptr;
@@ -2378,7 +2636,8 @@ private:
     /// ever turn off.
     void clearBridgeMidiLocked() noexcept
     {
-        bridgeMidiHeld_ = 0;
+        bridgeMidiHeld_   = 0;
+        bridgeMidiPosted_ = 0;
         for (auto& p : bridgeMidiPending_) p.packed = 0;
     }
 
@@ -2447,18 +2706,45 @@ private:
         return count;
     }
 
-    /// Audio thread: one bridge round trip for this callback. `buf` carries
-    /// the gained live input (or silence); on success with an active remote
-    /// chain it is replaced by the child's processed output.
-    void processRemoteBridge(juce::AudioBuffer<float>& buf, int numSamples) noexcept
+    /// Audio thread: whether any seat's sandbox bridge is armed. The seat loop
+    /// splits into its post/collect passes only then.
+    bool anyRemoteBridgeArmed() const noexcept
     {
-        if (! remoteBridge_.isEnabled()) return;
-        DCA_RT_LOCK_GUARD(remoteBridgeMutex_, "remoteBridgeMutex/process");
-        if (! remoteBridge_.isEnabled()) return;
-        processRemoteBridgeLocked(buf, numSamples);
+        for (const auto& bridge : remoteBridges_)
+            if (bridge.isEnabled()) return true;
+        return false;
     }
 
-    void processRemoteBridgeLocked(juce::AudioBuffer<float>& buf, int numSamples) noexcept
+    /// Audio thread: POST this seat's request to its own sandbox child (ABI
+    /// v50, #696), without waiting; collectRemoteBridges() reads the answer
+    /// back into `buf`, which must stay untouched until then. Seat 0's request
+    /// also carries the instrument's MIDI; a seat above 0 sends none and posts
+    /// only while its child holds a chain plugin for it. Returns whether a
+    /// request went out for the seat (its idle-sleep bookkeeping counts the
+    /// sandbox as a stage after the rig). The same barrier and lock site as
+    /// every other bridge trip, so rt_lock_sites.txt does not change.
+    bool postRemoteBridgeSeat(int seat, juce::AudioBuffer<float>& buf, int numSamples) noexcept
+    {
+        if (seat < 0 || seat >= kMaxPlayers) return false;
+        auto& bridge = remoteBridges_[(size_t) seat];
+        if (! bridge.isEnabled()) return false;
+        DCA_RT_LOCK_GUARD(remoteBridgeMutex_, "remoteBridgeMutex/process");
+        if (! bridge.isEnabled()) return false;
+        if (seat == 0)
+        {
+            postSeatZeroLocked(buf, numSamples);
+            return true;
+        }
+        if (! bridge.seatHasChain(seat)) return false;
+        if (bridge.post(buf, numSamples, nullptr, nullptr, 0, bridgeBlockStartFrame_,
+                        seat, bridgeCallbackSerial_))
+            bridgePosted_ = true;
+        return true;
+    }
+
+    /// Audio thread, under remoteBridgeMutex_: post seat 0's request, with
+    /// the instrument's MIDI for this block.
+    void postSeatZeroLocked(juce::AudioBuffer<float>& buf, int numSamples) noexcept
     {
         bridgeRanThisBlock_ = true;
         // W4-N7. The drain CONSUMES the engine fifo, and the bridge writes the
@@ -2493,56 +2779,111 @@ private:
         // in-process one.
         if (instrumentPlugin_.load(std::memory_order_acquire) == nullptr && room > 0)
             midiCount = collectBridgeMidi(held, numSamples);
-        bool chainActive = false, instrActive = false;
-        const bool answered = remoteBridge_.process(buf, numSamples,
-                                                    bridgeMidiScratch_.data(), bridgeMidiOffsets_.data(),
-                                                    midiCount, bridgeBlockStartFrame_,
-                                                    &bridgeInstrL_, &bridgeInstrR_,
-                                                    chainActive, instrActive);
-        if (answered)
+        if (remoteBridges_[0].post(buf, numSamples, bridgeMidiScratch_.data(), bridgeMidiOffsets_.data(),
+                                   midiCount, bridgeBlockStartFrame_, 0, bridgeCallbackSerial_))
         {
-            bridgeMidiHeld_ = 0;
+            bridgePosted_         = true;
+            bridgeSeatZeroPosted_ = true;
+            bridgeMidiPosted_     = midiCount;
         }
         else
         {
-            // Carry what fits; anything past the buffer is lost for real and is
-            // reported as such through dca_engine_get_midi_timing_stats.
-            bridgeMidiHeld_ = std::min(midiCount, (int) bridgeMidiScratch_.size());
-            const int lost  = midiCount - bridgeMidiHeld_;
-            if (lost > 0) midiDroppedEvents_.fetch_add(lost, std::memory_order_relaxed);
-            // A carried event is re-sent with the NEXT block, by which time its
-            // frame has passed: sample 0 of that block is the closest it can
-            // still land.
-            for (int i = 0; i < bridgeMidiHeld_; ++i) bridgeMidiOffsets_[(size_t) i] = 0;
+            settleBridgeMidi(false, midiCount);
         }
-        bridgeInstrumentActive_ = instrActive;
+    }
+
+    /// Audio thread, under remoteBridgeMutex_: settle seat 0's MIDI carry
+    /// once its request is answered or not. Only an answered request clears
+    /// the carry.
+    void settleBridgeMidi(bool answered, int midiCount) noexcept
+    {
+        if (answered)
+        {
+            bridgeMidiHeld_ = 0;
+            return;
+        }
+        // Carry what fits; anything past the buffer is lost for real and is
+        // reported as such through dca_engine_get_midi_timing_stats.
+        bridgeMidiHeld_ = std::min(midiCount, (int) bridgeMidiScratch_.size());
+        const int lost  = midiCount - bridgeMidiHeld_;
+        if (lost > 0) midiDroppedEvents_.fetch_add(lost, std::memory_order_relaxed);
+        // A carried event is re-sent with the NEXT block, by which time its
+        // frame has passed: sample 0 of that block is the closest it can
+        // still land.
+        for (int i = 0; i < bridgeMidiHeld_; ++i) bridgeMidiOffsets_[(size_t) i] = 0;
+    }
+
+    /// Audio thread: when no seat-0 request went out this callback (no input
+    /// block ran on seat 0), post a zero-input one so MIDI still reaches the
+    /// child and its instrument sounds. Collected with the seats' requests.
+    void postRemoteInstrumentIfIdle(int numSamples) noexcept
+    {
+        if (! remoteBridges_[0].isEnabled() || bridgeRanThisBlock_) return;
+        DCA_RT_LOCK_GUARD(remoteBridgeMutex_, "remoteBridgeMutex/instrument");
+        postRemoteInstrumentIfIdleLocked(numSamples);
+    }
+
+    void postRemoteInstrumentIfIdleLocked(int numSamples) noexcept
+    {
+        if (! remoteBridges_[0].isEnabled() || bridgeRanThisBlock_) return;
+        // Never allocate here — this is the audio callback. The buffer is
+        // sized in audioDeviceAboutToStart. If the host somehow hands us a
+        // block bigger than it declared, skip the zero-input request for this
+        // callback rather than calling setSize() (a heap allocation, and a
+        // lock, on the real-time thread). The request is posted from the
+        // buffer itself (not a view of it) because collect() writes the answer
+        // back into the buffer it was posted with.
+        if (bridgeSilentBuf_.getNumSamples() < numSamples
+            || bridgeSilentBuf_.getNumChannels() < dcvb::kMaxChannels)
+            return;
+        for (int ch = 0; ch < dcvb::kMaxChannels; ++ch)
+            bridgeSilentBuf_.clear(ch, 0, numSamples);
+        postSeatZeroLocked(bridgeSilentBuf_, numSamples);
+    }
+
+    /// Audio thread: collect every request posted this callback against ONE
+    /// one-block deadline (RemoteVstBridge::collect), then settle seat 0's
+    /// MIDI carry and instrument output. Runs once per callback.
+    void collectRemoteBridges() noexcept
+    {
+        if (bridgeCollected_) return;
+        DCA_RT_LOCK_GUARD(remoteBridgeMutex_, "remoteBridgeMutex/process");
+        collectRemoteBridgesLocked();
+    }
+
+    void collectRemoteBridgesLocked() noexcept
+    {
+        if (bridgeCollected_) return;
+        bridgeCollected_ = true;
+        if (! bridgePosted_) return;
+        std::array<RemoteVstBridge*, kMaxPlayers> bridges{};
+        for (size_t i = 0; i < bridges.size(); ++i) bridges[i] = &remoteBridges_[i];
+        RemoteVstBridge::collect(bridges.data(), (int) bridges.size());
+        if (! bridgeSeatZeroPosted_) return;
+        const auto& seatZero = remoteBridges_[0];
+        settleBridgeMidi(seatZero.answered(), bridgeMidiPosted_);
+        bridgeMidiPosted_       = 0;
+        bridgeInstrumentActive_ = seatZero.answered() && seatZero.instrumentActive();
+        bridgeInstrL_           = seatZero.instrumentL();
+        bridgeInstrR_           = seatZero.instrumentR();
     }
 
     /// Audio thread: mix the sandbox child's instrument output into `out`.
-    /// Runs a zero-input round trip first when no input block ran this
-    /// callback (input disabled) so MIDI still reaches the child.
+    /// When the seat loop did not collect this callback (no seat ran), the
+    /// zero-input request is posted and collected here so MIDI still reaches
+    /// the child.
     void renderRemoteInstrument(float* const* out, int numChannels, int numSamples) noexcept
     {
-        if (! remoteBridge_.isEnabled()) return;
+        if (! remoteBridges_[0].isEnabled()) return;
         if (numChannels <= 0 || numSamples <= 0 || out == nullptr) return;
         DCA_RT_LOCK_GUARD(remoteBridgeMutex_, "remoteBridgeMutex/instrument");
-        if (! remoteBridge_.isEnabled()) return;
+        if (! remoteBridges_[0].isEnabled()) return;
         try
         {
-            if (! bridgeRanThisBlock_)
+            if (! bridgeCollected_)
             {
-                // Never allocate here — this is the audio callback. The buffer
-                // is sized in audioDeviceAboutToStart. If the host somehow
-                // hands us a block bigger than it declared, skip the zero-input
-                // round trip for this callback rather than calling setSize()
-                // (a heap allocation, and a lock, on the real-time thread).
-                if (bridgeSilentBuf_.getNumSamples() < numSamples
-                    || bridgeSilentBuf_.getNumChannels() < dcvb::kMaxChannels)
-                    return;
-                juce::AudioBuffer<float> sub(bridgeSilentBuf_.getArrayOfWritePointers(),
-                                             dcvb::kMaxChannels, 0, numSamples);
-                sub.clear();
-                processRemoteBridgeLocked(sub, numSamples);
+                postRemoteInstrumentIfIdleLocked(numSamples);
+                collectRemoteBridgesLocked();
             }
             if (! bridgeInstrumentActive_ || bridgeInstrL_ == nullptr) return;
             // RAMP, do not step (W4-N3) — the same rule and the same helper as
@@ -2717,7 +3058,7 @@ private:
                 // OUR fault, and it is what usually makes the NEXT callback late.
                 deadlineOverruns_.fetch_add(1, std::memory_order_relaxed);
                 lastXrunHostTicks_.store(endTicks, std::memory_order_relaxed);
-                lastXrunFrame_    .store(renderFrames_, std::memory_order_relaxed);
+                lastXrunFrame_    .store(renderClock_.lastCount(), std::memory_order_relaxed);
             }
             else if (deltaNs > (budgetNs * 4) / 5)
             {
@@ -2773,7 +3114,7 @@ private:
                 const int64_t lost = (int64_t) (((double) (gapNs - expectedNs) * 1.0e-9) * sr);
                 if (lost > 0) droppedFrames_.fetch_add(lost, std::memory_order_relaxed);
                 lastXrunHostTicks_.store(startTicks, std::memory_order_relaxed);
-                lastXrunFrame_    .store(renderFrames_, std::memory_order_relaxed);
+                lastXrunFrame_    .store(renderClock_.lastCount(), std::memory_order_relaxed);
             }
         }
         xrunPrevStartTicks_ = startTicks;
@@ -2855,40 +3196,61 @@ private:
     std::atomic<float>                   clickGain_{ 1.0f };
 
     // --- Scheduled clicks (ABI v26) --------------------------------------
-    // {type, absolute render frame} pushed by any thread, drained by the audio
-    // thread into clickPending_ and fired at a sample offset inside the block
-    // that contains the frame. kClickClearSentinel travels through the SAME
-    // FIFO as an ordinary entry so a clear issued after a schedule reliably
-    // cancels it (no separate atomic flag to race with).
+    // {type, absolute render frame, clear generation} pushed by any control
+    // thread, drained by the audio thread into clickPending_ and fired at a
+    // sample offset inside the block that contains the frame.
+    //
+    // A CLEAR IS OUT OF BAND, so a full FIFO cannot drop it: it bumps
+    // clickClearGeneration_, and every entry carries the generation it was
+    // scheduled under. The audio thread wipes its pending set when it sees a
+    // newer generation (on the atomic or on an entry) and drops entries from
+    // an older one, so "schedule A, then clear" always cancels A and
+    // "clear, then schedule B" always keeps B.
     static constexpr int   kClickScheduleCapacity = 128;
     static constexpr int   kPendingClicks         = 32;
-    static constexpr int   kClickClearSentinel    = -2;
     struct ScheduledClick
     {
-        int     type  = -1;  // -1 = empty slot, -2 = clear-all sentinel
-        int64_t frame = 0;
+        int      type     = -1;  // -1 = empty slot
+        int64_t  frame    = 0;
+        uint32_t clearGen = 0;
     };
     juce::AbstractFifo                                 clickScheduleFifo_{ kClickScheduleCapacity };
     std::array<ScheduledClick, kClickScheduleCapacity> clickScheduleQueue_{};
     std::array<ScheduledClick, kPendingClicks>         clickPending_{};   // audio thread only
+    std::atomic<uint32_t>                              clickClearGeneration_{ 0 };
+    uint32_t                                           clickClearSeen_ = 0;   // audio thread only
+
+    // BOTH click FIFOs ARE SINGLE-PRODUCER (juce::AbstractFifo): triggerClick,
+    // scheduleClick and clearScheduledClicks hold this for their whole
+    // prepare / write / finish. Control threads only; the audio thread is the
+    // only consumer and never takes it. A spin lock, not a mutex: the
+    // producers are noexcept and the section is a few stores.
+    juce::SpinLock clickProducerLock_;
+    class ClickProducerScope
+    {
+    public:
+        explicit ClickProducerScope(AudioEngine& owner) noexcept;
+        ~ClickProducerScope() { owner_.clickProducerLock_.exit(); }
+        ClickProducerScope(const ClickProducerScope&) = delete;
+        ClickProducerScope& operator=(const ClickProducerScope&) = delete;
+    private:
+        AudioEngine& owner_;
+    };
 
     // --- Output render clock (ABI v26) ------------------------------------
-    // renderFrames_ counts every frame the device callback has rendered since
+    // The render clock counts every frame the device callback has rendered since
     // the device started; it IS the timeline scheduled clicks are placed on.
-    // Published seqlock-style (same pattern as the capture sync above) right
-    // after the transport pull, so a managed reader can sample it together with
-    // a source's audible position and get a torn-free {frame, song time} pair.
-    // Reset to 0 on every device (re)start — callers re-read it per schedule.
-    std::atomic<uint32_t>     renderSyncSeq_{0};
-    int64_t                   renderFrames_    = 0;  // audio/device thread writer
-    int64_t                   renderSyncTicks_ = 0;
+    // Published through a SeqlockClock (same type as the capture sync above)
+    // right after the transport pull, so a managed reader can sample it
+    // together with a source's audible position and get a torn-free {frame,
+    // song time} pair. Reset to 0 on every device (re)start — callers re-read
+    // it per schedule. The audio thread reads its own frame count back with
+    // renderClock_.lastCount().
+    SeqlockClock<int64_t>     renderClock_;
 
     void publishRenderClock(int64_t frames) noexcept
     {
-        renderSyncSeq_.fetch_add(1, std::memory_order_acq_rel);
-        renderFrames_    = frames;
-        renderSyncTicks_ = juce::Time::getHighResolutionTicks();
-        renderSyncSeq_.fetch_add(1, std::memory_order_release);
+        renderClock_.publish(frames, juce::Time::getHighResolutionTicks());
     }
 
     /// Device (re)start: rewind the render clock and drop the audio thread's
@@ -2896,9 +3258,7 @@ private:
     /// audioDeviceAboutToStart, i.e. with no callback in flight.
     void resetRenderClock() noexcept
     {
-        renderSyncSeq_.store(0, std::memory_order_release);
-        renderFrames_    = 0;
-        renderSyncTicks_ = 0;
+        renderClock_.reset();
         for (auto& p : clickPending_) p.type = -1;
     }
 
@@ -3008,9 +3368,9 @@ private:
     /// engine's own output block for THIS callback, handed to the rig
     /// read-only so a node keyed to the song mix can duck under the backing
     /// track. processMasterBus has already run by the time this is called, so
-    /// it holds the song; for seat p it also holds the monitor of every seat
-    /// before p, which is the honest cheap answer and is documented as such in
-    /// dotcharter_audio.h. Null is a valid argument and means "that source is
+    /// it holds the song; every seat's rig runs before any seat's monitor is
+    /// mixed, so it holds the song alone for every seat (dotcharter_audio.h).
+    /// Null is a valid argument and means "that source is
     /// unavailable", which the chain falls back from.
     /// `noexcept` like every other audio-thread helper in this header — it was
     /// the only one that was not. The rig is entirely this project's own code
@@ -3170,6 +3530,25 @@ public:
     {
         return validPlayer(player) ? rigIdle_[(size_t) player] : dcrig::RigIdleSleep{};
     }
+#if DCA_RTCHECK
+    /// Callbacks that entered the per-seat loop (device input, an injected take
+    /// or a generator on a LIVE seat). Safe only while no callback is in
+    /// flight, on the manual-pump null device between pumps. RT check only.
+    uint64_t seatLoopBlocksForTest() const noexcept { return seatLoopBlocks_; }
+    /// Native tests only (no ABI): see RemoteVstBridge::setPreparedSeamForTest.
+    void setBridgePreparedSeamForTest(int seat, RemoteVstBridge::PreparedSeamFn fn, void* user) noexcept
+    {
+        if (validPlayer(seat)) remoteBridges_[(size_t) seat].setPreparedSeamForTest(fn, user);
+    }
+    /// Native tests only: whether the bridge barrier is free right now. Never
+    /// call it from a thread that may hold the barrier.
+    bool bridgeBarrierFreeForTest() noexcept
+    {
+        if (! remoteBridgeMutex_.try_lock()) return false;
+        remoteBridgeMutex_.unlock();
+        return true;
+    }
+#endif
 
     unsigned long dspPublishCountForTest(int player) const
     {
@@ -3623,7 +4002,7 @@ public:
     /// Also resets the per-source tempo/pitch back to 1.0 / 0 semis so a
     /// later un-group restores a clean state.
     void setStretcherBypass(bool bypassed) noexcept;
-    bool isStretcherBypassed() const noexcept { return stretcherBypassed_; }
+    bool isStretcherBypassed() const noexcept { return stretcherBypassed_.load(std::memory_order_relaxed); }
 
 private:
     /// Seek the transport and reset the stretcher(s) in front of it.
@@ -3670,7 +4049,13 @@ private:
     // `gain_` used to sit here: setVolume stored it and nothing ever read it.
     // The gain that is really applied lives on the juce::AudioTransportSource.
     bool                                               attached_ = false;
-    bool                                               stretcherBypassed_ = false;
+    // Written by the control thread (setStretcherBypass), read by the audio
+    // thread (getAudiblePositionSeconds / readSongClockRt through the song
+    // clock). Relaxed: the flag publishes no other data. Each value it selects
+    // is read through its own atomic (stemGroupReadAheadRt, stemGroupTempo,
+    // the stretcher's own counters), so a reader that sees the old flag for one
+    // block reports the other path's position, never a torn value.
+    std::atomic<bool>                                  stretcherBypassed_ { false };
     double                                             fileSampleRate_ = 0.0;
     // The step a device-rate WAV stores its samples at (DeviceRateWav.h, ABI
     // v43); 0 for any other file. Read by the preload and the streaming wiring.
@@ -3689,6 +4074,13 @@ private:
     // This source was the engine's song clock when a re-open tore its wiring
     // down; the re-wire binds it again.
     bool                                               wasSongClock_ = false;
+    // Clock-drain bookkeeping, owned by AudioEngine under songClockMutex_:
+    // setSongClockSource bumps the publish count, forgetSongClockSource records
+    // the count its last completed drain covered. Equal means no callback can
+    // still be reading this source, so a teardown skips the drain.
+    friend class AudioEngine;
+    uint32_t                                           songClockPublishes_ = 0;
+    uint32_t                                           songClockDrainedThrough_ = 0;
 };
 
 } // namespace dotcharter

@@ -259,15 +259,37 @@ public sealed class JuceAudioPlugin : IDisposable, INativeChild, IJuceAudioPlugi
         var h = Acquire();
         try
         {
-            JuceAudioEngine.Check(NativeMethods.PluginSaveState(h, null, 0, out var size), "plugin_save_state_size");
-            if (size <= 0) return Array.Empty<byte>();
-            var buf = new byte[size];
-            JuceAudioEngine.Check(NativeMethods.PluginSaveState(h, buf, buf.Length, out var written), "plugin_save_state");
-            if (written != size)
-                Array.Resize(ref buf, Math.Max(0, written));
-            return buf;
+            return ReadState((byte[]? buf, int cap, out int n) => NativeMethods.PluginSaveState(h, buf, cap, out n));
         }
         finally { Release(); }
+    }
+
+    /// <summary>How many times <see cref="SaveState"/> repeats the copy before it gives up.</summary>
+    internal const int SaveStateAttempts = 4;
+
+    /// <summary>The size-and-copy exchange behind <see cref="SaveState"/>: asks for the size,
+    /// copies into a buffer of that size, and repeats with the size the native side then
+    /// reports while the state grew in between.</summary>
+    internal static byte[] ReadState(CountedRead<byte> copy)
+    {
+        JuceAudioEngine.Check(copy(null, 0, out var size), "plugin_save_state_size");
+        for (var attempt = 0; attempt < SaveStateAttempts; attempt++)
+        {
+            if (size <= 0) return Array.Empty<byte>();
+            var buf = new byte[size];
+            JuceAudioEngine.Check(copy(buf, buf.Length, out var written), "plugin_save_state");
+            if (written == buf.Length) return buf;
+            if (written <= buf.Length)
+            {
+                Array.Resize(ref buf, Math.Max(0, written));
+                return buf;
+            }
+
+            size = written;   // the state grew since the size was read: copy again with room for it
+        }
+
+        throw new InvalidOperationException(
+            $"The plugin's state kept growing across {SaveStateAttempts} attempts to save it.");
     }
 
     /// <summary>Restore a previously captured state blob. Passing an

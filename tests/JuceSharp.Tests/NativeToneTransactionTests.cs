@@ -5,9 +5,9 @@ namespace JuceSharp.Tests;
 public sealed class NativeToneTransactionTests
 {
     [Theory]
-    [InlineData("dca_plugin_attach_to_input_for_player")]
-    [InlineData("dca_plugin_detach_from_input")]
-    public void InputPluginStateTransitionIsEntirelyInsideMessageThreadTransaction(string export)
+    [InlineData("dca_plugin_attach_to_input_for_player", "leaveAllRoles(*p)")]
+    [InlineData("dca_plugin_detach_from_input", "detachInputPlugin")]
+    public void InputPluginStateTransitionIsEntirelyInsideMessageThreadTransaction(string export, string leavesTheSeat)
     {
         var source = Read("src/JuceSharp.Native/src/dotcharter_audio.cpp");
         var signature = source.IndexOf("DCA_CALL " + export + "(", StringComparison.Ordinal);
@@ -23,7 +23,7 @@ public sealed class NativeToneTransactionTests
         var lastState = method.LastIndexOf("p->attached", StringComparison.Ordinal);
         Assert.True(firstState > transactionStart, "idempotence check escaped message-thread serialization");
         Assert.True(lastState < transactionEnd, "attachment publication escaped message-thread serialization");
-        Assert.Contains("detachInputPlugin", method[transactionStart..transactionEnd]);
+        Assert.Contains(leavesTheSeat, method[transactionStart..transactionEnd]);
     }
 
     [Fact]

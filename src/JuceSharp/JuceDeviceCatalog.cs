@@ -95,12 +95,10 @@ public static class JuceDeviceCatalog
 
     private static IReadOnlyList<JuceAudioDevice> EnumerateHost(string typeName, bool isInput, AudioDriver driver)
     {
-        var probe = Interop.NativeMethods.EnumerateHostDevices(typeName, isInput ? 1 : 0, null, 0, out var count);
-        if (probe != Interop.NativeMethods.DcaStatus.Ok || count <= 0)
-            return Array.Empty<JuceAudioDevice>();
-        var buf = new Interop.NativeMethods.DcaDeviceInfo[count];
-        var s = Interop.NativeMethods.EnumerateHostDevices(typeName, isInput ? 1 : 0, buf, count, out var actual);
-        if (s != Interop.NativeMethods.DcaStatus.Ok || actual <= 0)
+        var (buf, actual) = Interop.CountedReads.Read<Interop.NativeMethods.DcaDeviceInfo>(
+            (Interop.NativeMethods.DcaDeviceInfo[]? b, int cap, out int n)
+                => Interop.NativeMethods.EnumerateHostDevices(typeName, isInput ? 1 : 0, b, cap, out n));
+        if (actual <= 0)
             return Array.Empty<JuceAudioDevice>();
         var list = new List<JuceAudioDevice>(actual);
         // driver comes from the HOST being scanned, not from the row.

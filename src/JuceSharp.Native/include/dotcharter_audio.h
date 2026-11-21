@@ -207,7 +207,21 @@ extern "C" {
 // additive export and the DCA_CHANNEL_NAME_BYTES stride. A one-output device now
 // runs a two-wide master bus and folds L and R into its one channel. No struct or
 // signature changed.
-#define DCA_ABI_VERSION 49
+// v50: one sandbox child per SEAT (DotCharter #696). Every seat owns its own
+// out-of-process VST bridge (mapping + events + child), armed and read through two
+// additive exports, dca_engine_set_remote_bridge_for_player and
+// dca_engine_get_remote_bridge_stats_for_player. The v19 pair is seat 0's bridge;
+// a seat with no armed bridge makes no round trip. No struct or signature changed;
+// the shared-memory layout (bridge version 4) is unchanged.
+// v51: SEAT ROUTING for the chart sound (DotCharter #751). A chart source and
+// the in-process instrument can each enter SEVERAL seats' rigs (a seat mask):
+// dca_engine_chart_source_set_route_mask_for_player / _get_, and
+// dca_engine_set_instrument_route_mask / _get_. Mask 0 is the engine-start value
+// (a chart source plays into its own seat; the instrument stays after the
+// master), so a host that never calls them hears exactly v50. The v38
+// dca_engine_set_instrument_route is now a one-seat view of the mask. Four
+// additive exports; no struct or signature changed.
+#define DCA_ABI_VERSION 51
 
 // ---- Per-player live-input rigs (ABI v28) ---------------------------------
 // The engine hosts DCA_MAX_PLAYERS independent live-input rigs ("seats"). Each
@@ -850,6 +864,8 @@ DCA_API dca_status DCA_CALL dca_engine_chart_source_set_voice_for_player(dca_eng
                                                                          int32_t voice);
 // gain_linear in [0, 4] (1 at engine start), offset_seconds in [-2, +2]
 // (0 at engine start; positive = every note sounds later), mode DCA_CHART_SOURCE_*.
+// While the source is playing, gain above unity boosts the seat's monitor mix
+// after the rig and the chart enters the rig at unity.
 // Out-of-range values are REJECTED, never clamped.
 DCA_API dca_status DCA_CALL dca_engine_chart_source_set_params_for_player(dca_engine_t engine,
                                                                           int32_t player,
@@ -953,6 +969,38 @@ DCA_API dca_status DCA_CALL dca_engine_set_instrument_route(dca_engine_t engine,
 // *out_player is zeroed to -1 first.
 DCA_API dca_status DCA_CALL dca_engine_get_instrument_route(dca_engine_t engine, int32_t* out_player);
 
+// ---- Seat routing (ABI v51, DotCharter #751) --------------------------------
+// Bit p of a seat mask = seat p (DCA_MAX_PLAYERS bits; any higher bit is
+// DCA_ERR_INVALID_ARG). Each generator is rendered ONCE per block and summed
+// into every seat it names, after that seat's capture ring (detection never
+// hears it). A bit naming a seat that is not live this block is skipped. A
+// generator entering N live seats enters each at 1/N, so the master hears the
+// level of the one-seat route (a gain above unity still boosts each target
+// seat's monitor, #753).
+// Neither is kept across a rebuild: the host replays both. Control thread for
+// the setters, any non-audio thread for the getters.
+//
+// The instrument (dca_plugin_attach_to_instrument): 0 (engine start) = after
+// the master; non-zero = into those seats' rigs and NOT on the master. With no
+// named seat live it stays on the master. dca_engine_set_instrument_route(p)
+// writes the mask 1 << p (or 0 for -1); dca_engine_get_instrument_route reads
+// the mask's lowest seat. The SANDBOXED instrument cannot follow (see v38).
+DCA_API dca_status DCA_CALL dca_engine_set_instrument_route_mask(dca_engine_t engine, uint32_t seat_mask);
+// *out_mask is zeroed first.
+DCA_API dca_status DCA_CALL dca_engine_get_instrument_route_mask(dca_engine_t engine, uint32_t* out_mask);
+// Seat `player`'s chart source. 0 (engine start) = its own seat only. With no
+// named seat live it plays into its own seat, never nowhere. A REPLACE-mode
+// source (DCA_CHART_SOURCE_REPLACE) clears the live input of EVERY seat it is
+// routed to, not only its own: routed to another player's seat it silences that
+// player. DotCharter uses DCA_CHART_SOURCE_MIX only.
+DCA_API dca_status DCA_CALL dca_engine_chart_source_set_route_mask_for_player(dca_engine_t engine,
+                                                                              int32_t player,
+                                                                              uint32_t seat_mask);
+// The EFFECTIVE mask: 0 reads back as 1 << player. *out_mask is zeroed first.
+DCA_API dca_status DCA_CALL dca_engine_chart_source_get_route_mask_for_player(dca_engine_t engine,
+                                                                              int32_t player,
+                                                                              uint32_t* out_mask);
+
 // ---- Master / filter bus -------------------------------------------------
 DCA_API dca_status DCA_CALL dca_engine_set_master_volume(dca_engine_t engine, float linear_gain);
 DCA_API dca_status DCA_CALL dca_engine_set_high_pass    (dca_engine_t engine, float freq_hz, float q); // freq<=0 disables
@@ -1049,12 +1097,14 @@ DCA_API dca_status DCA_CALL dca_engine_set_mirror_device(dca_engine_t engine, co
 //   0 = beat tick           (1 kHz, ~55 ms)
 //   1 = downbeat / measure  (1.5 kHz, ~55 ms)
 //   2 = clap                (filtered noise, ~90 ms)
-// Lock-free; safe to call from any thread, dropped silently if the FIFO is
-// saturated. The voice starts at the head of the NEXT audio block, so the
-// click jitters by up to one block plus the caller's own clock quantum, and it
-// is heard one full output latency after the caller decided to fire it. Fine
-// for a count-in or a "preview the metronome" button; use the scheduling API
-// below for anything that has to land ON a point of the song.
+// Call from any thread but the audio callback: producers serialize on a spin
+// lock the audio thread never takes, so a call from a real-time callback could
+// spin there. Dropped silently if the FIFO is saturated. The voice starts at
+// the head of the NEXT audio block, so the click jitters by up to one block
+// plus the caller's own clock quantum, and it is heard one full output latency
+// after the caller decided to fire it. Fine for a count-in or a "preview the
+// metronome" button; use the scheduling API below for anything that has to
+// land ON a point of the song.
 DCA_API dca_status DCA_CALL dca_engine_play_click(dca_engine_t engine, int32_t click_type);
 
 // ---- Sample-accurate click scheduling (ABI v26) --------------------------
@@ -1090,7 +1140,8 @@ DCA_API dca_status DCA_CALL dca_engine_get_render_clock(dca_engine_t engine,
 // Schedule a click (same click_type values as dca_engine_play_click) to start
 // at an absolute frame on the render clock above. The audio thread starts the
 // voice at that exact sample OFFSET inside the block that contains the frame —
-// no block-boundary jitter. Lock-free; safe from any thread.
+// no block-boundary jitter. Call from any thread but the audio callback
+// (producers serialize on a spin lock the audio thread never takes).
 //
 // A frame that has already been rendered fires at the head of the current block
 // (never worse than dca_engine_play_click) unless it is more than ~250 ms stale,
@@ -1102,8 +1153,10 @@ DCA_API dca_status DCA_CALL dca_engine_schedule_click(dca_engine_t engine,
                                                       int64_t render_frame);
 
 // Drop every scheduled-but-not-yet-sounded click. Ordered against
-// dca_engine_schedule_click (both travel through the same FIFO), so a clear
-// issued after a schedule always cancels it. Call on seek / pause / stop /
+// dca_engine_schedule_click by a clear generation that travels out of band (a
+// full schedule FIFO cannot drop it): a clear issued after a schedule always
+// cancels it, a schedule issued after a clear always survives it. Any thread
+// but the audio callback, like the schedule. Call on seek / pause / stop /
 // playback-speed change: the render clock keeps running while the transport
 // does not, so a stale queue would otherwise fire into silence — or, worse,
 // against the wrong song position.
@@ -1576,11 +1629,10 @@ DCA_API int32_t    DCA_CALL dca_engine_dsp_get_spill_tail_count_for_player(dca_e
 //                                 block, so a pedal late in the chain follows
 //                                 the pick rather than what the drive left of
 //                                 it produced.
-//   DCA_DSP_SIDECHAIN_SONG  (2) — the song / master mix as it stands when this
-//                                 seat is processed: the transport output after
-//                                 the master bus, plus the monitor of any seat
-//                                 processed earlier in the same callback. Duck
-//                                 the rig under the backing track.
+//   DCA_DSP_SIDECHAIN_SONG  (2) — the song mix: the transport output after the
+//                                 master bus, without any seat's monitor
+//                                 (every seat's rig runs before the monitor
+//                                 mix). Duck the rig under the backing track.
 //
 // REJECTED with DCA_ERR_INVALID_ARG for an unknown node, a source outside
 // 0..2, or a module that does not advertise DCA_DSP_MODULE_FLAG_SIDECHAIN — a
@@ -2062,6 +2114,12 @@ DCA_API dca_status DCA_CALL dca_plugin_attach_to_input  (dca_plugin_t plugin);
 // exactly one seat's chain at a time — attaching an already-attached plugin to
 // a different seat MOVES it, so a re-seated amp sim can never be run twice in
 // one block. `player` outside 0..DCA_MAX_PLAYERS-1 is rejected.
+// A plugin holds ONE role: attaching it here takes it off the instrument bus
+// first. When the attach fails (an error status, e.g. its prepareToPlay threw)
+// the plugin is back in the role it had: the instrument slot, or its old seat
+// at its old place in that chain. One exception: if putting it back fails too,
+// it is in NEITHER role (dca_plugin_get_input_player returns -1) and the
+// attach's error is returned.
 DCA_API dca_status DCA_CALL dca_plugin_attach_to_input_for_player(dca_plugin_t plugin, int32_t player);
 // Detaches from whichever seat holds it (and waits out any in-flight block on
 // every seat before returning, so the caller may destroy the instance).
@@ -2088,9 +2146,19 @@ DCA_API dca_status DCA_CALL dca_plugin_set_editor_closed_callback(dca_plugin_t p
 // Attach replaces any previously attached instrument; detach silences + frees
 // the slot. `dca_engine_send_midi_short` is lock-free and safe from the UI
 // thread; events queued while no instrument is attached are dropped.
+// A plugin holds ONE role: attaching it here takes it out of its seat's input
+// chain first. When the attach fails (an error status, e.g. its prepareToPlay
+// threw) the plugin is back in that seat at its old place in the chain. One
+// exception: if putting it back fails too, it is in NEITHER role
+// (dca_plugin_get_input_player returns -1) and the attach's error is returned.
+// A failed attach also gives the slot back to the plugin that held it before.
+// If putting that plugin back fails, the slot is empty and neither plugin is
+// attached as the instrument.
 DCA_API dca_status DCA_CALL dca_plugin_attach_to_instrument  (dca_plugin_t plugin);
 DCA_API dca_status DCA_CALL dca_plugin_detach_from_instrument(dca_plugin_t plugin);
 DCA_API dca_status DCA_CALL dca_engine_send_midi_short       (dca_engine_t engine, uint8_t status, uint8_t data1, uint8_t data2);
+// Gain above unity on a routed instrument boosts the seat's monitor mix after
+// the rig and the instrument enters the rig at unity.
 DCA_API dca_status DCA_CALL dca_engine_set_instrument_gain   (dca_engine_t engine, float linear_gain);
 
 // ---- Out-of-process VST bridge (ABI v19) ---------------------------------
@@ -2104,6 +2172,24 @@ DCA_API dca_status DCA_CALL dca_engine_set_instrument_gain   (dca_engine_t engin
 // the audio thread never stalls on a dead child. The layout of the mapping
 // is pinned in dotcharter_vst_bridge.h (bridge version 1).
 // enable=0 tears the bridge down (waits out any in-flight block first).
+//
+// ABI v50 (DotCharter #696): ONE BRIDGE PER SEAT. Each seat in
+// [0, DCA_MAX_PLAYERS) owns its own mapping, events and child process, armed with
+// dca_engine_set_remote_bridge_for_player; a bridge carries only its seat's chain,
+// and every request names its seat (bridge v4 `requestSeat`). The MIDI and the
+// sandboxed instrument stay on seat 0's bridge. A seat with no armed bridge makes no
+// round trip and is heard as an unsandboxed seat. Arming or disarming one seat never
+// touches another seat's bridge, and the miss counting and poll-only degradation are
+// per bridge, so an overloaded seat drops only its own chain. dca_engine_set_remote_bridge
+// and dca_engine_get_remote_bridge_stats are the seat-0 entry points. A player outside
+// the range is DCA_ERR_INVALID_ARG.
+DCA_API dca_status DCA_CALL dca_engine_set_remote_bridge_for_player(
+    dca_engine_t engine,
+    int32_t      player,
+    const char*  shm_name,
+    const char*  request_event_name,
+    const char*  response_event_name,
+    int32_t      enable);
 DCA_API dca_status DCA_CALL dca_engine_set_remote_bridge(
     dca_engine_t engine,
     const char*  shm_name,
@@ -2111,10 +2197,17 @@ DCA_API dca_status DCA_CALL dca_engine_set_remote_bridge(
     const char*  response_event_name,
     int32_t      enable);
 
-// Health/diagnostic counters for the bridge. `processed` / `timeouts` are
+// Health/diagnostic counters for one seat's bridge. `processed` / `timeouts` are
 // cumulative block counts since engine creation; `heartbeat` is the child's
-// free-running wakeup counter (stalls when the child dies or wedges). All
-// zero while the bridge is disabled.
+// free-running wakeup counter (stalls when the child dies or wedges), zero while
+// the bridge is disabled. A player out of range is DCA_ERR_INVALID_ARG with every
+// out value zeroed.
+DCA_API dca_status DCA_CALL dca_engine_get_remote_bridge_stats_for_player(
+    dca_engine_t engine,
+    int32_t      player,
+    uint32_t*    out_processed,
+    uint32_t*    out_timeouts,
+    uint32_t*    out_heartbeat);
 DCA_API dca_status DCA_CALL dca_engine_get_remote_bridge_stats(
     dca_engine_t engine,
     uint32_t*    out_processed,
@@ -2171,6 +2264,10 @@ DCA_API dca_status DCA_CALL dca_midi_input_close   (dca_midi_in_t handle);
 //                header while copying samples 1:1, so a 44.1 kHz source
 //                "rendered at 48000" came out 8.8% fast and 1.5 semitones
 //                sharp, with DCA_OK.
+// The render goes to a staged file next to dst_wav, which replaces dst_wav only
+// after every block was read and written: a failed render (DCA_ERR_DECODE for an
+// unreadable block, DCA_ERR_INTERNAL for a failed write or replace) leaves an
+// existing dst_wav unchanged.
 // STRETCH AND PITCH SHIFT ARE NOT IMPLEMENTED HERE and are REJECTED with
 // DCA_ERR_INVALID_ARG (this ABI has no NOT_SUPPORTED code, and adding one for a
 // rejection would be an ABI change). This comment used to promise "the same

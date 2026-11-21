@@ -19,10 +19,9 @@ public enum JuceDspSidechainSource
     SeatInput = 1,
 
     /// <summary>
-    ///     Key off the song / master mix as it stands when this seat is
-    ///     processed: the transport output after the master bus, plus the
-    ///     monitor of any seat processed earlier in the same callback. This is
-    ///     how the rig ducks under a backing track. Unavailable on the offline
+    ///     Key off the song mix: the transport output after the master bus,
+    ///     without any seat's monitor (every seat's rig runs before the monitor
+    ///     mix). This is how the rig ducks under a backing track. Unavailable on the offline
     ///     render path, where the module falls back to its own input.
     /// </summary>
     SongMix = 2,

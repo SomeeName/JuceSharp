@@ -109,6 +109,79 @@ bounded and lossless; sustained back-pressure surfaces as `room == 0`, and the
 drop is accounted on the PRODUCER side (`dca_engine_get_midi_timing_stats`'
 `dropped`), which is where a diagnostician should look.
 
+## ABI v51 — seat routing for the chart sound (DotCharter #751)
+
+- **Four additive exports:** `dca_engine_chart_source_set_route_mask_for_player` /
+  `_get_` and `dca_engine_set_instrument_route_mask` / `_get_`. Bit p of a mask is
+  seat p; a bit at or past `DCA_MAX_PLAYERS`, a bad player or a NULL engine is
+  `DCA_ERR_INVALID_ARG`, out-masks zeroed first. Plain atomic stores
+  (`ChartSourceSeat::routeMask`, `instrumentRouteMask_`), no lock, no device call.
+- **Engine start = v50 exactly:** a chart source's mask 0 means its own seat (the
+  getter reads back `1 << player`); the instrument's 0 means after the master. The
+  v38 `dca_engine_set_instrument_route(p)` now writes `1 << p` (or 0 for -1) and
+  its getter reads the mask's lowest seat.
+- **The callback renders every generator ONCE before the seat loop**
+  (`renderSeatGeneratorsRt`: each live seat's chart source into its own scratch,
+  the routed instrument summed to mono and gained into `instrumentMono_`, sized
+  with the scratch in `prepareChartSourcesForDevice`), then each seat's front pass
+  sums every source whose targets name it (`mixSeatGenerators`). A REPLACE-mode
+  source routed to a seat clears that seat's input first. A bit naming a seat that
+  is not live is skipped; with none left a chart source plays into its own seat and
+  the instrument stays on the master. Both still enter after the capture ring.
+- **Not kept across a rebuild:** the host replays both (DotCharter's
+  `ChartSynthEngineDriver.PushTo`). `AbiV51Tests`, `RtSeatRoutingMasks` (allocation-
+  free, the masked seat EXACTLY silent, both seats heard, the one-seat fallback).
+- **Level:** a generator entering N live seats enters each at 1/N (`shareRt`,
+  precomputed per block), so Guitar+Bass plays at the one-seat master level; a
+  gain above unity still boosts every target seat's monitor (#753).
+  `RtSeatRoutingKeepsTheLevel` (peak and RMS within 0.5 dB of the one-seat route).
+- **REPLACE routed elsewhere** clears that other seat's input too; DotCharter uses
+  MIX only.
+
+## ABI v50 — one sandbox child per seat (DotCharter #696)
+
+- **Two additive exports:** `dca_engine_set_remote_bridge_for_player(engine,
+  player, shm, req, resp, enable)` and `dca_engine_get_remote_bridge_stats_for_player(engine,
+  player, out_processed, out_timeouts, out_heartbeat)`. The engine holds one
+  `RemoteVstBridge` per seat (`remoteBridges_`, `kMaxPlayers` == `dcvb::kMaxSeats`),
+  each with its own mapping, events and child. The v19 pair is seat 0's. A player
+  outside `0..kMaxPlayers-1` (or a NULL engine) is `DCA_ERR_INVALID_ARG`, the stats
+  zeroed. Disarming seat 0 clears the instrument's MIDI carry; no other seat has
+  one. Every bridge sits behind the one `remoteBridgeMutex_` barrier, so
+  `rt_lock_sites.txt` is unchanged. Seat 0's child still renders the sandboxed
+  instrument. `JuceAudioEngine.SetRemoteBridge(player, ...)` /
+  `TryGetRemoteBridgeStats(player, ...)`; the host replays each seat's bridge on a
+  rebuild. `kBridgeVersion` stays 4: the mapping layout did not change.
+- **Post all, collect once:** with any seat's bridge armed the seat loop runs in
+  two passes. The front pass (input, rig, VST chain) ends by POSTING the seat's
+  request (`RemoteVstBridge::post`, no wait); the instrument's zero-input request
+  is posted too when seat 0 made no trip; then `RemoteVstBridge::collect` spins on
+  every posted request against ONE deadline, one block budget after collection
+  starts, checking all of them on every pass and once more at the deadline. Only
+  the seats still unanswered stay dry and count a miss, on their OWN bridge. A
+  poll-only bridge is checked but never holds the collection open. Then the back
+  pass (external-insert `endBlock`, scrub, EQ, meter, monitor mix, idle sleep)
+  runs per seat on the answered or dry chain buffer. With no bridge armed the two
+  passes run back to back per seat, as one pass. One collection waits at most one
+  block budget per callback however many seats post.
+- **Overload is per seat:** a seat whose child is too slow or wedged misses alone,
+  and after `kPollOnlyAfterMissedCallbacks` (3) missed callbacks only ITS bridge is
+  poll-only; the other seats and the instrument keep being processed, and an
+  answered poll (or the full wait every `kRetrySyncEveryBlocks` callbacks) ends
+  that seat's stretch.
+- **Song-mix sidechain:** a seat's rig keys `DCA_DSP_SIDECHAIN_SONG` on the output
+  block as it stands. Every seat's front pass (rig included) runs before any
+  back pass mixes a monitor, armed bridge or not, so the key is the song only
+  (`RtSongKeyIsTheSongOnlyInBothSeatPaths`).
+- Gated by `AbiV50Tests`, `RemoteBridgeRoundTripTests.EachSeatRoundTripsItsOwnInputToItsOwnChild_OnlyWhenThatChildHoldsAChainForIt_AndAgainAfterARebuild`,
+  `VstSandboxSeatEndToEndTests` (two real children) and the RT scenarios
+  `RtSandboxEachSeatOwnsItsBridge`, `RtSandboxOverloadedSeatDropsOnlyItsOwnChain`,
+  `RtSandboxWedgedChildPutsOnlyItsSeatInPollOnly`,
+  `RtSandboxInstrumentOnAHealthySeatKeepsSounding`,
+  `RtSandboxFourSeatsWaitAtMostOneBudget`, plus the overload phases of
+  `RtSandboxRoutesEverySeatWithoutAllocating` and
+  `RtSandboxInstrumentTripSharesTheCallbackDeadline` (see `rt-safety-and-tests.md`).
+
 ## ABI v49 — the open device's channel names, and a mono output folds L and R
 
 - **One additive export:** `dca_engine_get_channel_names(engine, is_input,
@@ -547,7 +620,14 @@ seat). No seat-0 aliases: they are new, not pre-v28.
   never reaches the post-master instrument bus. `DCA_CHART_SOURCE_MIX` (default)
   sums it with the guitar; `_REPLACE` gives the rig only the generator while the
   ring still hears the guitar. A seat whose device has no input still runs its
-  rig while a generator is enabled (`AudioEngine::mixSeatGenerators`).
+  rig while a generator is enabled (`AudioEngine::mixSeatGenerators`), and
+  while a disabled one is still rendering its choke fade or the cross-fade of a
+  voice a model change replaced
+  (RT `RtChartReplacedVoiceFadeRunsTheSeatLoopOnAnInputlessDevice`). Only LIVE seats (below
+  the player count) keep that loop running: a seat that leaves the live range is
+  quiesced on the audio thread (`AudioEngine::quiesceChartSeat`: voice reset,
+  runState 0), so it returns silent, or with a clean switch-on when enabled
+  (RT `RtChartSourceOnASeatThatLeftTheLiveRangeStopsTheSeatLoop`).
 - **The song clock.** `dca_engine_set_song_clock_source` binds ONE transport
   source; every block, right after the transport pull, the callback reads its
   audible position, play flag, seek generation and tempo
@@ -557,7 +637,16 @@ seat). No seat-0 aliases: they are new, not pre-v28.
   The binding is read under a seq_cst Dekker handshake (`songClockBusy_`), and
   `TransportSource::releaseWiring` calls `forgetSongClockSource` FIRST, so a
   destroyed or re-opened source is never read after its transport is freed (a
-  re-open rebinds itself: `wasSongClock_`).
+  re-open rebinds itself: `wasSongClock_`). It drains the readers even when the
+  source is not the published one (replaced by another source while a
+  callback still read it): `RtReplacedSongClockSourceIsDrained`. It skips the
+  drain for a source not published as the clock since its last completed drain
+  (per-source publish / drained counts under `songClockMutex_`; the reader only
+  dereferences what it loaded from `songClockSource_`), so a wedged callback
+  does not cost every teardown 2 s: `RtNeverPublishedSourceSkipsTheClockDrain`. A GROUPED stem's
+  audible position subtracts the shared stem-group stretcher's read-ahead at the
+  group tempo (`AudioEngine::stemGroupReadAheadRt`, mirrored lock-free from the
+  group stretcher): `RtGroupedSourceReportsAudiblePosition`.
 - **The scheduler** (`ChartScheduler.h`, audio thread only, pure C++17) turns
   consecutive clock samples into half-open windows of song time that TILE the
   timeline — continuous play takes `[previous end, new position)`, so no note
@@ -769,6 +858,19 @@ thing that proves the export is in the DLL, and it is worth running:
 & "$env:LOCALAPPDATA\..\dumpbin.exe" /EXPORTS build\Release\juce_sharp.dll | Select-String dca_engine_your_new_export
 ```
 
+## Plugin attach keeps the role on failure (no version bump)
+
+- `dca_plugin_attach_to_instrument` / `dca_plugin_attach_to_input_for_player`
+  record the roles the instance holds IN THE ENGINE (`currentRoles`: the
+  instrument slot, and the seat plus index in that seat's chain), take it out of
+  them, and attach. When the attach throws or fails, `restoreRoles` puts it back
+  (`AudioEngine::attachInputPlugin(plugin, seat, position)` re-inserts at the
+  old index: exact, because the whole transaction runs on the message thread)
+  and the export returns the error. If the restore fails too, the instance is in
+  NEITHER role and its flags say so; that one case is documented at both
+  exports in `include/dotcharter_audio.h`. Pinned by
+  `RtFailedAttachKeepsThePriorRole`.
+
 ## Per-player live-input rigs (ABI v28) — couch co-op
 
   - **PER-PLAYER live-input rigs (ABI v28) — couch co-op.** The engine hosts
@@ -823,10 +925,8 @@ thing that proves the export is in the DLL, and it is worth running:
       block over two signals with one lot of internal state. `detachInputPlugin`
       removes from EVERY seat and takes each seat's wait-one-block barrier in
       turn (never nested — it is a barrier, not a critical section).
-    - **ONE thing stays seat 0 only, on purpose:** the out-of-process VST sandbox
-      bridge — the shared mapping carries one stereo stream per block, so a
-      second seat needs a second child process. Seat 2's in-process rig and VST
-      chain are unaffected by it.
+    - **The out-of-process VST sandbox was seat 0 only until bridge v4
+      (DotCharter #646)** — see "The sandbox bridge routes seats" below.
       **The drop-tune pedal used to be the second entry here and is not any
       more — see ABI v31 below.** It was one CSVD engine ahead of the per-player
       split, which made the pedal unusable on a couch: dropping one guitar
@@ -1012,8 +1112,11 @@ callback at all).
 
 ## Output render clock + scheduled clicks (ABI v26)
 
-  - **Output render clock + scheduled clicks (ABI v26).** `renderFrames_` counts
-    every frame the device callback has rendered and is published seqlock-style
+  - **Output render clock + scheduled clicks (ABI v26).** `renderClock_` counts
+    every frame the device callback has rendered and is published through a
+    `SeqlockClock` (`src/SeqlockClock.h`: atomic payload, fenced sequence; the
+    capture sync pair uses the same type; `reset()` is a write with the publish
+    protocol and never rewinds the sequence, `RtSeqlockClockPayloadIsAtomicAndTornFree`)
     (`dca_engine_get_render_clock` → {frames, QPC ticks}) **immediately after the
     transport pull** — not at the end of the callback. That placement is
     load-bearing: it makes the render clock and
@@ -1022,10 +1125,14 @@ callback at all).
     block landed in between, and get a torn-free {frame ↔ song time} anchor. Move the
     publish and you silently reintroduce a one-block error. `dca_engine_schedule_click`
     starts a voice at a sample OFFSET inside its block (`mixClickBus` takes the block's
-    start frame); `dca_engine_clear_scheduled_clicks` travels through the SAME FIFO as
-    an ordinary entry (a sentinel, not a side-channel flag) so "schedule then clear"
-    reliably cancels. The immediate `triggerClick` path is untouched and still fires at
-    the next block. **Why anyone cares:** output latency cancels out of
+    start frame); `dca_engine_clear_scheduled_clicks` bumps a clear GENERATION (out of
+    band, so a full schedule FIFO cannot drop it: `RtClickClearSurvivesAFullQueue`);
+    every scheduled entry carries the generation it was queued under, so "schedule
+    then clear" always cancels and "clear then schedule" always survives. The click
+    FIFOs are single-producer: `triggerClick`, `scheduleClick` and the clear serialize
+    on `clickProducerLock_` (a control-thread spin lock the audio thread never takes:
+    `RtClickProducersAreSerialized`). The immediate `triggerClick` path fires at the
+    next block. **Why anyone cares:** output latency cancels out of
     `frame(T) = renderFrames + (T - rawTransportMs)/speed*sr`, so a scheduled click sits
     in the very samples that carry the note's audio and reaches the ear WITH it —
     whereas the trigger-now path is always one output latency late.
@@ -1299,9 +1406,69 @@ Rules, each of which cost a bug or would have:
 Gated by `RtXrunCounterIsRealAndQuiet` and `RtXrunStatsAbiHonoursStructBytes` —
 see `rt-safety-and-tests.md`.
 
+## The sandbox bridge routes seats (bridge v4, DotCharter #646)
+
+`kBridgeVersion` is **4**. A `dcvb::SeatRouting` block is APPENDED after
+`MidiTiming` at `kSeatRoutingOffset` (197704): `uint32 requestSeat` (parent
+writes, with the request) and `atomic<uint32> seatChainMask` (child writes, bit
+s = seat s holds a chain plugin). `kTotalBytes` grew 197704 → 197712; no v3
+offset moved. No C ABI export changed, so `DCA_ABI_VERSION` did not move.
+
+- **Parent:** since ABI v50 every seat has its own bridge and child (see the
+  ABI v50 section); the request still names its seat, and a child runs only the
+  chain loaded for that seat. Seat 0's request carries the MIDI carry and the
+  instrument (`postRemoteBridgeSeat` -> `postSeatZeroLocked`); a seat above 0
+  posts only while `RemoteVstBridge::seatHasChain` says its child holds a plugin
+  for it, sends no MIDI and leaves the instrument output and the carry alone.
+  Same `remoteBridgeMutex/process` lock site, so `rt_lock_sites.txt` is
+  unchanged. Every request of a callback is collected against ONE deadline
+  (`collectRemoteBridges`); a bridge posts at most one request per callback and
+  counts a missed callback once (`timeoutBlocks`, and
+  `kPollOnlyAfterMissedCallbacks` for poll-only). A seat's trip counts as a
+  stage after its rig for idle sleep (`rigIdleEndBlock`'s `downstreamOpaque`).
+- **Overload is per seat:** each seat's child has its own request slot and miss
+  count, so a seat whose chain is too slow misses alone and only its bridge goes
+  poll-only (one full synchronous wait every `kRetrySyncEveryBlocks` (256)
+  callbacks); the other seats and the instrument keep being processed.
+- **Request sequence lock:** the parent stores `dcvb::kRequestWriting` in
+  `requestSeq` before the first payload byte and the new sequence after the last;
+  the child reads through `dcvb::takeRequest`, which reads the seat with the
+  acquire and DROPS a request whose `requestSeq` changed during the copy (nothing
+  processed, nothing published). The parent only overwrites a request it stopped
+  waiting for, so a dropped request is already a missed trip there. The mask
+  counts bypassed slots: the engine never sees a sandboxed slot's bypass.
+- **Which child paths publish `responseSeq`:** a request dropped during its copy
+  publishes nothing; the re-prepare path answers with nothing active through
+  `dcvb::answerInactive`, which publishes only while `requestSeq` still names the
+  request (nothing for one the parent began overwriting); the main path publishes
+  the sequence of the request it PROCESSED, even when the parent has since
+  overwritten the slot. That late answer is harmless: the parent compares
+  `responseSeq` with the exact sequence it waits for, and the child, serving one
+  request at a time, writes the next request's output over it before publishing
+  that one (comments in `dotcharter_vst_bridge.h` and at the main publish in
+  `VstHostMain.cpp`).
+- **Child:** `load` takes an optional `seat` (absent = 0, out of range =
+  refused); a slot runs only on requests for its seat, the instrument only on
+  seat-0 requests, and `publishSeatMaskLocked` republishes the mask after every
+  load, unload, reorder, teardown and bridge open.
+- **Rebuild:** the mask lives in the mapping, so a fresh engine re-armed over a
+  surviving child routes the seats at once; a restarted child starts from an
+  empty mask and the host replays its slots with their seats.
+- Gated by `RemoteBridgeRoundTripTests.EachSeatRoundTripsItsOwnInputToItsOwnChild_OnlyWhenThatChildHoldsAChainForIt_AndAgainAfterARebuild`,
+  the v3-sized refusal in `AMappingLeftByABridgeV2Process_IsRefused`, the child's
+  refusal of v2 / v3 mappings and of an out-of-range seat in `VstHostChildLifecycleTests`,
+  the RT scenarios `RtSandboxRoutesEverySeatWithoutAllocating` (phases D and G:
+  one deadline for both children, a miss only on the wedged one's bridge, at most
+  one request posted per callback to a wedged child), `RtSandboxInstrumentTripSharesTheCallbackDeadline`
+  and `RtSandboxChildDropsARequestOverwrittenDuringItsCopy` (also
+  `dcvb::answerInactive`), and end to end by `VstSandboxSeatEndToEndTests` (the
+  test-only `dc_test_halfgain` VST3 through two real children; it skips, naming the
+  path it looked for, when that plugin was not built: the full native build and
+  the `juce_sharp_rtcheck` build both produce it).
+
 ## The sandbox bridge carries MIDI sample offsets (bridge v3, JuceSharp #28)
 
-`dotcharter_vst_bridge.h`'s `kBridgeVersion` is **3**. A `dcvb::MidiTiming`
+`dotcharter_vst_bridge.h`'s `kBridgeVersion` was **3** here. A `dcvb::MidiTiming`
 block is APPENDED after the instrument region at `kMidiTimingOffset` (197184):
 `int64 blockStartFrame` (the render-clock frame of the block's sample 0) and
 `uint32 midiOffset[128]`, the sample offset of `midi[i]` inside the block. The
@@ -1432,7 +1599,7 @@ whichever block drained it — up to one whole buffer, 5-10 ms, on every note of
 charted performance. The comment that justified it (`p3-51`) said the queue
 "would need to carry (event, sampleOffset) pairs ... and we'd need a
 free-running sample counter on the audio thread to convert wall-clock to
-per-block offset". **ABI v26 shipped exactly that counter** (`renderFrames_`)
+per-block offset". **ABI v26 shipped exactly that counter** (`renderClock_`)
 and nobody came back here. That is the shape worth remembering: a deliberate
 simplification whose stated blocker was removed by an unrelated feature two
 years later, with nothing linking the two.

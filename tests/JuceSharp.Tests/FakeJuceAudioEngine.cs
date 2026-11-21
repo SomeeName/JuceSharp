@@ -106,6 +106,10 @@ public sealed class FakeJuceAudioEngine : IJuceAudioEngine
     public JuceSharp.JuceChartInstrument? GetChartInstrument(int player, bool bass) { Record("GetChartInstrument"); return default; }
     public void SetInstrumentRoute(int player) => Record("SetInstrumentRoute");
     public int GetInstrumentRoute() { Record("GetInstrumentRoute"); return default; }
+    public bool TrySetInstrumentRouteMask(uint seatMask) { Record("TrySetInstrumentRouteMask"); return default; }
+    public uint GetInstrumentRouteMask() { Record("GetInstrumentRouteMask"); return default; }
+    public bool TrySetChartRouteMask(int player, uint seatMask) { Record("TrySetChartRouteMask"); return default; }
+    public uint GetChartRouteMask(int player) { Record("GetChartRouteMask"); return default; }
     public bool TryGetInputCaptureSync(out ulong capturedSamples, out long hostTicks) { Record("TryGetInputCaptureSync"); capturedSamples = default; hostTicks = default; return default; }
     public bool TryGetInputCaptureSync(int player, out ulong capturedSamples, out long hostTicks) { Record("TryGetInputCaptureSync"); capturedSamples = default; hostTicks = default; return default; }
     public void SetPlayerCount(int count) => Record("SetPlayerCount");
@@ -118,6 +122,8 @@ public sealed class FakeJuceAudioEngine : IJuceAudioEngine
     public void SetStretchQuality(bool faster) => Record("SetStretchQuality");
     public bool SetRemoteBridge(string shmName, string requestEventName, string responseEventName, bool enable) { Record("SetRemoteBridge"); return default; }
     public bool TryGetRemoteBridgeStats(out uint processed, out uint timeouts, out uint heartbeat) { Record("TryGetRemoteBridgeStats"); processed = default; timeouts = default; heartbeat = default; return default; }
+    public bool SetRemoteBridge(int player, string shmName, string requestEventName, string responseEventName, bool enable) { Record("SetRemoteBridgeForPlayer"); return default; }
+    public bool TryGetRemoteBridgeStats(int player, out uint processed, out uint timeouts, out uint heartbeat) { Record("TryGetRemoteBridgeStatsForPlayer"); processed = default; timeouts = default; heartbeat = default; return default; }
     public void SendMidi(byte status, byte data1, byte data2) => Record("SendMidi");
     // Recorded UNDER ITS OWN NAME. Both overloads recorded "SendMidi", so no
     // test could assert that host code took the SAMPLE-ACCURATE path — which is

@@ -676,10 +676,10 @@ Six things are load-bearing:
   be keyed while the device is running and growing it on the callback is the
   audit-#5 bug.
 - **The song key is ONE pointer**, handed to `processDspRig` per block by the
-  engine callback (`out`, after `processMasterBus`). For seat p it therefore
-  also carries the monitor of every seat processed earlier in the same
-  callback — the honest cheap answer, documented in the header rather than
-  quietly true.
+  engine callback (`out`, after `processMasterBus`). Every seat's rig runs
+  before any seat's monitor is mixed into `out`, so the key is the song only,
+  for every seat, armed sandbox bridge or not
+  (`RtSongKeyIsTheSongOnlyInBothSeatPaths`).
 - **Only the DETECTOR moves.** The audio path, the wet/dry crossfade and the
   per-stage scrub are byte-for-byte what they were, and a keyed node is still
   one `process` call from the chain's point of view.

@@ -13,8 +13,11 @@
 // sample offset of every event in midi[] plus the block's render-clock frame.
 //
 // Handshake per audio block (single-producer / single-consumer):
-//   1. parent writes blockFrames/inputChannels/midi + input samples,
-//      then requestSeq.store(seq, release) and signals the request event.
+//   1. parent stores kRequestWriting in requestSeq, writes
+//      blockFrames/inputChannels/midi/seat + input samples, then
+//      requestSeq.store(seq, release) and signals the request event. The
+//      child drops a request whose requestSeq changed while it copied it
+//      (takeRequest below).
 //   2. child wakes, processes, writes chainOut/instrOut,
 //      then responseSeq.store(seq, release) and signals the response event.
 //   3. parent spins on responseSeq against a ONE-BLOCK deadline until
@@ -37,7 +40,16 @@
 namespace dcvb {
 
 constexpr uint32_t kMagic         = 0x44435642u; // 'DCVB'
-constexpr uint32_t kBridgeVersion = 3;
+constexpr uint32_t kBridgeVersion = 4;
+// v4 (2026-11-14, DotCharter #646): sandboxed chain plugins belong to a SEAT.
+// A SeatRouting block is APPENDED after MidiTiming (kSeatRoutingOffset): the
+// parent names the seat each request is for, and the child publishes which
+// seats hold at least one chain plugin. The child runs only that seat's chain
+// on a request, and renders the instrument only on a seat-0 request. Every v3
+// offset is unchanged; the mapping grows by 8 bytes. A v3 child would ignore
+// the seat and run every seat's plugins over whichever input a request
+// carries, so both sides refuse the mismatch.
+//
 // v3 (2026-10-13, JuceSharp #28): MIDI to a sandboxed instrument is
 // SAMPLE-ACCURATE. A MidiTiming block is APPENDED after the instrOut region
 // (kMidiTimingOffset): the sample offset inside this block of every event in
@@ -58,6 +70,7 @@ constexpr uint32_t kBridgeVersion = 3;
 constexpr int kMaxChannels    = 2;
 constexpr int kMaxBlockFrames = 8192;
 constexpr int kMaxMidiEvents  = 128;
+constexpr int kMaxSeats       = 4;   // the engine's kMaxPlayers
 
 // Child lifecycle states published in SharedHeader::childState.
 constexpr uint32_t kChildStarting = 0;
@@ -134,10 +147,26 @@ struct MidiTiming
 static_assert(sizeof(MidiTiming) == 520, "bridge MIDI-timing layout is ABI-pinned (mirror: VstSandboxLayout.cs)");
 
 constexpr size_t kMidiTimingOffset = kInstrOutOffset + kRegionBytes;
-constexpr size_t kTotalBytes       = kMidiTimingOffset + sizeof(MidiTiming);
 
-static_assert(kMidiTimingOffset == 197184, "layout pinned");
-static_assert(kTotalBytes       == 197704, "layout pinned");
+// v4: the seat a request is for (parent writes, child reads; written before
+// requestSeq's release like the rest of the request) and the seats whose chain
+// is not empty (child writes after every load / unload / reorder, parent reads
+// to skip a round trip for a seat with nothing to run).
+#pragma pack(push, 8)
+struct SeatRouting
+{
+    uint32_t              requestSeat;    // +0: 0 .. kMaxSeats-1
+    std::atomic<uint32_t> seatChainMask;  // +4: bit s set = seat s has a chain plugin
+};
+#pragma pack(pop)
+static_assert(sizeof(SeatRouting) == 8, "bridge seat-routing layout is ABI-pinned (mirror: VstSandboxLayout.cs)");
+
+constexpr size_t kSeatRoutingOffset = kMidiTimingOffset + sizeof(MidiTiming);
+constexpr size_t kTotalBytes        = kSeatRoutingOffset + sizeof(SeatRouting);
+
+static_assert(kMidiTimingOffset  == 197184, "layout pinned");
+static_assert(kSeatRoutingOffset == 197704, "layout pinned");
+static_assert(kTotalBytes        == 197712, "layout pinned");
 
 inline float* inputChannel(void* base, int ch) noexcept
 { return reinterpret_cast<float*>(static_cast<char*>(base) + kInputOffset + (size_t) ch * kChannelBytes); }
@@ -163,11 +192,112 @@ inline int midiSampleOffset(const MidiTiming& t, int i, int blockFrames) noexcep
     return o >= (uint32_t) blockFrames ? blockFrames - 1 : (int) o;
 }
 
+inline SeatRouting* seatRouting(void* base) noexcept
+{ return reinterpret_cast<SeatRouting*>(static_cast<char*>(base) + kSeatRoutingOffset); }
+
 inline SharedHeader* header(void* base) noexcept
 { return static_cast<SharedHeader*>(base); }
 
 inline uint32_t packMidi(uint8_t status, uint8_t d1, uint8_t d2) noexcept
 { return (uint32_t) status | ((uint32_t) d1 << 8) | ((uint32_t) d2 << 16); }
+
+// ---- request sequence: a payload is only ever read whole -------------------
+//
+// The parent posts a new request only after the previous one was answered or
+// given up on, so a LATE child can still be copying request N when the parent
+// starts writing request N+1 (another seat's input, another seat number). A
+// child that ran N's seat over a half-overwritten payload would put one
+// player's audio through the other player's plugins, and a delay or reverb
+// tail keeps it there long after the response is thrown away.
+//
+// So requestSeq doubles as a sequence lock. The parent stores kRequestWriting
+// BEFORE the first payload byte (beginRequestWrite) and the new sequence after
+// the last (publishRequest), so requestSeq differs from N for the whole of an
+// overwrite and not only once it is finished. The child reads the seat right
+// after acquiring N, copies the payload, and keeps the request only when
+// requestSeq still reads N (requestStillCurrent). A dropped request is one the
+// parent has already counted as a miss, because it only overwrites a request
+// it stopped waiting for; nothing is processed or published for it.
+//
+// What the child publishes, by path: a request overwritten DURING its copy
+// (takeRequest's Dropped) gets nothing; the silent answer of a re-preparing
+// child (answerInactive) is published only while requestSeq still names the
+// request; a request copied whole is processed and answered with its own
+// sequence even when the parent overwrote the slot while the plugins ran.
+// That late answer is harmless: the parent compares responseSeq with the
+// exact sequence it waits for (or polled), so N never answers N+1, and the
+// child, which serves one request at a time, writes N+1's output over N's
+// before it publishes N+1.
+constexpr uint32_t kRequestWriting = 0xFFFFFFFFu;
+
+/// The sequence after `seq`: never 0 (a mapping nobody posted to) and never
+/// kRequestWriting.
+inline uint32_t nextRequestSeq(uint32_t seq) noexcept
+{
+    ++seq;
+    return (seq == 0u || seq == kRequestWriting) ? 1u : seq;
+}
+
+/// Parent: called before the first payload byte of a request is written.
+inline void beginRequestWrite(SharedHeader* h) noexcept
+{
+    h->requestSeq.store(kRequestWriting, std::memory_order_relaxed);
+    std::atomic_thread_fence(std::memory_order_release);
+}
+
+/// Parent: called after the last payload byte; publishes the request.
+inline void publishRequest(SharedHeader* h, uint32_t seq) noexcept
+{
+    h->requestSeq.store(seq, std::memory_order_release);
+}
+
+/// Child: whether the request acquired as `seq` is still the one in the
+/// mapping once its payload has been copied out.
+inline bool requestStillCurrent(const SharedHeader* h, uint32_t seq) noexcept
+{
+    std::atomic_thread_fence(std::memory_order_acquire);
+    return h->requestSeq.load(std::memory_order_relaxed) == seq;
+}
+
+/// Child: answer request `seq` with nothing active, without running a plugin
+/// (juce_vst_host does this while it re-prepares). Like a copied request, it
+/// is answered only while requestSeq still names it: one the parent has begun
+/// overwriting is a request it already gave up on, and nothing is published
+/// for it. Returns whether the answer was published (the caller then signals
+/// the response event).
+inline bool answerInactive(SharedHeader* h, uint32_t seq) noexcept
+{
+    if (! requestStillCurrent(h, seq)) return false;
+    h->chainActive      = 0;
+    h->instrumentActive = 0;
+    h->responseSeq.store(seq, std::memory_order_release);
+    return true;
+}
+
+enum class RequestTake { None, Taken, Dropped };
+
+/// Child: take the next request, the way juce_vst_host does and the native
+/// tests' stub child does. `None`: nothing new (or a write in progress).
+/// `Dropped`: the parent overwrote the request during `copyPayload`, so the
+/// copy is unusable and nothing may be processed or published for it.
+/// `Taken`: `seq` and `seat` describe the request `copyPayload` copied whole.
+/// `beforeCopy` runs between the acquire and the copy and may answer the
+/// request itself (returning false skips the copy and reports `None`).
+template <typename BeforeCopy, typename CopyPayload>
+inline RequestTake takeRequest(void* base, uint32_t& lastSeq, uint32_t& seq, uint32_t& seat,
+                               BeforeCopy&& beforeCopy, CopyPayload&& copyPayload)
+{
+    auto* h = header(base);
+    seq = h->requestSeq.load(std::memory_order_acquire);
+    if (seq == lastSeq || seq == kRequestWriting) return RequestTake::None;
+    lastSeq = seq;
+    // The seat is read with the acquire, not after the copy: by then the
+    // parent may have named the next request's seat.
+    seat = seatRouting(base)->requestSeat;
+    if (! beforeCopy()) return RequestTake::None;
+    copyPayload();
+    return requestStillCurrent(h, seq) ? RequestTake::Taken : RequestTake::Dropped;
+}
 
 } // namespace dcvb
 

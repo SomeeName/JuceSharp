@@ -26,6 +26,9 @@
 #include "dsp/cores/dcdsp_slapback.h"
 #include "dsp/cores/dcdsp_shimmer.h"
 #include "dsp/cores/dcdsp_cab.h"
+#include "dsp/cores/dcdsp_harmonizer.h"
+#include "dsp/cores/dcdsp_filterseq.h"
+#include "dsp/cores/dcdsp_looper.h"
 
 static int failures = 0;
 static void check(bool ok, const char* what) {
@@ -262,6 +265,188 @@ static void overdriveContinuityAndLatency() {
     check(module->latencySamples() == 0, "OD model0 restores zero reported latency");
 }
 
+// A live semitone change moves the harmonizer's analysis HOP. The next grain's
+// analysis start must continue from where the last one was taken: derived as
+// hop x grains-so-far, a change after 20 s of play moved it seconds forward
+// (every grain then waits for input that never arrives in time) or seconds
+// backward (grains read history the input ring overwrote long ago).
+static void harmonizerSemitoneChangeKeepsTheAnalysisInTheRing() {
+    dcdsp::HarmonizerCore core;
+    core.prepare(48000., 256, 1);
+    dcdsp::HarmonizerParams p;
+    p.semitones = 12.f; p.mix = 1.f;
+    core.setParams(p);
+
+    std::vector<float> buf(256);
+    float* ch[] = {buf.data()};
+    double phase = 0.;
+    long long lagMin = 1LL << 62, lagMax = -(1LL << 62);
+    auto run = [&](double seconds) {
+        const int blocks = static_cast<int>(seconds * 48000. / 256.);
+        for (int b = 0; b < blocks; ++b) {
+            for (auto& s : buf) { s = .3f * static_cast<float>(std::sin(phase)); phase += 2. * 3.14159265358979 * 220. / 48000.; }
+            core.process(ch, 1, 256);
+            const long long lag = core.analysisLagForTest();
+            lagMin = std::min(lagMin, lag);
+            lagMax = std::max(lagMax, lag);
+        }
+    };
+    run(20.);
+    const long long steadyMin = lagMin, steadyMax = lagMax;
+    p.semitones = -12.f; core.setParams(p); run(2.);   // the hop grows 4x
+    p.semitones = 12.f;  core.setParams(p); run(2.);   // and shrinks back
+    p.semitones = 5.f;   core.setParams(p); run(2.);
+    const int ring = core.inputRingSamplesForTest();
+    std::printf("harmonizer analysis lag: steady [%lld, %lld], across semitone changes [%lld, %lld], ring %d\n",
+                steadyMin, steadyMax, lagMin, lagMax, ring);
+    check(steadyMin >= 0 && steadyMax <= ring, "harmonizer steady-state analysis lag fits the input ring");
+    check(lagMin >= 0, "a semitone change moved the harmonizer's analysis AHEAD of the input (grain stall)");
+    check(lagMax <= ring, "a semitone change moved the harmonizer's analysis behind the input ring (stale history)");
+}
+
+// At a FIXED non-zero semitone value the next grain's analysis start is the
+// grid product hop x grains, bit for bit, over a long run: a start summed one
+// hop per grain drifts from that product by rounding, and floor() of a drifted
+// start can take a grain one sample off the grid. Low latency at 8 kHz is the
+// smallest hop (64 samples), so 2^20 grains are ~90 minutes of audio; 32-sample
+// blocks produce at most one grain each, so every grain's start is compared.
+static void harmonizerFixedPitchAnalysisIsTheExactGrid() {
+    constexpr int block = 32;
+    dcdsp::HarmonizerCore core;
+    core.prepare(8000., block, 1);
+    dcdsp::HarmonizerParams p;
+    p.semitones = 7.f; p.mix = 1.f; p.lowLatency = 1.f;
+    core.setParams(p);
+
+    std::vector<float> buf(block);
+    float* ch[] = {buf.data()};
+    const double twoPi = 2. * 3.14159265358979, inc = twoPi * 220. / 8000.;
+    double phase = 0.;
+    long long compared = 0, mismatches = 0, firstBad = -1, multiGrainBlocks = 0;
+    long long prevGrains = core.grainsProducedForTest();
+    const long long target = 1LL << 20;
+    const long long maxBlocks = target * 64 / block * 4;   // a stall ends the run, not the process
+    for (long long b = 0; b < maxBlocks && core.grainsProducedForTest() < target; ++b) {
+        for (auto& s : buf) { s = .3f * static_cast<float>(std::sin(phase)); phase += inc; if (phase >= twoPi) phase -= twoPi; }
+        core.process(ch, 1, block);
+        const long long grains = core.grainsProducedForTest();
+        if (grains == prevGrains) continue;
+        if (grains - prevGrains > 1) ++multiGrainBlocks;
+        prevGrains = grains;
+        ++compared;
+        const double grid = core.analysisHopForTest() * static_cast<double>(grains);
+        if (core.nextAnalysisStartForTest() != grid) { ++mismatches; if (firstBad < 0) firstBad = grains; }
+    }
+    std::printf("harmonizer fixed-pitch grid: %lld grains, %lld starts compared, %lld off the grid (first at grain %lld), %lld blocks with >1 grain\n",
+                prevGrains, compared, mismatches, firstBad, multiGrainBlocks);
+    check(prevGrains >= target, "harmonizer: the fixed-pitch run produced fewer than 2^20 grains");
+    check(multiGrainBlocks == 0, "harmonizer: a block produced two grains, so not every grain start was compared");
+    check(mismatches == 0, "harmonizer: at a fixed pitch the analysis start drifted off hop x grains");
+}
+
+// A looper transport press and an undo press are CHANGES of a sequence the
+// adapter bumps once per press, so each sequence has to change on every press
+// a session can make. Both start at 2^24 (where a float stops counting:
+// x + 1 == x) and at the top of a 32-bit counter (where the next press wraps
+// to 0); every press must still act.
+static void looperSequencesCountEveryPress() {
+    using StateSeq = decltype(dcdsp::LooperParams{}.stateSeq);
+    using UndoSeq  = decltype(dcdsp::LooperParams{}.undoSeq);
+    using L = dcdsp::LooperCore;
+    for (const double start : {16777216.0, 4294967295.0}) {
+        dcdsp::LooperCore core;
+        core.prepare(48000., 256, 1);
+        dcdsp::LooperParams p;
+        p.maxLoopS = 1.f; p.loopLevel = 1.f; p.mix = 1.f; p.overdubDecay = 1.f;
+        p.stateSeq = static_cast<StateSeq>(start);
+        p.undoSeq  = static_cast<UndoSeq>(start);
+        core.setParams(p);
+        std::vector<float> buf(256);
+        float* ch[] = {buf.data()};
+        auto run = [&](float in, int blocks) {
+            for (int b = 0; b < blocks; ++b) { std::fill(buf.begin(), buf.end(), in); core.process(ch, 1, 256); }
+            return buf.back();
+        };
+        auto press = [&](int state) { p.state = static_cast<float>(state); p.stateSeq += StateSeq(1); core.setParams(p); };
+
+        press(L::Record);
+        run(.5f, 188);              // 48000 frames close the take to Play; pos ends at 128
+        const bool recorded = core.transportState() == L::Play && core.loopLengthFrames() == 48000;
+        press(L::Overdub);
+        const bool overdub = core.transportState() == L::Overdub;
+        run(.25f, 187);             // frames 128..47999 once: 0.5 -> 0.75
+        press(L::Play);
+        const float layered = run(0.f, 16);   // reads frame 4095
+        p.undoSeq += UndoSeq(1);
+        core.setParams(p);
+        const float undone = run(0.f, 16);    // reads frame 8191
+        std::printf("looper sequences from %.0f: recorded %d, overdub %d, layered %.3f, after undo %.3f\n",
+                    start, recorded ? 1 : 0, overdub ? 1 : 0, layered, undone);
+        check(recorded, "looper: a Record press past the sequence's float range was lost");
+        check(overdub, "looper: an Overdub press past the sequence's float range was lost");
+        check(std::abs(layered - .75f) < .02f, "looper: the overdubbed take does not play back");
+        check(std::abs(undone - .5f) < .02f, "looper: an undo press past the sequence's float range was lost");
+    }
+}
+
+// Down walks the step ramp from the top of the range to the bottom: one
+// direction reversal, not two (a decrementing index read through an inverted
+// ramp is an ASCENDING sweep).
+static void filterSeqDownModeDescends() {
+    auto transitions = [](int mode, int& downs, int& ups) {
+        dcdsp::FilterSeqCore core;
+        core.prepare(48000., 1, 1);
+        dcdsp::FilterSeqParams p;
+        p.mode = mode; p.steps = 4; p.rateHz = 16.f; p.glide = 0.f; p.trigger = 0;
+        core.setParams(p);
+        core.reset();
+        float x = 0.f;
+        float* ch[] = {&x};
+        std::vector<float> targets{core.stepTargetHzForTest()};
+        for (int i = 0; i < 48000 && targets.size() < 9; ++i) {
+            x = 0.f;
+            core.process(ch, 1, 1);
+            if (core.stepTargetHzForTest() != targets.back()) targets.push_back(core.stepTargetHzForTest());
+        }
+        downs = ups = 0;
+        for (size_t i = 1; i < targets.size(); ++i) (targets[i] < targets[i - 1] ? downs : ups)++;
+        return targets;
+    };
+    int downs = 0, ups = 0;
+    const auto up = transitions(0, downs, ups);
+    check(up.size() == 9 && ups == 6 && downs == 2, "filterseq Up: three rising steps then a wrap, twice");
+    const auto down = transitions(1, downs, ups);
+    std::printf("filterseq Down targets:");
+    for (float t : down) std::printf(" %.0f", t);
+    std::printf(" Hz (%d down, %d up)\n", downs, ups);
+    check(down.size() == 9 && downs == 6 && ups == 2,
+          "filterseq Down sweeps UPWARD: three falling steps then a wrap, twice, is the Down pattern");
+    check(down.front() > down[1], "filterseq Down starts at the top of its range");
+}
+
+// The WSOLA adapters report the latency their core has ADOPTED on the audio
+// thread, published atomically: unchanged until a process() drains the write,
+// the new geometry's number right after it.
+static void wsolaAdaptersPublishTheAdoptedLatency() {
+    for (const char* type : {"harmonizer", "whammy"}) {
+        auto m = dcrig::createModule(type);
+        check(m != nullptr, "WSOLA module created");
+        if (m == nullptr) continue;
+        m->prepare(48000., 256, 2);
+        std::array<float, 256> l{}, r{};
+        float* ch[] = {l.data(), r.data()};
+        m->process(ch, 2, 256);
+        const int normal = m->latencySamples();
+        m->setParam("lowLatency", 1.f);
+        const int pending = m->latencySamples();
+        m->process(ch, 2, 256);
+        const int low = m->latencySamples();
+        std::printf("%s latency: normal %d, pending %d, lowLatency %d\n", type, normal, pending, low);
+        check(normal > 0 && pending == normal, "a WSOLA adapter reports a latency its core has not adopted");
+        check(low > 0 && low < normal, "a WSOLA adapter does not report the adopted lowLatency geometry");
+    }
+}
+
 static void legacyDcReference() {
     dcdsp::DcBlocker old, derived;
     derived.prepareLegacy48k(48000.);
@@ -377,6 +562,11 @@ int main() {
 #endif
     everyCatalogueEntryHasAKnownCategory();
     structureEditsDoNotWaitOnAChainNobodyIsProcessing();
+    harmonizerSemitoneChangeKeepsTheAnalysisInTheRing();
+    harmonizerFixedPitchAnalysisIsTheExactGrid();
+    filterSeqDownModeDescends();
+    looperSequencesCountEveryPress();
+    wsolaAdaptersPublishTheAdoptedLatency();
     overdriveBlend(); overdriveContinuityAndLatency(); legacyDcReference(); mailbox(); irPublication(); adapterIr(); irAdoption<dcdsp::CabCore>("cab"); irAdoption<dcdsp::AcousticSimCore>("acoustic");
     dcdsp::OverdriveParams od; od.drive = 0.f; rate<dcdsp::OverdriveCore>("overdrive", od);
     dcdsp::DistortionParams dist; dist.gain = 0.f; rate<dcdsp::DistortionCore>("distortion", dist);

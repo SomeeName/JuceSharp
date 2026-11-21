@@ -243,6 +243,9 @@ public:
     /// it made that mistake and the gate case passed with the fix reverted).
     float resonanceCurrentForTest() const { return appliedRes_; }
 
+    /// Test-only: the cutoff the current step glides toward, in Hz.
+    float stepTargetHzForTest() const { return std::exp2(targetLog_); }
+
 private:
     static float clamp(float v, float lo, float hi) {
         if (!(v == v)) return lo;
@@ -252,8 +255,9 @@ private:
 
     void advanceStep() {
         switch (mode_) {
-            case 1:  // Down
-                if (--stepIndex_ < 0) stepIndex_ = steps_ - 1;
+            case 1:  // Down: the index walks forward; newStep() reads it from
+                     // the TOP of the ramp. One reversal, never two.
+                if (++stepIndex_ >= steps_) stepIndex_ = 0;
                 break;
             case 2:  // Up-Down (bounce, no repeated endpoint)
                 if (steps_ <= 1) { stepIndex_ = 0; break; }

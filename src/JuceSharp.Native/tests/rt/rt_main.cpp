@@ -15,6 +15,8 @@
 
 #include "AudioEngine.h"
 #include "NullAudioIODevice.h"
+#include "SeqlockClock.h"
+#include "SyncCall.h"
 #include "MidiOutputDevice.h"
 #include "dsp/DspModuleFactory.h"
 #include "dsp/Retirement.h"
@@ -105,6 +107,17 @@
  #define NOMINMAX
  #include <windows.h>
 #endif
+
+// Internal gate seam in dotcharter_audio.cpp (DCA_RTCHECK only, never exported):
+// a plugin handle around an in-process stub, freed by dca_plugin_unload.
+namespace dca_rtcheck {
+dca_plugin_t adoptPluginForTest(dca_engine_t engine, std::unique_ptr<juce::AudioPluginInstance> instance);
+dotcharter::AudioEngine* engineForTest(dca_engine_t engine);
+bool instrumentFlagForTest(dca_plugin_t plugin);
+void failRenderWritesFromBlockForTest(int block);
+void failRenderReadsFromBlockForTest(int block);
+void failRenderReadsPastEndForTest(bool on);
+}
 
 using namespace dotcharter;
 
@@ -661,12 +674,44 @@ public:
     /// poll-only recovery assertion below goes vacuous.
     void setAnswerDelayUs(int us) { answerDelayUs_.store(us, std::memory_order_release); }
 
+    /// Bridge v4: an extra delay for requests of one seat (on top of the one
+    /// above), so a scenario can make one seat's chain cost more of the
+    /// callback's single deadline than another's.
+    void setSeatAnswerDelayUs(int seat, int us) { seatDelayUs_[(size_t) seat].store(us, std::memory_order_release); }
+
+    /// The request sequence the parent last published (kRequestWriting while
+    /// it writes one): its distance between two reads counts the posts.
+    uint32_t requestSeq() const { return dcvb::header(view_)->requestSeq.load(std::memory_order_acquire); }
+
+    /// Requests the stub dropped because the parent overwrote them during the
+    /// copy (dcvb::takeRequest), as juce_vst_host drops them.
+    int droppedRequests() const { return dropped_.load(std::memory_order_acquire); }
+
     /// One MIDI event as the child received it (bridge v3): the packed short,
     /// its sample offset inside the request's block, and that block's
     /// render-clock frame — so `blockStart + offset` is where it will sound.
     struct MidiSeen { uint32_t seq; uint32_t packed; uint32_t offset; int64_t blockStart; uint32_t blockFrames; };
 
     void clearMidiLog() { std::lock_guard<std::mutex> lk(logMutex_); midiCount_ = 0; }
+
+    /// Bridge v4: publish which seats hold a chain plugin, as juce_vst_host
+    /// does after every load / unload.
+    void setSeatChainMask(uint32_t mask)
+    {
+        dcvb::seatRouting(view_)->seatChainMask.store(mask, std::memory_order_release);
+    }
+
+    /// Bridge v4: requests answered per seat, the MIDI events they carried, and
+    /// requests that named a seat outside the layout.
+    void clearSeatLog()
+    {
+        for (auto& c : seatRequests_)   c.store(0, std::memory_order_relaxed);
+        for (auto& c : seatMidiEvents_) c.store(0, std::memory_order_relaxed);
+        badSeatRequests_.store(0, std::memory_order_relaxed);
+    }
+    int seatRequests(int seat)   const { return seatRequests_[(size_t) seat].load(std::memory_order_acquire); }
+    int seatMidiEvents(int seat) const { return seatMidiEvents_[(size_t) seat].load(std::memory_order_acquire); }
+    int badSeatRequests()        const { return badSeatRequests_.load(std::memory_order_acquire); }
     int  midiLogCount() { std::lock_guard<std::mutex> lk(logMutex_); return midiCount_; }
     MidiSeen midiLogAt(int i)
     {
@@ -698,11 +743,38 @@ private:
             h->heartbeat.fetch_add(1, std::memory_order_relaxed);
             if (! answering_.load(std::memory_order_acquire)) continue;
 
-            const uint32_t seq = h->requestSeq.load(std::memory_order_acquire);
-            if (seq == lastSeq_) continue;
-            lastSeq_ = seq;
+            // The child's own request reader: the seat is read with the
+            // acquire, and a request overwritten during the copy is dropped.
+            uint32_t seq = 0, seat = 0;
+            const auto take = dcvb::takeRequest(view_, lastSeq_, seq, seat, [] { return true; },
+                [&]
+                {
+                    // Bridge v3: read the request's MIDI exactly as juce_vst_host
+                    // does: packed word from the header, offset from the timing
+                    // block.
+                    const auto& timing = *dcvb::midiTiming(view_);
+                    copiedFrames_ = std::min(h->blockFrames, (uint32_t) dcvb::kMaxBlockFrames);
+                    copiedMidi_   = (int) std::min<uint32_t>(h->midiCount, dcvb::kMaxMidiEvents);
+                    copiedBlockStart_ = timing.blockStartFrame;
+                    for (int i = 0; i < copiedMidi_; ++i)
+                    {
+                        copiedPacked_[(size_t) i]  = h->midi[i];
+                        copiedOffsets_[(size_t) i] = timing.midiOffset[i];
+                    }
+                });
+            if (take == dcvb::RequestTake::Dropped) dropped_.fetch_add(1, std::memory_order_release);
+            if (take != dcvb::RequestTake::Taken) continue;
+            {
+                // Logged only for a request copied whole.
+                std::lock_guard<std::mutex> lk(logMutex_);
+                for (int i = 0; i < copiedMidi_ && midiCount_ < (int) midiLog_.size(); ++i)
+                    midiLog_[(size_t) midiCount_++] = MidiSeen{ seq, copiedPacked_[(size_t) i], copiedOffsets_[(size_t) i],
+                                                               copiedBlockStart_, copiedFrames_ };
+            }
 
-            if (const int delayUs = answerDelayUs_.load(std::memory_order_acquire); delayUs > 0)
+            const int seatDelayUs = seat < (uint32_t) dcvb::kMaxSeats
+                                  ? seatDelayUs_[seat].load(std::memory_order_acquire) : 0;
+            if (const int delayUs = answerDelayUs_.load(std::memory_order_acquire) + seatDelayUs; delayUs > 0)
             {
                 // NOT sleep_for: on Windows a sub-millisecond sleep rounds up to
                 // the timer resolution, which is 1 ms only while SOME process on
@@ -719,18 +791,17 @@ private:
                 do { YieldProcessor(); ::QueryPerformanceCounter(&t); } while (t.QuadPart < until);
             }
 
-            const uint32_t frames = std::min(h->blockFrames, (uint32_t) dcvb::kMaxBlockFrames);
+            const uint32_t frames = copiedFrames_;
+            // Bridge v4: the seat this request is for. Like juce_vst_host, only
+            // a seat-0 request renders the instrument (it carries the MIDI).
+            if (seat < (uint32_t) dcvb::kMaxSeats)
             {
-                // Bridge v3: read the request's MIDI exactly as juce_vst_host
-                // does — packed word from the header, offset from the timing
-                // block — before answering, i.e. while the parent still owns
-                // nothing of this request.
-                const auto& timing = *dcvb::midiTiming(view_);
-                const int count = (int) std::min<uint32_t>(h->midiCount, dcvb::kMaxMidiEvents);
-                std::lock_guard<std::mutex> lk(logMutex_);
-                for (int i = 0; i < count && midiCount_ < (int) midiLog_.size(); ++i)
-                    midiLog_[(size_t) midiCount_++] = MidiSeen{ seq, h->midi[i], timing.midiOffset[i],
-                                                               timing.blockStartFrame, frames };
+                seatMidiEvents_[seat].fetch_add(copiedMidi_, std::memory_order_relaxed);
+                seatRequests_[seat].fetch_add(1, std::memory_order_release);
+            }
+            else
+            {
+                badSeatRequests_.fetch_add(1, std::memory_order_release);
             }
             // Stamp a per-block constant so a torn/spliced block is detectable.
             const float marker = 0.01f * (float) (seq % 97u);
@@ -738,10 +809,12 @@ private:
             {
                 float* c = dcvb::chainOutChannel(view_, ch);
                 float* i = dcvb::instrOutChannel(view_, ch);
-                for (uint32_t n = 0; n < frames; ++n) { c[n] = marker; i[n] = marker; }
+                for (uint32_t n = 0; n < frames; ++n) c[n] = marker;
+                if (seat == 0)
+                    for (uint32_t n = 0; n < frames; ++n) i[n] = marker;
             }
             h->chainActive      = 1;
-            h->instrumentActive = 1;
+            h->instrumentActive = seat == 0 ? 1u : 0u;
             h->responseSeq.store(seq, std::memory_order_release);
             ::SetEvent(resp_);
         }
@@ -754,10 +827,21 @@ private:
     std::atomic<bool> run_{ false };
     std::atomic<bool> answering_{ true };
     std::atomic<int>  answerDelayUs_{ 0 };
+    std::array<std::atomic<int>, dcvb::kMaxSeats> seatDelayUs_{};
+    std::atomic<int>  dropped_{ 0 };
     uint32_t          lastSeq_ = 0;
+    // The last request's payload, copied by the loop thread only.
+    uint32_t                                   copiedFrames_ = 0;
+    int                                        copiedMidi_   = 0;
+    int64_t                                    copiedBlockStart_ = 0;
+    std::array<uint32_t, dcvb::kMaxMidiEvents> copiedPacked_{};
+    std::array<uint32_t, dcvb::kMaxMidiEvents> copiedOffsets_{};
     std::mutex                    logMutex_;
     std::array<MidiSeen, 256>     midiLog_{};
     int                           midiCount_ = 0;
+    std::array<std::atomic<int>, dcvb::kMaxSeats> seatRequests_{};
+    std::array<std::atomic<int>, dcvb::kMaxSeats> seatMidiEvents_{};
+    std::atomic<int>                              badSeatRequests_{ 0 };
 };
 #endif // _WIN32
 
@@ -9279,14 +9363,26 @@ public:
               .withOutput("Out", juce::AudioChannelSet::stereo(), true)) {}
 
     const juce::String getName() const override { return "RtCheck Stub Throwing Input"; }
-    void prepareToPlay(double, int) override {}
+    void prepareToPlay(double, int) override
+    {
+        if (prepareThrows_.load(std::memory_order_acquire) <= 0) return;
+        prepareThrows_.fetch_sub(1, std::memory_order_acq_rel);
+        throw PluginFault{};
+    }
     void releaseResources() override {}
 
     void processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) override
     {
         ran_.fetch_add(1, std::memory_order_relaxed);
         const bool always = throwAlways_.load(std::memory_order_acquire);
-        if (! throwNext_.exchange(false, std::memory_order_acq_rel) && ! always) return;
+        if (! throwNext_.exchange(false, std::memory_order_acq_rel) && ! always)
+        {
+            const float level = outputLevel_.load(std::memory_order_relaxed);
+            if (level != 0.0f)
+                for (int c = 0; c < buffer.getNumChannels(); ++c)
+                    juce::FloatVectorOperations::fill(buffer.getWritePointer(c), level, buffer.getNumSamples());
+            return;
+        }
         // Half-process the block first, so "break, not continue" is a claim the
         // scenario could in principle catch failing: a stage that ran after this
         // one would be running over audio nobody finished writing.
@@ -9308,6 +9404,12 @@ public:
     /// licence check, a layout it was not prepared for), which is the common
     /// case and the one the single-block phase above cannot model.
     void throwOnEveryBlock() noexcept { throwAlways_.store(true, std::memory_order_release); }
+    void stopThrowing() noexcept      { throwAlways_.store(false, std::memory_order_release); }
+    /// The next `n` prepareToPlay calls throw (an attach that fails part-way).
+    void throwOnNextPrepares(int n) noexcept { prepareThrows_.store(n, std::memory_order_release); }
+    /// Blocks that do not throw write this DC level (0 = pass the buffer through),
+    /// so an instrument that ran is audible on the output.
+    void setOutputLevel(float level) noexcept { outputLevel_.store(level, std::memory_order_relaxed); }
     int  blocksRun()   const noexcept { return ran_  .load(std::memory_order_relaxed); }
     int  blocksThrown() const noexcept { return threw_.load(std::memory_order_relaxed); }
 
@@ -9340,6 +9442,8 @@ private:
     std::atomic<bool> throwAlways_ { false };
     std::atomic<int>  ran_         { 0 };
     std::atomic<int>  threw_       { 0 };
+    std::atomic<int>  prepareThrows_ { 0 };
+    std::atomic<float> outputLevel_  { 0.0f };
 };
 
 /// A THIRD-PARTY PLUGIN THAT THROWS, on the input chain.
@@ -10388,7 +10492,7 @@ void scenarioMidiIsSampleAccurate()
     // Read the `delta > futureFrames` branch carefully before changing this: it
     // is reached only when the event is NOT for this block AND is further out
     // than 5 s, and the clock only gets that far ahead of an event if it REWOUND
-    // (a device restart drops renderFrames_ to 0). A manual-pump fixture cannot
+    // (a device restart drops the render clock to 0). A manual-pump fixture cannot
     // rewind, so the horizon DROP itself is genuinely not reachable here and
     // this phase does not claim to reach it — what it pins is the half that is:
     // an event far in the future is parked and dispatched to nobody, rather than
@@ -11196,6 +11300,246 @@ void scenarioChartSource()
                  + std::to_string(peak) + ")");
         src.pause();
     }
+    endScenario();
+}
+
+/// On a device with NO input, the seat loop runs only because a generator is
+/// live. Disabling the last chart source must keep that loop running until the
+/// source's choke fade has rendered: skipping it the same block cuts a sounding
+/// note to digital silence in one sample. Asserts the SAMPLES of the first
+/// block after the disable (a fade with no step), never a measured duration.
+void scenarioChartSourceDisableFadesWithNoInput()
+{
+    beginScenario("RtChartSourceDisableFadesOnAnInputlessDevice");
+    dca_chart_note n{};
+    n.start_seconds   = 0.05;
+    n.release_seconds = 5.0;
+    n.sustain_seconds = 4.95;
+    n.pitch           = 45.0f;
+    n.velocity        = 0.9f;
+    n.string_index    = 4;
+    n.fret            = 0;
+    n.slide_to_fret   = -1.0f;
+    n.chord_id        = -1;
+    n.bend_first      = -1;
+    const auto blob = makeWavBlob(6.0, 48000, 220.0);
+    if (blob.getSize() == 0) { fail("could not synthesise a WAV blob"); endScenario(); return; }
+
+    Fixture fx(48000, 256, 0);
+    if (! fx.ok()) { fail("input-less engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    e.setMonitorGain(1.0f);
+    TransportSource src(e);
+    RT_CHECK(src.openMemory(blob.getData(), blob.getSize(), "wav").isEmpty(), "openMemory failed");
+    src.setVolume(0.0f);   // the song is silent; its CLOCK is what we want
+    RT_CHECK(e.setSongClockSource(&src), "clock refused");
+    std::string error;
+    RT_CHECK(e.setChartNotes(0, &n, 1, (int32_t) sizeof(dca_chart_note), nullptr, 0, error),
+             "table rejected: " + error);
+    RT_CHECK(e.setChartSourceEnabled(0, true), "enable failed");
+    src.play();
+    fx.pumpWarm(100);   // ~0.53 s: the note is sustaining
+
+    auto* dev = nulldev::manualDevice();
+    if (dev == nullptr) { fail("no manual device"); endScenario(); return; }
+    const auto before = dev->manualOutputBuffers()[0];
+    float beforePeak = 0.0f, beforeMaxDelta = 0.0f;
+    for (size_t i = 0; i < before.size(); ++i)
+    {
+        beforePeak = std::max(beforePeak, std::abs(before[i]));
+        if (i > 0) beforeMaxDelta = std::max(beforeMaxDelta, std::abs(before[i] - before[i - 1]));
+    }
+    RT_CHECK(beforePeak > 0.02f, "the sustained note is not sounding before the disable (peak "
+             + std::to_string(beforePeak) + ")");
+
+    RT_CHECK(e.setChartSourceEnabled(0, false), "disable failed");
+    fx.pumpWarm(1);
+    const auto first = dev->manualOutputBuffers()[0];
+    float firstPeak = 0.0f;
+    for (float s : first) firstPeak = std::max(firstPeak, std::abs(s));
+    const float step = first.empty() || before.empty() ? 0.0f : std::abs(first.front() - before.back());
+    note("before peak " + std::to_string(beforePeak) + ", first block after the disable: peak "
+         + std::to_string(firstPeak) + ", boundary step " + std::to_string(step)
+         + " (largest step before " + std::to_string(beforeMaxDelta) + ")");
+    RT_CHECK(firstPeak > 0.25f * beforePeak,
+             "disabling the last chart source cut it to silence in one block (peak "
+             + std::to_string(firstPeak) + " after " + std::to_string(beforePeak)
+             + ") — the seat loop stopped before the fade rendered");
+    RT_CHECK(step <= 2.0f * beforeMaxDelta + 1.0e-4f,
+             "the block boundary after the disable steps by " + std::to_string(step));
+    fx.pumpWarm(8);
+    RT_CHECK(fx.lastOutputPeak() < 1.0e-6f, "8 blocks after disabling the output still carries "
+             + std::to_string(fx.lastOutputPeak()));
+    src.pause();
+    endScenario();
+}
+
+/// On a device with NO input, a chart source on a seat that LEAVES the live
+/// range (the player count drops) must not keep the seat loop running: only
+/// live seats render, so a source disabled out there never finishes a fade the
+/// callback would wait for. Counted through the callbacks that entered the
+/// seat loop, never a clock. A seat that comes BACK into the live range, after
+/// a disable or in the middle of its fade, plays silence, not the old tail.
+void scenarioChartSourceOffLiveSeatStopsTheSeatLoop()
+{
+    beginScenario("RtChartSourceOnASeatThatLeftTheLiveRangeStopsTheSeatLoop");
+    dca_chart_note n{};
+    n.start_seconds   = 0.05;
+    n.release_seconds = 20.0;
+    n.sustain_seconds = 19.95;
+    n.pitch           = 45.0f;
+    n.velocity        = 0.9f;
+    n.string_index    = 4;
+    n.fret            = 0;
+    n.slide_to_fret   = -1.0f;
+    n.chord_id        = -1;
+    n.bend_first      = -1;
+    const auto blob = makeWavBlob(21.0, 48000, 220.0);
+    if (blob.getSize() == 0) { fail("could not synthesise a WAV blob"); endScenario(); return; }
+
+    // 64-sample blocks: the choke fade (<= 5 ms, 240 samples) spans several
+    // callbacks, so the count can drop with the fade half rendered.
+    Fixture fx(48000, 64, 0);
+    if (! fx.ok()) { fail("input-less engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    e.setMonitorGain(1.0f);
+    e.setPlayerCount(2);
+    TransportSource src(e);
+    RT_CHECK(src.openMemory(blob.getData(), blob.getSize(), "wav").isEmpty(), "openMemory failed");
+    src.setVolume(0.0f);
+    RT_CHECK(e.setSongClockSource(&src), "clock refused");
+    std::string error;
+    RT_CHECK(e.setChartNotes(1, &n, 1, (int32_t) sizeof(dca_chart_note), nullptr, 0, error),
+             "table rejected: " + error);
+
+    // Sounds on seat 1, leaves the live range, is disabled out there.
+    const auto soundSeat1 = [&](const char* phase)
+    {
+        RT_CHECK(e.setChartSourceEnabled(1, true), std::string("enable failed: ") + phase);
+        float peak = 0.0f;
+        for (int i = 0; i < 400; ++i) { fx.pumpWarm(1); peak = std::max(peak, fx.lastOutputPeak()); }
+        RT_CHECK(peak > 0.02f, std::string("seat 1's chart source is not sounding (") + phase
+                 + ", peak " + std::to_string(peak) + "): the checks below are vacuous");
+    };
+    // The seat loop must not have entered once in `blocks` callbacks, and the
+    // output must be digital silence in every one of them.
+    const auto expectIdle = [&](int blocks, const std::string& phase)
+    {
+        const uint64_t before = e.seatLoopBlocksForTest();
+        float peak = 0.0f;
+        for (int i = 0; i < blocks; ++i) { fx.pumpArmed(1); peak = std::max(peak, fx.lastOutputPeak()); }
+        const uint64_t entered = e.seatLoopBlocksForTest() - before;
+        RT_CHECK(entered == 0, phase + ": the seat loop still entered " + std::to_string(entered)
+                 + " of " + std::to_string(blocks) + " callbacks with no live generator");
+        RT_CHECK(peak < 1.0e-6f, phase + ": the output carries " + std::to_string(peak));
+    };
+
+    src.play();
+    soundSeat1("before the count drops");
+    e.setPlayerCount(1);
+    fx.pumpArmed(4);
+    RT_CHECK(e.setChartSourceEnabled(1, false), "disable failed");
+    fx.pumpArmed(64);
+    expectIdle(64, "seat 1 disabled after leaving the live range");
+
+    // Back into the live range, disabled: nothing of the abandoned note.
+    e.setPlayerCount(2);
+    expectIdle(64, "seat 1 back in the live range after a disable");
+
+    // Disabled while live, the count drops in the MIDDLE of the choke fade,
+    // then the seat returns: it does not resume that fade.
+    soundSeat1("before the mid-fade drop");
+    RT_CHECK(e.setChartSourceEnabled(1, false), "second disable failed");
+    fx.pumpArmed(1);
+    RT_CHECK(fx.lastOutputPeak() > 1.0e-4f, "the choke fade had already ended after one block "
+             "(peak " + std::to_string(fx.lastOutputPeak()) + "): the mid-fade check is vacuous");
+    e.setPlayerCount(1);
+    fx.pumpArmed(4);
+    e.setPlayerCount(2);
+    expectIdle(64, "seat 1 back in the live range in the middle of its fade");
+    src.pause();
+    endScenario();
+}
+
+/// On a device with NO input, a voice REPLACED by a model change and then a
+/// disable before the next callback leaves a live seat with `enabled` off and
+/// the new (silent) voice ending its choke at once (runState 0), while the
+/// replaced voice is still cross-fading out. The seat loop must keep running
+/// until that fade is rendered to its end (10 ms = 480 samples, 8 blocks of
+/// 64), then stop. Counted through the callbacks that entered the seat loop,
+/// never a clock.
+void scenarioChartReplacedVoiceFadeRunsTheSeatLoop()
+{
+    beginScenario("RtChartReplacedVoiceFadeRunsTheSeatLoopOnAnInputlessDevice");
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "dcrt_chart_fade_seat_loop";
+    voicefixture::writeAllPacks(dir, 12, 3.0, 3);
+    setEnv("DOTCHARTER_VOICE_DIR", dir.string().c_str());
+    dca_chart_note n{};
+    n.start_seconds   = 0.05;
+    n.release_seconds = 20.0;
+    n.sustain_seconds = 19.95;
+    n.pitch           = 47.0f;
+    n.velocity        = 0.9f;
+    n.string_index    = 1;
+    n.fret            = 2;
+    n.slide_to_fret   = -1.0f;
+    n.chord_id        = -1;
+    n.bend_first      = -1;
+    n.flags           = DCA_CHART_NOTE_LET_RING;
+    const auto blob = makeWavBlob(21.0, 48000, 220.0);
+    {
+        Fixture fx(48000, 64, 0);
+        if (! fx.ok()) { fail("input-less engine did not start: " + fx.error()); }
+        else
+        {
+            auto& e = fx.engine();
+            e.setMonitorGain(1.0f);
+            TransportSource src(e);
+            RT_CHECK(src.openMemory(blob.getData(), blob.getSize(), "wav").isEmpty(), "openMemory failed");
+            src.setVolume(0.0f);
+            RT_CHECK(e.setSongClockSource(&src), "clock refused");
+            std::string error;
+            RT_CHECK(e.setChartNotes(0, &n, 1, (int32_t) sizeof(dca_chart_note), nullptr, 0, error),
+                     "table rejected: " + error);
+            dcvoice::InstrumentConfig neck;   neck.model = dcvoice::kModelStratSSS;   neck.pickup = dcvoice::kPickNeck;
+            dcvoice::InstrumentConfig bridge; bridge.model = dcvoice::kModelStratSSS; bridge.pickup = dcvoice::kPickBridge;
+            RT_CHECK(e.setChartVoice(0, DCA_CHART_VOICE_GUITAR), "guitar voice refused");
+            RT_CHECK(e.setChartInstrument(0, neck), "Strat neck refused");
+            RT_CHECK(e.setChartSourceEnabled(0, true), "enable failed");
+            src.play();
+            float peak = 0.0f;
+            for (int i = 0; i < 300; ++i) { fx.pumpWarm(1); peak = std::max(peak, fx.lastOutputPeak()); }
+            RT_CHECK(peak > 1.0e-3f, "the neck voice is not sounding (peak " + std::to_string(peak)
+                     + "): the checks below are vacuous");
+
+            // Replaced, then disabled, with no callback in between.
+            RT_CHECK(e.setChartInstrument(0, bridge), "the switch to the bridge was refused");
+            RT_CHECK(e.setChartSourceEnabled(0, false), "disable failed");
+
+            const uint64_t before = e.seatLoopBlocksForTest();
+            fx.pumpArmed(1);
+            const float firstPeak = fx.lastOutputPeak();
+            RT_CHECK(firstPeak > 1.0e-4f, "the replaced voice was silent in the first block after the swap (peak "
+                     + std::to_string(firstPeak) + "): the fade check is vacuous");
+            fx.pumpArmed(31);
+            const uint64_t entered = e.seatLoopBlocksForTest() - before;
+            note("first block after the swap: peak " + std::to_string(firstPeak) + ", seat loop entered "
+                 + std::to_string(entered) + " of 32 callbacks");
+            RT_CHECK(entered >= 7, "the seat loop stopped after " + std::to_string(entered)
+                     + " block(s) with the replaced voice's 480-sample fade unfinished");
+            RT_CHECK(entered < 32, "the seat loop never stopped after the replaced voice's fade ("
+                     + std::to_string(entered) + " of 32 callbacks)");
+
+            const uint64_t idleFrom = e.seatLoopBlocksForTest();
+            float tail = 0.0f;
+            for (int i = 0; i < 32; ++i) { fx.pumpArmed(1); tail = std::max(tail, fx.lastOutputPeak()); }
+            RT_CHECK(e.seatLoopBlocksForTest() == idleFrom, "the seat loop still entered "
+                     + std::to_string(e.seatLoopBlocksForTest() - idleFrom) + " callbacks after the fade");
+            RT_CHECK(tail < 1.0e-6f, "after the fade the output carries " + std::to_string(tail));
+            src.pause();
+        }
+    }
+    setEnv("DOTCHARTER_VOICE_DIR", nullptr);
     endScenario();
 }
 
@@ -12599,6 +12943,2709 @@ void scenarioSparseOutputMaskMasterBus()
     endScenario();
 }
 
+
+// ---------------------------------------------------------------------------
+// DotCharter #696 (ABI v50): one stub child per seat.
+// ---------------------------------------------------------------------------
+//
+// Each seat's bridge has its own mapping, events and child, as the app arms
+// them: `arm(s)` arms seat s's bridge under names unique to this process, tag
+// and seat, and attaches seat s's stub child once; a later `arm(s)` re-arms the
+// bridge over the surviving child (what an engine rebuild does).
+#if defined(_WIN32)
+class SeatBridges
+{
+public:
+    SeatBridges(AudioEngine& e, const char* tag) : e_(e)
+    {
+        const unsigned pid = (unsigned) ::GetCurrentProcessId();
+        for (int s = 0; s < dcvb::kMaxSeats; ++s)
+        {
+            auto& n = names_[(size_t) s];
+            std::snprintf(n.shm,  sizeof(n.shm),  "%s%d_shm_%u",  tag, s, pid);
+            std::snprintf(n.req,  sizeof(n.req),  "%s%d_req_%u",  tag, s, pid);
+            std::snprintf(n.resp, sizeof(n.resp), "%s%d_resp_%u", tag, s, pid);
+        }
+    }
+
+    ~SeatBridges() { close(); }
+
+    bool arm(int seat)
+    {
+        const auto& n = names_[(size_t) seat];
+        if (! e_.setRemoteBridge(seat, n.shm, n.req, n.resp, true)) return false;
+        if (open_[(size_t) seat]) return true;
+        open_[(size_t) seat] = children_[(size_t) seat].open(n.shm, n.req, n.resp);
+        return open_[(size_t) seat];
+    }
+
+    void disarm(int seat) { e_.setRemoteBridge(seat, nullptr, nullptr, nullptr, false); }
+
+    StubBridgeChild& child(int seat) { return children_[(size_t) seat]; }
+
+    struct Stats { uint32_t processed = 0, timeouts = 0, heartbeat = 0; };
+    Stats stats(int seat) const
+    {
+        Stats st;
+        e_.getRemoteBridgeStats(seat, st.processed, st.timeouts, st.heartbeat);
+        return st;
+    }
+
+    /// Every child stops first, then every bridge is disarmed.
+    void close()
+    {
+        for (auto& c : children_) c.close();
+        for (int s = 0; s < dcvb::kMaxSeats; ++s) disarm(s);
+        open_.fill(false);
+    }
+
+private:
+    struct Names { char shm[128], req[128], resp[128]; };
+    AudioEngine&                                   e_;
+    std::array<Names, dcvb::kMaxSeats>             names_{};
+    std::array<StubBridgeChild, dcvb::kMaxSeats>   children_;
+    std::array<bool, dcvb::kMaxSeats>              open_{};
+};
+
+/// One armed callback over the first `seats` armed seats: per seat, the trips
+/// its bridge counted as answered and as missed and the requests its child saw
+/// posted; for the callback, the bridge waits (dcrt's wait samples), their sum
+/// and the allocations.
+struct SeatCallback
+{
+    std::array<uint32_t, dcvb::kMaxSeats> answered{}, missed{}, posts{};
+    int       waits    = 0;
+    long long waitedNs = 0;
+    int       allocs   = 0;
+};
+
+SeatCallback pumpSeatCallback(Fixture& fx, SeatBridges& sb, int seats)
+{
+    std::array<SeatBridges::Stats, dcvb::kMaxSeats> before{};
+    std::array<uint32_t, dcvb::kMaxSeats>           seq0{};
+    for (int s = 0; s < seats; ++s)
+    {
+        before[(size_t) s] = sb.stats(s);
+        seq0[(size_t) s]   = sb.child(s).requestSeq();
+    }
+    dcrt::reset();
+    dcrt::arm();
+    fx.pumpArmed(1);
+    dcrt::disarm();
+    SeatCallback cb;
+    cb.allocs = dcrt::allocCount();
+    for (int s = 0; s < seats; ++s)
+    {
+        const auto after = sb.stats(s);
+        cb.answered[(size_t) s] = after.processed - before[(size_t) s].processed;
+        cb.missed[(size_t) s]   = after.timeouts  - before[(size_t) s].timeouts;
+        cb.posts[(size_t) s]    = sb.child(s).requestSeq() - seq0[(size_t) s];
+    }
+    for (const long long ns : dcrt::samplesNs(dcrt::Kind::Wait, "bridge/responseWait")) { cb.waitedNs += ns; ++cb.waits; }
+    return cb;
+}
+#endif // _WIN32
+
+// ---------------------------------------------------------------------------
+// DotCharter #646 (bridge v4): the sandbox bridge routes EVERY seat.
+// ---------------------------------------------------------------------------
+//
+// A sandboxed effect belongs to its seat, and since ABI v50 (DotCharter #696)
+// every seat's chain has a child of its own. A seat above 0 round-trips its
+// own input with its seat number in the request, to its OWN child, only while
+// that child's seat mask names it, never with MIDI (the instrument is seat
+// 0's), and without allocating. Seat 0's child sees only seat-0 requests. A
+// re-armed bridge (what an engine rebuild does over the surviving child)
+// routes the seat again from the mask alone.
+void scenarioSandboxRoutesEverySeat()
+{
+    beginScenario("RtSandboxRoutesEverySeatWithoutAllocating");
+#if !defined(_WIN32)
+    note("skipped: the sandbox bridge is Windows-only");
+    endScenario();
+    return;
+#else
+    Fixture fx(48000, 256, 2);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    fx.engine().setPlayerCount(2);
+    fx.installInputStimulus();
+
+    SeatBridges sb(fx.engine(), "dcrtseat");
+    if (! sb.arm(0) || ! sb.arm(1))
+    { fail("arming a seat's bridge or attaching its stub child failed"); endScenario(); return; }
+    auto& c0 = sb.child(0);
+    auto& c1 = sb.child(1);
+    auto clearLogs = [&] { c0.clearSeatLog(); c1.clearSeatLog(); };
+    fx.pumpWarm(kWarmupBlocks);
+
+    // --- A: no chain on seat 1 -> only seat 0 round-trips -------------------
+    clearLogs();
+    fx.pumpWarm(64);
+    note("A (seat 1's child holds nothing): seat 0 trips " + std::to_string(c0.seatRequests(0))
+         + ", seat 1 trips " + std::to_string(c1.seatRequests(1)));
+    RT_CHECK(c0.seatRequests(0) > 0, "seat 0 never round-tripped: the routing checks below are vacuous");
+    RT_CHECK(c1.seatRequests(0) + c1.seatRequests(1) == 0,
+             "seat 1 round-tripped " + std::to_string(c1.seatRequests(1))
+             + " time(s) while its child held no chain plugin for it");
+
+    // --- B: seat 1's child publishes a seat-1 chain ---------------------------
+    c1.setSeatChainMask(0b10u);
+    clearLogs();
+    constexpr int kBlocksB = 256;
+    dcrt::reset();
+    dcrt::arm();
+    for (int i = 0; i < kBlocksB; ++i)
+    {
+        if (i % 8 == 0) fx.engine().sendMidiShort(0x90, (uint8_t) (40 + (i % 40)), 100);
+        fx.pumpArmed(1);
+    }
+    dcrt::disarm();
+    const int allocsB = dcrt::allocCount();
+    note("B (seat 1 chain): seat 0's child got seat 0 x" + std::to_string(c0.seatRequests(0)) + " (MIDI "
+         + std::to_string(c0.seatMidiEvents(0)) + "), seat 1 x" + std::to_string(c0.seatRequests(1))
+         + "; seat 1's child got seat 1 x" + std::to_string(c1.seatRequests(1)) + " (MIDI "
+         + std::to_string(c1.seatMidiEvents(1)) + "), seat 0 x" + std::to_string(c1.seatRequests(0))
+         + " over " + std::to_string(kBlocksB) + " blocks");
+    reportHeap("seat routing");
+    RT_CHECK(allocsB == 0, "routing a second seat through its bridge allocated "
+                           + std::to_string(allocsB) + " time(s) on the callback");
+    RT_CHECK(c1.seatRequests(1) > 0, "seat 1 never round-tripped although its child published a chain for it");
+    RT_CHECK(c0.seatRequests(0) > 0, "seat 0 stopped round-tripping once seat 1 was routed");
+    RT_CHECK(c0.seatRequests(1) == 0, "seat 0's child received " + std::to_string(c0.seatRequests(1))
+                                      + " seat-1 request(s): seat 1 has a child of its own");
+    RT_CHECK(c1.seatRequests(0) == 0, "seat 1's child received " + std::to_string(c1.seatRequests(0))
+                                      + " seat-0 request(s)");
+    RT_CHECK(c0.seatMidiEvents(0) > 0, "no MIDI reached seat 0's trip: the MIDI check is vacuous");
+    RT_CHECK(c1.seatMidiEvents(1) == 0, "a seat-1 request carried " + std::to_string(c1.seatMidiEvents(1))
+                                        + " MIDI event(s): the instrument's MIDI belongs to seat 0's trip");
+    RT_CHECK(c0.badSeatRequests() + c1.badSeatRequests() == 0, "a request named a seat outside the layout");
+
+    // --- C: the mask drops seat 1 again -> its trips stop --------------------
+    c1.setSeatChainMask(0u);
+    fx.pumpWarm(4);
+    clearLogs();
+    fx.pumpWarm(64);
+    RT_CHECK(c1.seatRequests(1) == 0, "seat 1 kept round-tripping after its child unloaded its chain ("
+                                      + std::to_string(c1.seatRequests(1)) + " trips)");
+
+    // --- E: re-arm (an engine rebuild over the surviving children) ----------
+    c1.setSeatChainMask(0b10u);
+    if (! sb.arm(0) || ! sb.arm(1))
+        fail("re-arming the bridges over the surviving mappings failed");
+    fx.pumpWarm(8);
+    clearLogs();
+    fx.pumpWarm(64);
+    note("E (re-armed): seat 0 trips " + std::to_string(c0.seatRequests(0)) + ", seat 1 trips "
+         + std::to_string(c1.seatRequests(1)));
+    RT_CHECK(c0.seatRequests(0) > 0, "seat 0 stopped round-tripping after its bridge was re-armed");
+    RT_CHECK(c1.seatRequests(1) > 0, "seat 1 stopped round-tripping after its bridge was re-armed; "
+                                     "the child's seat mask must survive a re-arm");
+
+    // --- D: both children wedged: one budget per callback in TOTAL -----------
+    // Every seat's request is posted first and all are collected against ONE
+    // deadline, so two wedged children cost a callback one block budget, not
+    // one each; each child sees at most one request per callback; each seat
+    // counts the miss on its OWN bridge.
+    const long long budget = fx.blockBudgetNs();
+    const long long bound  = budget + budget / 16;
+    c0.setAnswering(false);
+    c1.setAnswering(false);
+    uint32_t worstPostsD = 0, missesD0 = 0, missesD1 = 0;
+    long long worstD = 0;
+    int overD = 0, allocsD = 0;
+    for (int i = 0; i < 32; ++i)
+    {
+        const SeatCallback cb = pumpSeatCallback(fx, sb, 2);
+        worstPostsD = std::max({ worstPostsD, cb.posts[0], cb.posts[1] });
+        missesD0 += cb.missed[0];
+        missesD1 += cb.missed[1];
+        worstD = std::max(worstD, cb.waitedNs);
+        allocsD += cb.allocs;
+        if (cb.waitedNs > bound) ++overD;
+    }
+    c0.setAnswering(true);
+    c1.setAnswering(true);
+    note("D (both children wedged, 32 callbacks): misses seat 0 " + std::to_string(missesD0) + ", seat 1 "
+         + std::to_string(missesD1) + "; at most " + std::to_string(worstPostsD) + " request(s) per child per callback; "
+         "longest callback wait " + std::to_string(worstD) + " ns (block budget " + std::to_string(budget) + " ns), "
+         + std::to_string(overD) + " callback(s) over budget + 1/16");
+    RT_CHECK(missesD0 > 0 && missesD1 > 0, "a wedged child's seat never counted a miss: the probe is vacuous");
+    RT_CHECK(worstPostsD <= 1, "a child saw " + std::to_string(worstPostsD) + " requests in one callback");
+    RT_CHECK(overD <= 1, std::to_string(overD) + " callbacks waited longer than one block budget in total "
+                         "(longest " + std::to_string(worstD) + " ns, budget " + std::to_string(budget) + " ns): "
+                         "each seat's bridge waited a budget of its own");
+    RT_CHECK(allocsD == 0, "collecting two wedged bridges allocated " + std::to_string(allocsD) + " time(s)");
+
+    // --- G: both seats answer in time on their own (0.5 and 0.8 blocks) -----
+    // Posted together and collected together, both answer inside the one
+    // deadline: BOTH seats are processed and the callback waits about 0.8 of
+    // a block. Taking the trips in turn needs 1.3 blocks and breaks the rule in
+    // every sample. Judged over kSamplesG callbacks, each after two callbacks at
+    // no delay (both bridges out of poll-only, every child drained), one
+    // preempted or late-woken sample allowed.
+    if (! sb.arm(0) || ! sb.arm(1)) fail("re-arming the bridges before phase G failed");   // fresh miss counts
+    const int blockUs = (int) (budget / 1000);
+    fx.pumpWarm(8);
+    constexpr int kSamplesG = 8;
+    int badG = 0;
+    long long worstG = 0;
+    std::string firstBadG;
+    for (int k = 0; k < kSamplesG; ++k)
+    {
+        c0.setAnswerDelayUs(0);
+        c1.setAnswerDelayUs(0);
+        fx.pumpWarm(2);
+        c0.setAnswerDelayUs(blockUs / 2);
+        c1.setAnswerDelayUs(blockUs * 4 / 5);
+        const SeatCallback g = pumpSeatCallback(fx, sb, 2);
+        worstG = std::max(worstG, g.waitedNs);
+        const bool ok = g.answered[0] == 1 && g.answered[1] == 1 && g.missed[0] == 0 && g.missed[1] == 0
+                     && g.waitedNs <= bound;
+        if (! ok && ++badG == 1)
+            firstBadG = "answered " + std::to_string(g.answered[0]) + "/" + std::to_string(g.answered[1])
+                      + ", missed " + std::to_string(g.missed[0]) + "/" + std::to_string(g.missed[1]) + ", "
+                      + std::to_string(g.waits) + " wait(s) summing " + std::to_string(g.waitedNs) + " ns";
+    }
+    c0.setAnswerDelayUs(0);
+    c1.setAnswerDelayUs(0);
+    note("G (seat 0 0.5 blocks, seat 1 0.8 blocks): " + std::to_string(badG) + " of " + std::to_string(kSamplesG)
+         + " callbacks off the rule (first: " + (firstBadG.empty() ? std::string("none") : firstBadG)
+         + "); longest callback wait " + std::to_string(worstG) + " ns (budget " + std::to_string(budget) + " ns)");
+    RT_CHECK(badG <= 1, std::to_string(badG) + " of " + std::to_string(kSamplesG) + " callbacks broke the rule "
+                        "(both seats processed, the callback waits at most one block budget); first: " + firstBadG);
+
+    sb.close();
+    endScenario();
+#endif
+}
+
+
+// ---------------------------------------------------------------------------
+// DotCharter #646 / #696: the instrument's zero-input trip on an input-less
+// device.
+// ---------------------------------------------------------------------------
+//
+// A device with no input: seat 0 has nothing to run (its loop iteration ends
+// before the bridge), seat 1 plays a take through a sandboxed chain on its
+// own child, and the instrument's zero-input trip runs on seat 0's bridge
+// because no seat-0 trip did. Each trip reaches its own seat's child. The
+// instrument's request is posted with seat 1's and both are collected against
+// the callback's ONE deadline, and each completes on its own: with both
+// children wedged each seat counts its own miss and the callback waits one
+// budget in total; with the instrument's child at 0.5 of a block and seat 1's
+// at 0.8 both are answered in the same callback, inside one budget.
+void scenarioSandboxInstrumentTripSharesTheDeadline()
+{
+    beginScenario("RtSandboxInstrumentTripSharesTheCallbackDeadline");
+#if !defined(_WIN32)
+    note("skipped: the sandbox bridge is Windows-only");
+    endScenario();
+    return;
+#else
+    Fixture fx(48000, 256, 0);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    e.setPlayerCount(2);
+    std::vector<float> take(4800);
+    for (size_t i = 0; i < take.size(); ++i)
+        take[i] = 0.25f * (float) std::sin(2.0 * 3.14159265358979323846 * 1000.0 * (double) i / 48000.0);
+    if (! e.setInputInjection(1, take.data(), (int64_t) take.size(), true) || ! e.setInputInjectionPlaying(1, true))
+    { fail("seat 1 refused its take"); endScenario(); return; }
+
+    SeatBridges sb(e, "dcrtinstr");
+    if (! sb.arm(0) || ! sb.arm(1))
+    { fail("arming a seat's bridge or attaching its stub child failed"); endScenario(); return; }
+    auto& c0 = sb.child(0);
+    auto& c1 = sb.child(1);
+    c1.setSeatChainMask(0b10u);
+    fx.pumpWarm(kWarmupBlocks);
+    c0.clearSeatLog();
+    c1.clearSeatLog();
+    fx.pumpWarm(32);
+    note("healthy: seat 1's child got seat 1 x" + std::to_string(c1.seatRequests(1)) + ", seat 0's child got the "
+         "instrument (seat 0, zero-input) x" + std::to_string(c0.seatRequests(0)) + " over 32 callbacks");
+    RT_CHECK(c1.seatRequests(1) > 0, "seat 1 never round-tripped to its own child");
+    RT_CHECK(c0.seatRequests(0) > 0, "the instrument's zero-input trip never reached seat 0's child");
+    RT_CHECK(c0.seatRequests(1) + c1.seatRequests(0) == 0, "a trip reached the other seat's child");
+
+    const long long budget = fx.blockBudgetNs();
+    const long long bound  = budget + budget / 16;
+    const int blockUs = (int) (budget / 1000);
+
+    // --- both children wedged: one miss per seat, one budget in total --------
+    c0.setAnswering(false);
+    c1.setAnswering(false);
+    const SeatCallback w = pumpSeatCallback(fx, sb, 2);
+    c0.setAnswering(true);
+    c1.setAnswering(true);
+    note("wedged: misses seat 0 " + std::to_string(w.missed[0]) + ", seat 1 " + std::to_string(w.missed[1]) + "; "
+         + std::to_string(w.waits) + " wait(s) summing " + std::to_string(w.waitedNs) + " ns (block budget "
+         + std::to_string(budget) + " ns)");
+    RT_CHECK(w.missed[0] == 1 && w.missed[1] == 1,
+             "with both children wedged, seat 0 counted " + std::to_string(w.missed[0]) + " and seat 1 "
+             + std::to_string(w.missed[1]) + " misses (want one each, on its own bridge)");
+    RT_CHECK(w.waits == 1, std::to_string(w.waits) + " waits in one callback: the instrument's trip and seat 1's "
+                           "must be collected together against one deadline");
+
+    // --- instrument 0.5 blocks, seat 1 0.8: both answered, one budget ---------
+    if (! sb.arm(0) || ! sb.arm(1)) fail("re-arming the bridges failed");   // fresh miss counts
+    fx.pumpWarm(8);
+    constexpr int kSamples = 8;
+    int bad = 0;
+    long long worst = 0;
+    std::string firstBad;
+    for (int k = 0; k < kSamples; ++k)
+    {
+        c0.setAnswerDelayUs(0);
+        c1.setAnswerDelayUs(0);
+        fx.pumpWarm(2);
+        c0.setAnswerDelayUs(blockUs / 2);
+        c1.setAnswerDelayUs(blockUs * 4 / 5);
+        const SeatCallback g = pumpSeatCallback(fx, sb, 2);
+        worst = std::max(worst, g.waitedNs);
+        const bool ok = g.answered[0] == 1 && g.answered[1] == 1 && g.waitedNs <= bound;
+        if (! ok && ++bad == 1)
+            firstBad = "answered " + std::to_string(g.answered[0]) + "/" + std::to_string(g.answered[1]) + ", "
+                     + std::to_string(g.waits) + " wait(s) summing " + std::to_string(g.waitedNs) + " ns";
+    }
+    c0.setAnswerDelayUs(0);
+    c1.setAnswerDelayUs(0);
+    note("instrument 0.5 blocks, seat 1 0.8 blocks: " + std::to_string(bad) + " of " + std::to_string(kSamples)
+         + " callbacks off the rule (first: " + (firstBad.empty() ? std::string("none") : firstBad)
+         + "); longest callback wait " + std::to_string(worst) + " ns");
+    RT_CHECK(bad <= 1, std::to_string(bad) + " of " + std::to_string(kSamples) + " callbacks broke the rule (the "
+                       "instrument and seat 1 both answered, the callback waits at most one block budget); first: "
+                       + firstBad);
+
+    sb.close();
+    endScenario();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DotCharter #646: a late child drops a request the parent overwrote while it
+// was copying it.
+// ---------------------------------------------------------------------------
+//
+// The parent only writes a new request after giving up on the previous one,
+// and a late child may still be copying that one. dcvb::takeRequest (the
+// reader juce_vst_host and the stub use) reads the seat with the acquire and
+// keeps the copy only when requestSeq still names it afterwards. The
+// interleaving is staged inside the copy callback, so no sleep decides it:
+// (a) an untouched request is taken with its seat; (b) the parent has only
+// STARTED the next request (kRequestWriting) when the copy ends; (c) it has
+// published it; (d) the real RemoteVstBridge writes it (no child answers, so
+// that trip misses after its one block); (e) a request still being written is
+// not taken at all; (f) the answer a re-preparing child gives without copying
+// (dcvb::answerInactive) is not published for a request the parent began
+// overwriting, and (g) is for an untouched one. Pure memory work on the test
+// thread, no device.
+void scenarioSandboxChildDropsAnOverwrittenRequest()
+{
+    beginScenario("RtSandboxChildDropsARequestOverwrittenDuringItsCopy");
+#if !defined(_WIN32)
+    note("skipped: the sandbox bridge is Windows-only");
+    endScenario();
+    return;
+#else
+    std::vector<uint64_t> mem((dcvb::kTotalBytes + 7) / 8, 0);
+    void* base = mem.data();
+    auto* h = dcvb::header(base);
+    auto post = [&](uint32_t seq, uint32_t seat)
+    {
+        dcvb::beginRequestWrite(h);
+        dcvb::seatRouting(base)->requestSeat = seat;
+        dcvb::publishRequest(h, seq);
+    };
+    auto nothing = [] { return true; };
+    uint32_t last = 0, seq = 0, seat = 99;
+
+    post(5, 1);
+    auto t = dcvb::takeRequest(base, last, seq, seat, nothing, [] {});
+    RT_CHECK(t == dcvb::RequestTake::Taken && seq == 5 && seat == 1, "(a) an untouched request was not taken whole");
+
+    post(6, 1);
+    t = dcvb::takeRequest(base, last, seq, seat, nothing, [&]
+    {
+        dcvb::beginRequestWrite(h);                    // the parent starts request 7 ...
+        dcvb::seatRouting(base)->requestSeat = 0;      // ... for seat 0
+    });
+    RT_CHECK(t == dcvb::RequestTake::Dropped, "(b) a request the parent began overwriting during the copy was kept");
+    RT_CHECK(seat == 1, "(b) the seat was read after the copy (" + std::to_string(seat) + "), not with the acquire");
+
+    // (e) the write in progress is not a request yet.
+    const uint32_t lastBefore = last;
+    t = dcvb::takeRequest(base, last, seq, seat, nothing, [] {});
+    RT_CHECK(t == dcvb::RequestTake::None && last == lastBefore, "(e) a request still being written was taken");
+    dcvb::publishRequest(h, 7);
+    t = dcvb::takeRequest(base, last, seq, seat, nothing, [] {});
+    RT_CHECK(t == dcvb::RequestTake::Taken && seq == 7 && seat == 0, "(e) the finished request was not taken");
+
+    post(8, 1);
+    t = dcvb::takeRequest(base, last, seq, seat, nothing, [&] { post(9, 0); });
+    RT_CHECK(t == dcvb::RequestTake::Dropped, "(c) a request the parent replaced during the copy was kept");
+
+    // (f) a re-preparing child answers without copying (dcvb::answerInactive,
+    // juce_vst_host's beforeCopy); a request the parent began overwriting
+    // first gets no answer. (g) an untouched one is answered, nothing active.
+    const uint32_t responseBefore = h->responseSeq.load(std::memory_order_acquire);
+    bool published = true;
+    post(10, 1);
+    t = dcvb::takeRequest(base, last, seq, seat, [&]
+    {
+        dcvb::beginRequestWrite(h);                    // the parent starts request 11
+        published = dcvb::answerInactive(h, seq);
+        return false;
+    }, [] {});
+    RT_CHECK(t == dcvb::RequestTake::None && ! published
+                 && h->responseSeq.load(std::memory_order_acquire) == responseBefore,
+             "(f) a re-preparing child answered a request the parent had begun overwriting");
+    dcvb::publishRequest(h, 11);
+    h->chainActive = 1;
+    h->instrumentActive = 1;
+    t = dcvb::takeRequest(base, last, seq, seat, [&] { published = dcvb::answerInactive(h, seq); return false; }, [] {});
+    RT_CHECK(t == dcvb::RequestTake::None && published && h->responseSeq.load(std::memory_order_acquire) == 11u
+                 && h->chainActive == 0 && h->instrumentActive == 0,
+             "(g) a re-preparing child did not answer its current request with nothing active");
+
+    RT_CHECK(dcvb::nextRequestSeq(dcvb::kRequestWriting - 1) == 1 && dcvb::nextRequestSeq(dcvb::kRequestWriting) == 1,
+             "a sequence number wrapped onto kRequestWriting or 0");
+
+    // (d) the real parent writer.
+    char shm[128], req[128], resp[128];
+    const unsigned pid = (unsigned) ::GetCurrentProcessId();
+    std::snprintf(shm,  sizeof(shm),  "dcrtdrop_shm_%u", pid);
+    std::snprintf(req,  sizeof(req),  "dcrtdrop_req_%u", pid);
+    std::snprintf(resp, sizeof(resp), "dcrtdrop_resp_%u", pid);
+    RemoteVstBridge bridge;
+    if (! bridge.enable(shm, req, resp, 48000, 256)) { fail("(d) bridge enable failed"); endScenario(); return; }
+    HANDLE mapping = ::OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, shm);
+    void* view = mapping != nullptr ? ::MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, dcvb::kTotalBytes) : nullptr;
+    if (view == nullptr) { fail("(d) could not map the bridge"); if (mapping) ::CloseHandle(mapping); endScenario(); return; }
+    juce::AudioBuffer<float> buf(dcvb::kMaxChannels, 256);
+    buf.clear();
+    RemoteVstBridge* const one[] = { &bridge };
+    auto trip = [&](int seat, uint32_t serial)
+    {
+        if (! bridge.post(buf, 256, nullptr, nullptr, 0, 0, seat, serial)) return false;
+        RemoteVstBridge::collect(one, 1);
+        return bridge.answered();
+    };
+    const bool firstAnswered = trip(1, 1u);
+    uint32_t lastD = 0, seqD = 0, seatD = 99;
+    bool secondAnswered = true;
+    t = dcvb::takeRequest(view, lastD, seqD, seatD, nothing, [&] { secondAnswered = trip(0, 2u); });
+    note("(d) real writer: first trip answered " + std::to_string(firstAnswered) + ", second "
+         + std::to_string(secondAnswered) + ", take " + std::to_string((int) t) + ", seat " + std::to_string(seatD));
+    RT_CHECK(! firstAnswered && ! secondAnswered, "(d) a trip with no child answered");
+    RT_CHECK(t == dcvb::RequestTake::Dropped && seatD == 1,
+             "(d) the child kept a seat-1 request RemoteVstBridge overwrote with a seat-0 one during the copy");
+    ::UnmapViewOfFile(view);
+    ::CloseHandle(mapping);
+    bridge.disable();
+    endScenario();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DotCharter #696 (ABI v50): every seat's sandboxed chain has its OWN bridge.
+// ---------------------------------------------------------------------------
+//
+// One stub child per seat, each behind its own mapping and events. (A) Seat 1
+// armed alone: its child serves seat-1 requests and seat 0, which has no
+// bridge, makes no trip at all. (B) Seat 0 armed as well: each child sees only
+// its own seat's requests, the MIDI goes to seat 0's child only, and routing
+// two bridges does not allocate. (C) Disarming seat 0 leaves seat 1 processing;
+// (D) re-arming seat 0 over its surviving child and disarming seat 1 leaves
+// seat 0 processing. (E) Statistics are per seat: a wedged seat-1 child times
+// out on seat 1's bridge only. (F) The seat-0 entry points are seat 0's bridge.
+void scenarioSandboxEachSeatOwnsItsBridge()
+{
+    beginScenario("RtSandboxEachSeatOwnsItsBridge");
+#if !defined(_WIN32)
+    note("skipped: the sandbox bridge is Windows-only");
+    endScenario();
+    return;
+#else
+    Fixture fx(48000, 256, 2);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    e.setPlayerCount(2);
+    fx.installInputStimulus();
+
+    struct Names { char shm[128], req[128], resp[128]; };
+    std::array<Names, 2> n{};
+    const unsigned pid = (unsigned) ::GetCurrentProcessId();
+    for (int s = 0; s < 2; ++s)
+    {
+        std::snprintf(n[(size_t) s].shm,  sizeof(n[0].shm),  "dcrtown%d_shm_%u", s, pid);
+        std::snprintf(n[(size_t) s].req,  sizeof(n[0].req),  "dcrtown%d_req_%u", s, pid);
+        std::snprintf(n[(size_t) s].resp, sizeof(n[0].resp), "dcrtown%d_resp_%u", s, pid);
+    }
+    struct Stats { uint32_t processed = 0, timeouts = 0, heartbeat = 0; };
+    auto stats = [&](int seat)
+    {
+        Stats st;
+        e.getRemoteBridgeStats(seat, st.processed, st.timeouts, st.heartbeat);
+        return st;
+    };
+    auto arm = [&](int seat, bool on)
+    {
+        const auto& s = n[(size_t) seat];
+        return on ? e.setRemoteBridge(seat, s.shm, s.req, s.resp, true)
+                  : e.setRemoteBridge(seat, nullptr, nullptr, nullptr, false);
+    };
+    StubBridgeChild c0, c1;
+    auto cleanup = [&]
+    {
+        c0.close();
+        c1.close();
+        arm(0, false);
+        arm(1, false);
+    };
+
+    // --- A: seat 1 armed alone -------------------------------------------------
+    if (! arm(1, true) || ! c1.open(n[1].shm, n[1].req, n[1].resp))
+    { fail("arming seat 1 or attaching its child failed"); cleanup(); endScenario(); return; }
+    c1.setSeatChainMask(0b10u);
+    fx.pumpWarm(kWarmupBlocks);
+    c1.clearSeatLog();
+    const Stats a1Before = stats(1);
+    fx.pumpWarm(64);
+    const Stats a0 = stats(0), a1 = stats(1);
+    note("A (seat 1 alone): seat-1 child got seat 0 x" + std::to_string(c1.seatRequests(0)) + ", seat 1 x"
+         + std::to_string(c1.seatRequests(1)) + "; seat 0 stats " + std::to_string(a0.processed) + "/"
+         + std::to_string(a0.timeouts) + "/" + std::to_string(a0.heartbeat) + ", seat 1 processed "
+         + std::to_string(a1Before.processed) + " -> " + std::to_string(a1.processed));
+    RT_CHECK(c1.seatRequests(1) > 0, "seat 1's child never received a seat-1 request with only seat 1 armed");
+    RT_CHECK(c1.seatRequests(0) == 0, "seat 1's child received " + std::to_string(c1.seatRequests(0))
+                                      + " seat-0 request(s): seat 0 has no bridge and must make no trip");
+    RT_CHECK(a1.processed > a1Before.processed, "seat 1's statistics did not count its answered trips");
+    RT_CHECK(a0.processed == 0 && a0.timeouts == 0 && a0.heartbeat == 0,
+             "seat 0's statistics moved while only seat 1 was armed");
+
+    // --- B: seat 0 armed as well -----------------------------------------------
+    if (! arm(0, true) || ! c0.open(n[0].shm, n[0].req, n[0].resp))
+    { fail("arming seat 0 or attaching its child failed"); cleanup(); endScenario(); return; }
+    fx.pumpWarm(8);
+    c0.clearSeatLog();
+    c1.clearSeatLog();
+    dcrt::reset();
+    dcrt::arm();
+    for (int i = 0; i < 128; ++i)
+    {
+        if (i % 8 == 0) e.sendMidiShort(0x90, (uint8_t) (40 + (i % 40)), 100);
+        fx.pumpArmed(1);
+    }
+    dcrt::disarm();
+    const int allocsB = dcrt::allocCount();
+    note("B (both armed): seat-0 child got seat 0 x" + std::to_string(c0.seatRequests(0)) + " (MIDI "
+         + std::to_string(c0.seatMidiEvents(0)) + "), seat 1 x" + std::to_string(c0.seatRequests(1))
+         + "; seat-1 child got seat 0 x" + std::to_string(c1.seatRequests(0)) + ", seat 1 x"
+         + std::to_string(c1.seatRequests(1)) + " (MIDI " + std::to_string(c1.seatMidiEvents(1)) + ")");
+    RT_CHECK(allocsB == 0, "two armed bridges allocated " + std::to_string(allocsB) + " time(s) on the callback");
+    RT_CHECK(c0.seatRequests(0) > 0, "seat 0's child never received a seat-0 request");
+    RT_CHECK(c0.seatRequests(1) == 0, "seat 0's child received " + std::to_string(c0.seatRequests(1))
+                                      + " seat-1 request(s): seat 1 has a bridge of its own");
+    RT_CHECK(c1.seatRequests(1) > 0, "seat 1's child stopped receiving requests once seat 0 was armed");
+    RT_CHECK(c1.seatRequests(0) == 0, "seat 1's child received " + std::to_string(c1.seatRequests(0))
+                                      + " seat-0 request(s) with seat 0 armed on its own mapping");
+    RT_CHECK(c0.seatMidiEvents(0) > 0, "no MIDI reached seat 0's child: the MIDI check is vacuous");
+    RT_CHECK(c1.seatMidiEvents(1) == 0, "seat 1's child received " + std::to_string(c1.seatMidiEvents(1))
+                                        + " MIDI event(s): the instrument is seat 0's");
+
+    // --- C: disarming seat 0 leaves seat 1 processing --------------------------
+    arm(0, false);
+    c0.clearSeatLog();
+    c1.clearSeatLog();
+    const Stats c1Before = stats(1);
+    fx.pumpWarm(64);
+    note("C (seat 0 disarmed): seat-0 child got " + std::to_string(c0.seatRequests(0)) + ", seat-1 child got "
+         + std::to_string(c1.seatRequests(1)) + "; seat 1 processed " + std::to_string(c1Before.processed)
+         + " -> " + std::to_string(stats(1).processed) + ", seat 0 heartbeat " + std::to_string(stats(0).heartbeat));
+    RT_CHECK(c0.seatRequests(0) == 0, "seat 0's child kept receiving requests after seat 0 was disarmed");
+    RT_CHECK(c1.seatRequests(1) > 0 && stats(1).processed > c1Before.processed,
+             "disarming seat 0 stopped seat 1's bridge");
+    RT_CHECK(stats(0).heartbeat == 0, "a disarmed seat 0 still reads a child heartbeat");
+
+    // --- D: re-arm seat 0 over its surviving child, disarm seat 1 ---------------
+    if (! arm(0, true)) fail("re-arming seat 0 over its surviving child failed");
+    arm(1, false);
+    fx.pumpWarm(8);
+    c0.clearSeatLog();
+    c1.clearSeatLog();
+    const Stats d0Before = stats(0), d1Before = stats(1);
+    fx.pumpWarm(64);
+    note("D (seat 1 disarmed): seat-0 child got " + std::to_string(c0.seatRequests(0)) + ", seat-1 child got "
+         + std::to_string(c1.seatRequests(1)) + "; seat 0 processed " + std::to_string(d0Before.processed)
+         + " -> " + std::to_string(stats(0).processed));
+    RT_CHECK(c0.seatRequests(0) > 0 && stats(0).processed > d0Before.processed,
+             "seat 0 stopped processing when seat 1 was disarmed");
+    RT_CHECK(c1.seatRequests(0) == 0 && c1.seatRequests(1) == 0,
+             "seat 1's child kept receiving requests after seat 1 was disarmed");
+    RT_CHECK(stats(1).processed == d1Before.processed && stats(1).heartbeat == 0,
+             "a disarmed seat 1's statistics kept moving");
+
+    // --- E: statistics per seat: a wedged seat-1 child --------------------------
+    if (! arm(1, true)) fail("re-arming seat 1 over its surviving child failed");
+    fx.pumpWarm(8);
+    c1.setAnswering(false);
+    const Stats e0Before = stats(0), e1Before = stats(1);
+    fx.pumpWarm(16);
+    const Stats e0 = stats(0), e1 = stats(1);
+    c1.setAnswering(true);
+    note("E (seat-1 child wedged, 16 callbacks): seat 0 processed +" + std::to_string(e0.processed - e0Before.processed)
+         + " timeouts +" + std::to_string(e0.timeouts - e0Before.timeouts) + "; seat 1 processed +"
+         + std::to_string(e1.processed - e1Before.processed) + " timeouts +" + std::to_string(e1.timeouts - e1Before.timeouts));
+    RT_CHECK(e1.timeouts > e1Before.timeouts, "the wedged seat-1 child never timed out on seat 1: the check is vacuous");
+    RT_CHECK(e0.timeouts == e0Before.timeouts, "seat 0's bridge counted " + std::to_string(e0.timeouts - e0Before.timeouts)
+                                               + " timeout(s) while only seat 1's child was wedged");
+    RT_CHECK(e0.processed > e0Before.processed, "seat 0 stopped answering while seat 1's child was wedged");
+
+    // --- F: the seat-0 entry points are seat 0's bridge --------------------------
+    uint32_t op = 0, ot = 0, oh = 0;
+    e.getRemoteBridgeStats(op, ot, oh);
+    const Stats f0 = stats(0);
+    RT_CHECK(op == f0.processed && ot == f0.timeouts, "the seat-0 statistics entry point does not read seat 0's bridge");
+    e.setRemoteBridge(nullptr, nullptr, nullptr, false);
+    c0.clearSeatLog();
+    c1.clearSeatLog();
+    fx.pumpWarm(16);
+    RT_CHECK(c0.seatRequests(0) == 0, "the seat-0 disarm entry point left seat 0 armed");
+    RT_CHECK(c1.seatRequests(1) > 0, "the seat-0 disarm entry point disarmed seat 1");
+    if (! e.setRemoteBridge(n[0].shm, n[0].req, n[0].resp, true)) fail("the seat-0 arm entry point failed");
+    c0.clearSeatLog();
+    fx.pumpWarm(16);
+    RT_CHECK(c0.seatRequests(0) > 0, "the seat-0 arm entry point did not arm seat 0");
+
+    cleanup();
+    endScenario();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DotCharter #696: an overloaded seat drops only its own chain.
+// ---------------------------------------------------------------------------
+//
+// One child per seat, every request posted first and all collected against
+// the callback's ONE deadline. Phase A: seat 1's chain costs 1.2 blocks, seat
+// 0's 0.5. Seat 0 is processed in every callback and never counts a miss;
+// seat 1 is dry in every callback and its own bridge goes poll-only after
+// kPollOnlyAfterMissedCallbacks callbacks (the callbacks before it wait out
+// the deadline, the ones after it wait only for seat 0); no callback waits
+// more than one budget in total. Phase B is the mirror: seat 0 overloaded,
+// seat 1 processed. One preempted callback per phase is tolerated for each
+// timing rule; the miss counts are not timing.
+void scenarioSandboxOverloadedSeatDropsOnlyItsOwnChain()
+{
+    beginScenario("RtSandboxOverloadedSeatDropsOnlyItsOwnChain");
+#if !defined(_WIN32)
+    note("skipped: the sandbox bridge is Windows-only");
+    endScenario();
+    return;
+#else
+    Fixture fx(48000, 256, 2);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    fx.engine().setPlayerCount(2);
+    fx.installInputStimulus();
+    SeatBridges sb(fx.engine(), "dcrtover");
+    if (! sb.arm(0) || ! sb.arm(1))
+    { fail("arming a seat's bridge or attaching its stub child failed"); endScenario(); return; }
+    sb.child(1).setSeatChainMask(0b10u);
+    fx.pumpWarm(kWarmupBlocks);
+
+    const long long budget = fx.blockBudgetNs();
+    const long long bound  = budget + budget / 16;
+    const int blockUs = (int) (budget / 1000);
+    constexpr int kCallbacks = 12;
+    const int pollOnlyAt = RemoteVstBridge::kPollOnlyAfterMissedCallbacks;
+
+    for (int slow = 1; slow >= 0; --slow)
+    {
+        const int healthy = 1 - slow;
+        const std::string phase = slow == 1 ? "A (seat 1 overloaded)" : "B (seat 0 overloaded)";
+        if (! sb.arm(0) || ! sb.arm(1)) fail(phase + ": re-arming failed");   // fresh miss counts
+        sb.child(0).setAnswerDelayUs(0);
+        sb.child(1).setAnswerDelayUs(0);
+        fx.pumpWarm(8);
+        sb.child(healthy).setAnswerDelayUs(blockUs / 2);
+        sb.child(slow).setAnswerDelayUs(blockUs * 6 / 5);
+        int healthyDry = 0, healthyMissed = 0, over = 0, shortBeforePollOnly = 0, longAfterPollOnly = 0, allocs = 0;
+        uint32_t slowMissed = 0, slowAnswered = 0;
+        long long worst = 0;
+        for (int i = 0; i < kCallbacks; ++i)
+        {
+            const SeatCallback cb = pumpSeatCallback(fx, sb, 2);
+            if (cb.answered[(size_t) healthy] != 1) ++healthyDry;
+            if (cb.missed[(size_t) healthy] != 0) ++healthyMissed;
+            slowMissed   += cb.missed[(size_t) slow];
+            slowAnswered += cb.answered[(size_t) slow];
+            worst = std::max(worst, cb.waitedNs);
+            if (cb.waitedNs > bound) ++over;
+            // Before poll-only the slow seat holds the collection to the
+            // deadline; after it only the healthy seat's half block is waited.
+            if (i < pollOnlyAt && cb.waitedNs < budget * 9 / 10) ++shortBeforePollOnly;
+            if (i >= pollOnlyAt && cb.waitedNs > budget * 3 / 4) ++longAfterPollOnly;
+            allocs += cb.allocs;
+        }
+        sb.child(0).setAnswerDelayUs(0);
+        sb.child(1).setAnswerDelayUs(0);
+        note(phase + ": healthy seat dry in " + std::to_string(healthyDry) + " and missed in "
+             + std::to_string(healthyMissed) + " of " + std::to_string(kCallbacks) + " callbacks; slow seat missed "
+             + std::to_string(slowMissed) + ", answered " + std::to_string(slowAnswered) + "; callbacks before poll-only "
+             "shorter than the deadline " + std::to_string(shortBeforePollOnly) + ", after it longer than 3/4 block "
+             + std::to_string(longAfterPollOnly) + "; longest wait " + std::to_string(worst) + " ns (budget "
+             + std::to_string(budget) + " ns), " + std::to_string(over) + " over budget + 1/16");
+        RT_CHECK(slowMissed == (uint32_t) kCallbacks && slowAnswered == 0,
+                 phase + ": the overloaded seat missed " + std::to_string(slowMissed) + " of " + std::to_string(kCallbacks)
+                 + " callbacks (want every one, on its own bridge)");
+        RT_CHECK(healthyDry <= 1 && healthyMissed <= 1,
+                 phase + ": the healthy seat was dry in " + std::to_string(healthyDry) + " callbacks and counted "
+                 + std::to_string(healthyMissed) + " misses: another seat's overload reached it");
+        RT_CHECK(over <= 1, phase + ": " + std::to_string(over) + " callbacks waited longer than one block budget "
+                            "in total (longest " + std::to_string(worst) + " ns, budget " + std::to_string(budget) + " ns)");
+        RT_CHECK(shortBeforePollOnly == 0, phase + ": " + std::to_string(shortBeforePollOnly) + " callbacks before poll-only "
+                                           "stopped waiting for the overloaded seat before the deadline");
+        RT_CHECK(longAfterPollOnly <= 1, phase + ": " + std::to_string(longAfterPollOnly) + " callbacks after #"
+                                         + std::to_string(pollOnlyAt) + " still waited for the overloaded seat: "
+                                         "its bridge never went poll-only");
+        RT_CHECK(allocs == 0, phase + ": the collection allocated " + std::to_string(allocs) + " time(s)");
+    }
+
+    sb.close();
+    endScenario();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DotCharter #696: a wedged child puts only its own seat in poll-only, and an
+// answered poll brings it back.
+// ---------------------------------------------------------------------------
+//
+// Seat 0's child answers in half a block, seat 1's never answers. Seat 0 is
+// processed in every callback; seat 1 misses every callback, its bridge goes
+// poll-only after kPollOnlyAfterMissedCallbacks and seat 0's never does; no
+// callback waits more than one budget. Then seat 1's child answers again
+// (at once): its poll, still posted every callback and checked while the
+// collection waits for seat 0, is answered, and seat 1 is processed again
+// within a few callbacks instead of waiting for the periodic full wait.
+void scenarioSandboxWedgedChildPutsOnlyItsSeatInPollOnly()
+{
+    beginScenario("RtSandboxWedgedChildPutsOnlyItsSeatInPollOnly");
+#if !defined(_WIN32)
+    note("skipped: the sandbox bridge is Windows-only");
+    endScenario();
+    return;
+#else
+    Fixture fx(48000, 256, 2);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    fx.engine().setPlayerCount(2);
+    fx.installInputStimulus();
+    SeatBridges sb(fx.engine(), "dcrtwedge");
+    if (! sb.arm(0) || ! sb.arm(1))
+    { fail("arming a seat's bridge or attaching its stub child failed"); endScenario(); return; }
+    auto& c0 = sb.child(0);
+    auto& c1 = sb.child(1);
+    c1.setSeatChainMask(0b10u);
+    fx.pumpWarm(kWarmupBlocks);
+
+    const long long budget = fx.blockBudgetNs();
+    const long long bound  = budget + budget / 16;
+    const int blockUs = (int) (budget / 1000);
+    const int pollOnlyAt = RemoteVstBridge::kPollOnlyAfterMissedCallbacks;
+
+    // --- A: seat 1's child wedged ----------------------------------------------
+    c0.setAnswerDelayUs(blockUs / 2);
+    c1.setAnswering(false);
+    constexpr int kCallbacksA = 16;
+    int seat0Dry = 0, over = 0, longAfterPollOnly = 0, allocs = 0;
+    uint32_t seat0Missed = 0, seat1Missed = 0, worstPosts1 = 0;
+    long long worst = 0;
+    for (int i = 0; i < kCallbacksA; ++i)
+    {
+        const SeatCallback cb = pumpSeatCallback(fx, sb, 2);
+        if (cb.answered[0] != 1) ++seat0Dry;
+        seat0Missed += cb.missed[0];
+        seat1Missed += cb.missed[1];
+        worstPosts1 = std::max(worstPosts1, cb.posts[1]);
+        worst = std::max(worst, cb.waitedNs);
+        if (cb.waitedNs > bound) ++over;
+        if (i >= pollOnlyAt && cb.waitedNs > budget * 3 / 4) ++longAfterPollOnly;
+        allocs += cb.allocs;
+    }
+    note("A (seat 1 wedged, seat 0 0.5 blocks): seat 0 dry " + std::to_string(seat0Dry) + ", missed "
+         + std::to_string(seat0Missed) + "; seat 1 missed " + std::to_string(seat1Missed) + " of "
+         + std::to_string(kCallbacksA) + ", at most " + std::to_string(worstPosts1) + " post(s) per callback; "
+         + std::to_string(longAfterPollOnly) + " callback(s) after #" + std::to_string(pollOnlyAt)
+         + " still waiting for seat 1; longest wait " + std::to_string(worst) + " ns (budget " + std::to_string(budget)
+         + " ns), " + std::to_string(over) + " over budget + 1/16");
+    RT_CHECK(seat1Missed == (uint32_t) kCallbacksA, "the wedged seat missed " + std::to_string(seat1Missed) + " of "
+                                                    + std::to_string(kCallbacksA) + " callbacks");
+    RT_CHECK(worstPosts1 == 1, "a poll-only seat must still post its request every callback (saw at most "
+                               + std::to_string(worstPosts1) + ")");
+    RT_CHECK(seat0Dry <= 1 && seat0Missed <= 1, "seat 0 was dry in " + std::to_string(seat0Dry) + " callbacks and missed "
+                                                + std::to_string(seat0Missed) + ": seat 1's wedged child reached it");
+    RT_CHECK(longAfterPollOnly <= 1, std::to_string(longAfterPollOnly) + " callbacks after #" + std::to_string(pollOnlyAt)
+                                     + " still waited for the wedged seat: its bridge never went poll-only");
+    RT_CHECK(over <= 1, std::to_string(over) + " callbacks waited longer than one block budget in total (longest "
+                        + std::to_string(worst) + " ns, budget " + std::to_string(budget) + " ns)");
+    RT_CHECK(allocs == 0, "a poll-only seat beside a waiting one allocated " + std::to_string(allocs) + " time(s)");
+
+    // --- B: seat 1's child answers again ---------------------------------------
+    c1.setAnswering(true);
+    constexpr int kCallbacksB = 8;
+    uint32_t seat1AnsweredB = 0;
+    int firstAnswered = -1;
+    for (int i = 0; i < kCallbacksB; ++i)
+    {
+        const SeatCallback cb = pumpSeatCallback(fx, sb, 2);
+        seat1AnsweredB += cb.answered[1];
+        if (cb.answered[1] == 1 && firstAnswered < 0) firstAnswered = i;
+    }
+    c0.setAnswerDelayUs(0);
+    note("B (seat 1 answers again): seat 1 answered " + std::to_string(seat1AnsweredB) + " of "
+         + std::to_string(kCallbacksB) + " callbacks, first at #" + std::to_string(firstAnswered));
+    RT_CHECK(seat1AnsweredB >= (uint32_t) kCallbacksB - 2,
+             "seat 1 answered only " + std::to_string(seat1AnsweredB) + " of " + std::to_string(kCallbacksB)
+             + " callbacks after its child recovered: an answered poll must end its poll-only stretch");
+
+    sb.close();
+    endScenario();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DotCharter #696: the instrument on a healthy seat 0 keeps sounding while
+// seat 1 is overloaded.
+// ---------------------------------------------------------------------------
+//
+// An input-less device: seat 1 plays a take through its own child, whose
+// chain costs 1.2 blocks; the sandboxed instrument's zero-input trip runs on
+// seat 0's child at half a block. The monitor is off, so the device output is
+// the instrument alone. In every callback (one tolerated) the instrument's
+// trip is answered and the output carries it, seat 1 misses on its own
+// bridge, and the callback waits at most one budget.
+void scenarioSandboxInstrumentOnAHealthySeatKeepsSounding()
+{
+    beginScenario("RtSandboxInstrumentOnAHealthySeatKeepsSounding");
+#if !defined(_WIN32)
+    note("skipped: the sandbox bridge is Windows-only");
+    endScenario();
+    return;
+#else
+    Fixture fx(48000, 256, 0);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    e.setPlayerCount(2);
+    std::vector<float> take(4800);
+    for (size_t i = 0; i < take.size(); ++i)
+        take[i] = 0.25f * (float) std::sin(2.0 * 3.14159265358979323846 * 1000.0 * (double) i / 48000.0);
+    if (! e.setInputInjection(1, take.data(), (int64_t) take.size(), true) || ! e.setInputInjectionPlaying(1, true))
+    { fail("seat 1 refused its take"); endScenario(); return; }
+    SeatBridges sb(e, "dcrtsound");
+    if (! sb.arm(0) || ! sb.arm(1))
+    { fail("arming a seat's bridge or attaching its stub child failed"); endScenario(); return; }
+    sb.child(1).setSeatChainMask(0b10u);
+    fx.pumpWarm(kWarmupBlocks);
+
+    const long long budget = fx.blockBudgetNs();
+    const long long bound  = budget + budget / 16;
+    const int blockUs = (int) (budget / 1000);
+    sb.child(0).setAnswerDelayUs(blockUs / 2);
+    sb.child(1).setAnswerDelayUs(blockUs * 6 / 5);
+    constexpr int kCallbacks = 16;
+    int silent = 0, unanswered = 0, over = 0, allocs = 0;
+    uint32_t seat1Missed = 0;
+    long long worst = 0;
+    for (int i = 0; i < kCallbacks; ++i)
+    {
+        const SeatCallback cb = pumpSeatCallback(fx, sb, 2);
+        if (cb.answered[0] != 1) ++unanswered;
+        if (fx.lastOutputPeak() <= 0.0f) ++silent;
+        seat1Missed += cb.missed[1];
+        worst = std::max(worst, cb.waitedNs);
+        if (cb.waitedNs > bound) ++over;
+        allocs += cb.allocs;
+    }
+    sb.child(0).setAnswerDelayUs(0);
+    sb.child(1).setAnswerDelayUs(0);
+    note("instrument at 0.5 blocks beside seat 1 at 1.2: instrument unanswered in " + std::to_string(unanswered)
+         + " and the output silent in " + std::to_string(silent) + " of " + std::to_string(kCallbacks)
+         + " callbacks; seat 1 missed " + std::to_string(seat1Missed) + "; longest wait " + std::to_string(worst)
+         + " ns (budget " + std::to_string(budget) + " ns), " + std::to_string(over) + " over budget + 1/16");
+    RT_CHECK(seat1Missed == (uint32_t) kCallbacks, "the overloaded seat 1 missed " + std::to_string(seat1Missed) + " of "
+                                                   + std::to_string(kCallbacks) + " callbacks: the probe is vacuous");
+    RT_CHECK(unanswered <= 1 && silent <= 1, "the sandboxed instrument on healthy seat 0 was unanswered in "
+                                             + std::to_string(unanswered) + " and silent in " + std::to_string(silent)
+                                             + " callbacks while seat 1 was overloaded");
+    RT_CHECK(over <= 1, std::to_string(over) + " callbacks waited longer than one block budget in total (longest "
+                        + std::to_string(worst) + " ns, budget " + std::to_string(budget) + " ns)");
+    RT_CHECK(allocs == 0, "the instrument's trip beside an overloaded seat allocated " + std::to_string(allocs) + " time(s)");
+
+    sb.close();
+    endScenario();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DotCharter #696: four armed seats wait at most one budget in total.
+// ---------------------------------------------------------------------------
+//
+// Four seats, four children, every seat with a chain. Phase A: each chain
+// costs 0.4 of a block (1.6 blocks in turn): all four are processed in the
+// same callback inside one budget. Phase B: all four children wedged: each
+// child sees at most one request per callback, every seat counts its own
+// miss, and no callback waits more than one budget. One preempted callback
+// per phase is tolerated.
+void scenarioSandboxFourSeatsWaitAtMostOneBudget()
+{
+    beginScenario("RtSandboxFourSeatsWaitAtMostOneBudget");
+#if !defined(_WIN32)
+    note("skipped: the sandbox bridge is Windows-only");
+    endScenario();
+    return;
+#else
+    constexpr int kSeats = 4;
+    Fixture fx(48000, 256, kSeats);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    fx.engine().setPlayerCount(kSeats);
+    fx.installInputStimulus();
+    SeatBridges sb(fx.engine(), "dcrtfour");
+    for (int s = 0; s < kSeats; ++s)
+    {
+        if (! sb.arm(s)) { fail("arming seat " + std::to_string(s) + " failed"); endScenario(); return; }
+        sb.child(s).setSeatChainMask(1u << (uint32_t) s);
+    }
+    fx.pumpWarm(kWarmupBlocks);
+
+    const long long budget = fx.blockBudgetNs();
+    const long long bound  = budget + budget / 16;
+    const int blockUs = (int) (budget / 1000);
+
+    // --- A: every chain at 0.4 of a block -------------------------------------
+    constexpr int kSamplesA = 8;
+    int badA = 0, allocs = 0;
+    long long worstA = 0;
+    std::string firstBadA;
+    for (int k = 0; k < kSamplesA; ++k)
+    {
+        for (int s = 0; s < kSeats; ++s) sb.child(s).setAnswerDelayUs(0);
+        fx.pumpWarm(2);
+        for (int s = 0; s < kSeats; ++s) sb.child(s).setAnswerDelayUs(blockUs * 2 / 5);
+        const SeatCallback cb = pumpSeatCallback(fx, sb, kSeats);
+        allocs += cb.allocs;
+        worstA = std::max(worstA, cb.waitedNs);
+        int answered = 0;
+        for (int s = 0; s < kSeats; ++s) answered += (int) cb.answered[(size_t) s];
+        const bool ok = answered == kSeats && cb.waitedNs <= bound;
+        if (! ok && ++badA == 1)
+            firstBadA = std::to_string(answered) + " of " + std::to_string(kSeats) + " seats answered, "
+                      + std::to_string(cb.waits) + " wait(s) summing " + std::to_string(cb.waitedNs) + " ns";
+    }
+    for (int s = 0; s < kSeats; ++s) sb.child(s).setAnswerDelayUs(0);
+    note("A (four chains at 0.4 blocks): " + std::to_string(badA) + " of " + std::to_string(kSamplesA)
+         + " callbacks off the rule (first: " + (firstBadA.empty() ? std::string("none") : firstBadA)
+         + "); longest wait " + std::to_string(worstA) + " ns (budget " + std::to_string(budget) + " ns)");
+    RT_CHECK(badA <= 1, std::to_string(badA) + " of " + std::to_string(kSamplesA) + " callbacks broke the rule "
+                        "(all four seats processed, the callback waits at most one block budget); first: " + firstBadA);
+
+    // --- B: all four children wedged ------------------------------------------
+    for (int s = 0; s < kSeats; ++s) sb.child(s).setAnswering(false);
+    constexpr int kCallbacksB = 16;
+    int overB = 0;
+    uint32_t worstPosts = 0;
+    std::array<uint32_t, kSeats> missed{};
+    long long worstB = 0;
+    for (int i = 0; i < kCallbacksB; ++i)
+    {
+        const SeatCallback cb = pumpSeatCallback(fx, sb, kSeats);
+        allocs += cb.allocs;
+        for (int s = 0; s < kSeats; ++s)
+        {
+            worstPosts = std::max(worstPosts, cb.posts[(size_t) s]);
+            missed[(size_t) s] += cb.missed[(size_t) s];
+        }
+        worstB = std::max(worstB, cb.waitedNs);
+        if (cb.waitedNs > bound) ++overB;
+    }
+    for (int s = 0; s < kSeats; ++s) sb.child(s).setAnswering(true);
+    note("B (four children wedged): misses " + std::to_string(missed[0]) + "/" + std::to_string(missed[1]) + "/"
+         + std::to_string(missed[2]) + "/" + std::to_string(missed[3]) + " over " + std::to_string(kCallbacksB)
+         + ", at most " + std::to_string(worstPosts) + " request(s) per child per callback; longest wait "
+         + std::to_string(worstB) + " ns (budget " + std::to_string(budget) + " ns), " + std::to_string(overB)
+         + " over budget + 1/16");
+    for (int s = 0; s < kSeats; ++s)
+        RT_CHECK(missed[(size_t) s] == (uint32_t) kCallbacksB,
+                 "wedged seat " + std::to_string(s) + " missed " + std::to_string(missed[(size_t) s]) + " of "
+                 + std::to_string(kCallbacksB) + " callbacks on its own bridge");
+    RT_CHECK(worstPosts <= 1, "a child saw " + std::to_string(worstPosts) + " requests in one callback");
+    RT_CHECK(overB <= 1, std::to_string(overB) + " callbacks waited longer than one block budget in total (longest "
+                         + std::to_string(worstB) + " ns, budget " + std::to_string(budget) + " ns)");
+    RT_CHECK(allocs == 0, "four armed bridges allocated " + std::to_string(allocs) + " time(s) on the callback");
+
+    sb.close();
+    endScenario();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DotCharter #696: DCA_DSP_SIDECHAIN_SONG is the song only, in BOTH seat paths.
+// ---------------------------------------------------------------------------
+//
+// Two seats, a silent song. Seat 0 monitors its input (loud or silent); seat 1
+// runs a gate keyed on the song mix. Seat 1's contribution to the output is the
+// output with seat 1 heard minus the same run with seat 1's monitor at zero,
+// and it must be the same, sample for sample, whatever seat 0 plays: seat 0's
+// monitor is not part of the song. Checked with no bridge armed and with a
+// bridge armed on seat 3, which no seat here uses. Each run is a fresh engine
+// pumped the same number of blocks, so the runs differ only in what the case
+// changes. A last phase per path plays a LOUD song with seat 0 silent: seat 1's
+// contribution must then be clearly above its silent-song value, so the key
+// reaching the gate is the live song and not silence.
+namespace songkey {
+
+std::vector<float> runOnce(bool seat0Loud, bool seat1Heard, bool armOtherSeat, std::string& error,
+                           bool songLoud = false)
+{
+    Fixture fx(48000, 256, 2);
+    if (! fx.ok()) { error = "engine did not start: " + fx.error(); return {}; }
+    auto& e = fx.engine();
+    e.setPlayerCount(2);
+    e.setMasterGain(1.0f);
+    e.setInputGain(1.0f);
+    e.setMonitorGain(1.0f);
+    e.setPlayerInputChannel(0, 0);
+    e.setPlayerInputChannel(1, 1);
+    e.setPlayerMonitorGain(0, 1.0f);
+    e.setPlayerMonitorGain(1, seat1Heard ? 1.0f : 0.0f);
+
+    const int gate = e.dspAddNode(1, "gate");
+    if (gate < 0 || ! e.dspSetNodeSidechain(gate, 2))
+    { error = "could not build seat 1's song-keyed gate"; return {}; }
+    e.dspSetParam(gate, "thresholdDb", -30.0f);
+    e.dspSetParam(gate, "ratio", 50.0f);
+    e.dspSetParam(gate, "attackMs", 0.1f);
+    e.dspSetParam(gate, "holdMs", 0.0f);
+    e.dspSetParam(gate, "releaseMs", 5.0f);
+
+    // Whole cycles per 256-frame block, so every block is the same.
+    auto* dev = nulldev::manualDevice();
+    auto& in  = dev->manualInputBuffers();
+    if (in.size() < 2) { error = "the null device has fewer than two inputs"; return {}; }
+    for (size_t i = 0; i < in[0].size(); ++i)
+    {
+        const double t = (double) i / 48000.0;
+        in[0][i] = seat0Loud ? 0.5f * (float) std::sin(2.0 * 3.14159265358979323846 * 187.5 * t) : 0.0f;
+        in[1][i] = 0.25f * (float) std::sin(2.0 * 3.14159265358979323846 * 375.0 * t);
+    }
+
+    // The song stays silent unless the case asks for it; it is opened before
+    // the first block so the whole run sees the same song.
+    std::unique_ptr<TransportSource> song;
+    juce::MemoryBlock songBlob;
+    if (songLoud)
+    {
+        songBlob = makeWavBlob(6.0, 48000, 220.0);
+        song = std::make_unique<TransportSource>(e);
+        if (songBlob.getSize() == 0 || song->openMemory(songBlob.getData(), songBlob.getSize(), "wav").isNotEmpty())
+        { error = "could not open the loud song"; return {}; }
+        song->setVolume(1.0f);
+        song->play();
+    }
+
+    char shm[96], req[96], resp[96];
+    if (armOtherSeat)
+    {
+        const unsigned pid = (unsigned) ::GetCurrentProcessId();
+        std::snprintf(shm,  sizeof(shm),  "dcrtsongkey_shm_%u", pid);
+        std::snprintf(req,  sizeof(req),  "dcrtsongkey_req_%u", pid);
+        std::snprintf(resp, sizeof(resp), "dcrtsongkey_resp_%u", pid);
+        if (! e.setRemoteBridge(3, shm, req, resp, true)) { error = "arming seat 3's bridge failed"; return {}; }
+    }
+
+    fx.pumpWarm(kWarmupBlocks);
+
+    std::vector<float> out;
+    for (const auto& ch : dev->manualOutputBuffers()) out.insert(out.end(), ch.begin(), ch.end());
+    if (armOtherSeat) e.setRemoteBridge(3, nullptr, nullptr, nullptr, false);
+    return out;
+}
+
+} // namespace songkey
+
+void scenarioSongKeyIsTheSongOnlyInBothSeatPaths()
+{
+    beginScenario("RtSongKeyIsTheSongOnlyInBothSeatPaths");
+#if !defined(_WIN32)
+    note("skipped: the armed path needs the Windows-only sandbox bridge");
+    endScenario();
+    return;
+#else
+    for (const bool armed : { false, true })
+    {
+        const std::string path = armed ? "a bridge armed on seat 3" : "no bridge armed";
+        std::string err;
+        const auto loudHeard   = songkey::runOnce(true,  true,  armed, err);
+        const auto loudMuted   = songkey::runOnce(true,  false, armed, err);
+        const auto silentHeard = songkey::runOnce(false, true,  armed, err);
+        const auto silentMuted = songkey::runOnce(false, false, armed, err);
+        if (! err.empty()) { fail(path + ": " + err); continue; }
+        const size_t n = loudHeard.size();
+        if (n == 0 || loudMuted.size() != n || silentHeard.size() != n || silentMuted.size() != n)
+        { fail(path + ": the runs rendered different output sizes"); continue; }
+
+        float maxDiff = 0.0f, seat1Loud = 0.0f, seat1Silent = 0.0f;
+        size_t worst = 0;
+        for (size_t i = 0; i < n; ++i)
+        {
+            const float withLoud   = loudHeard[i]   - loudMuted[i];
+            const float withSilent = silentHeard[i] - silentMuted[i];
+            seat1Loud   = std::max(seat1Loud,   std::abs(withLoud));
+            seat1Silent = std::max(seat1Silent, std::abs(withSilent));
+            const float d = std::abs(withLoud - withSilent);
+            if (d > maxDiff) { maxDiff = d; worst = i; }
+        }
+        note(path + ": seat 1's contribution peaks at " + std::to_string(seat1Loud)
+             + " with seat 0 loud and " + std::to_string(seat1Silent) + " with seat 0 silent; largest difference "
+             + std::to_string(maxDiff) + " at sample " + std::to_string(worst));
+        // Float rounding of (a + b) - a only; a gate that opened on seat 0's
+        // monitor moves seat 1's output by its whole level.
+        RT_CHECK(maxDiff <= 1.0e-6f,
+                 path + ": seat 1's song-keyed gate heard seat 0's monitor (seat 1's output moved by "
+                 + std::to_string(maxDiff) + " at sample " + std::to_string(worst) + ")");
+
+        // The key is live: a loud song opens seat 1's gate. Seat 1's input
+        // peaks at 0.25, so an open gate passes most of it; a gate keyed from
+        // silence stays at the silent-song value above.
+        std::string songErr;
+        const auto songHeard = songkey::runOnce(false, true,  armed, songErr, true);
+        const auto songMuted = songkey::runOnce(false, false, armed, songErr, true);
+        if (! songErr.empty()) { fail(path + ": " + songErr); continue; }
+        if (songHeard.size() != n || songMuted.size() != n)
+        { fail(path + ": the loud-song runs rendered different output sizes"); continue; }
+        float seat1Song = 0.0f;
+        for (size_t i = 0; i < n; ++i)
+            seat1Song = std::max(seat1Song, std::abs(songHeard[i] - songMuted[i]));
+        note(path + ": with a loud song seat 1's contribution peaks at " + std::to_string(seat1Song)
+             + " (silent song " + std::to_string(seat1Silent) + ")");
+        RT_CHECK(seat1Song >= 0.1f && seat1Song >= 10.0f * seat1Silent + 1.0e-6f,
+                 path + ": a loud song did not open seat 1's song-keyed gate (peak " + std::to_string(seat1Song)
+                 + ", silent song " + std::to_string(seat1Silent) + ")");
+    }
+    endScenario();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DotCharter #696: arming a seat's bridge prepares the mapping OUTSIDE the
+// audio barrier.
+// ---------------------------------------------------------------------------
+//
+// Creating the mapping and clearing it (about 198 KB) runs before the engine
+// takes remoteBridgeMutex_; the barrier is taken only to swap the prepared
+// bridge in. The prepared-seam fires once the mapping is created, cleared or
+// validated, and stamped; a helper thread then try-locks the barrier, which
+// must be free. Seat 1 is armed, re-armed over itself and disarmed while seat
+// 0, armed with a stub child, keeps running callbacks: every callback settles
+// seat 0's request (answered or missed), so no arm on seat 1 cost seat 0 one.
+void scenarioSandboxArmPreparesOutsideTheBarrier()
+{
+    beginScenario("RtSandboxArmPreparesTheMappingOutsideTheBarrier");
+#if !defined(_WIN32)
+    note("skipped: the sandbox bridge is Windows-only");
+    endScenario();
+    return;
+#else
+    Fixture fx(48000, 256, 2);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    e.setPlayerCount(2);
+    fx.installInputStimulus();
+
+    struct Names { char shm[128], req[128], resp[128]; };
+    std::array<Names, 2> n{};
+    const unsigned pid = (unsigned) ::GetCurrentProcessId();
+    for (int s = 0; s < 2; ++s)
+    {
+        std::snprintf(n[(size_t) s].shm,  sizeof(n[0].shm),  "dcrtprep%d_shm_%u", s, pid);
+        std::snprintf(n[(size_t) s].req,  sizeof(n[0].req),  "dcrtprep%d_req_%u", s, pid);
+        std::snprintf(n[(size_t) s].resp, sizeof(n[0].resp), "dcrtprep%d_resp_%u", s, pid);
+    }
+    auto arm = [&](int seat, bool on)
+    {
+        const auto& s = n[(size_t) seat];
+        return on ? e.setRemoteBridge(seat, s.shm, s.req, s.resp, true)
+                  : e.setRemoteBridge(seat, nullptr, nullptr, nullptr, false);
+    };
+    auto settled = [&]
+    {
+        uint32_t processed = 0, timeouts = 0, heartbeat = 0;
+        e.getRemoteBridgeStats(0, processed, timeouts, heartbeat);
+        return (long long) processed + (long long) timeouts;
+    };
+
+    struct Probe { AudioEngine* engine = nullptr; int calls = 0; int barrierHeld = 0; };
+    Probe probe;
+    probe.engine = &e;
+
+    StubBridgeChild c0;
+    if (! arm(0, true) || ! c0.open(n[0].shm, n[0].req, n[0].resp))
+    { fail("arming seat 0 or attaching its child failed"); c0.close(); arm(0, false); endScenario(); return; }
+    fx.pumpWarm(kWarmupBlocks);
+
+    e.setBridgePreparedSeamForTest(1, [](void* user)
+    {
+        auto* p = static_cast<Probe*>(user);
+        ++p->calls;
+        bool free = false;
+        std::thread t([&] { free = p->engine->bridgeBarrierFreeForTest(); });
+        t.join();
+        if (! free) ++p->barrierHeld;
+    }, &probe);
+
+    constexpr int kRounds = 24, kBlocksPerRound = 4;
+    int arms = 0, armFailures = 0, unsettledRounds = 0;
+    for (int i = 0; i < kRounds; ++i)
+    {
+        // Arm, re-arm over the armed bridge, disarm: both the fresh-mapping
+        // (cleared) and the surviving-mapping (validated) preparations run.
+        if (i % 3 == 2) arm(1, false);
+        else if (arm(1, true)) ++arms;
+        else ++armFailures;
+        const long long before = settled();
+        fx.pumpWarm(kBlocksPerRound);
+        if (settled() - before != kBlocksPerRound) ++unsettledRounds;
+    }
+    e.setBridgePreparedSeamForTest(1, nullptr, nullptr);
+
+    note("seat 1 armed " + std::to_string(arms) + " time(s) (" + std::to_string(armFailures) + " refused); seam ran "
+         + std::to_string(probe.calls) + " time(s), barrier held in " + std::to_string(probe.barrierHeld)
+         + "; rounds where seat 0 did not settle every callback: " + std::to_string(unsettledRounds));
+    RT_CHECK(armFailures == 0 && arms > 0, "arming seat 1 was refused " + std::to_string(armFailures) + " time(s)");
+    RT_CHECK(probe.calls == arms,
+             "the prepared-seam ran " + std::to_string(probe.calls) + " time(s) for " + std::to_string(arms)
+             + " arm(s): the check is vacuous");
+    RT_CHECK(probe.barrierHeld == 0,
+             "the audio barrier was held while seat 1's mapping was created and cleared ("
+             + std::to_string(probe.barrierHeld) + " of " + std::to_string(probe.calls)
+             + " arm(s)): every other seat's post and collect waited for it");
+    RT_CHECK(unsettledRounds == 0,
+             "seat 0 did not settle a request in every callback in " + std::to_string(unsettledRounds)
+             + " round(s) while seat 1 was being armed");
+
+    c0.close();
+    arm(1, false);
+    arm(0, false);
+    endScenario();
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Plugin attach transactions and the seqlock clocks (JuceSharp #22)
+// ---------------------------------------------------------------------------
+
+/// A HOSTED PLUGIN THAT THROWS INSIDE A MESSAGE-THREAD CALL.
+///
+/// Every attach runs the plugin's prepareToPlay inside JuceHost::callSync, i.e.
+/// on the JUCE message thread, while the export's guard() waits on the CALLING
+/// thread. An exception that unwinds out of the trampoline lands in the message
+/// thread's dispatch loop, which nothing on the caller's side can catch. In this
+/// exe the main thread IS the message thread, so the export path runs inline and
+/// never crosses threads; the trampoline is therefore driven directly, with a
+/// worker thread standing in for the message thread. The worker's own catch-all
+/// is the stand-in for "escaped into the dispatch loop".
+void scenarioSyncCallRethrowsOnTheCaller()
+{
+    beginScenario("RtSyncCallRethrowsAPluginExceptionOnTheCaller");
+    struct PrepareFault {};
+
+    bool escaped = false;
+    auto onWorker = [&](dcsync::Trampoline trampoline, void* user)
+    {
+        std::thread worker([&]
+        {
+            try { trampoline(user); }
+            catch (...) { escaped = true; }
+        });
+        worker.join();
+    };
+
+    // void body that throws: the caller gets THE SAME exception type.
+    bool caughtVoid = false;
+    try { dcsync::callThroughTrampoline([] { throw PrepareFault{}; }, onWorker); }
+    catch (const PrepareFault&) { caughtVoid = true; }
+    catch (...) {}
+    RT_CHECK(! escaped, "a void body's exception unwound out of the trampoline on the other thread");
+    RT_CHECK(caughtVoid, "a void body's exception did not reach the caller");
+
+    // value body that throws.
+    escaped = false;
+    bool caughtValue = false;
+    try { (void) dcsync::callThroughTrampoline([]() -> int { throw PrepareFault{}; }, onWorker); }
+    catch (const PrepareFault&) { caughtValue = true; }
+    catch (...) {}
+    RT_CHECK(! escaped, "a value body's exception unwound out of the trampoline on the other thread");
+    RT_CHECK(caughtValue, "a value body's exception did not reach the caller");
+
+    // The ordinary paths still return what the body did, on the other thread.
+    escaped = false;
+    const auto caller = std::this_thread::get_id();
+    std::thread::id ranOn{};
+    const int v = dcsync::callThroughTrampoline([&] { ranOn = std::this_thread::get_id(); return 42; }, onWorker);
+    RT_CHECK(v == 42, "a value body returned " + std::to_string(v) + ", not 42");
+    RT_CHECK(ranOn != caller && ranOn != std::thread::id{}, "the body did not run on the posted thread");
+    int sideEffect = 0;
+    dcsync::callThroughTrampoline([&] { sideEffect = 7; }, onWorker);
+    RT_CHECK(sideEffect == 7 && ! escaped, "a void body did not run");
+    endScenario();
+}
+
+/// The C ABI's plugin handle around a heap stub, plus a dca engine on the
+/// manual-pump null device — the export layer the Fixture above bypasses.
+struct AbiPluginFixture
+{
+    dca_engine_t engine = nullptr;
+
+    AbiPluginFixture()
+    {
+        setEnv(nulldev::kEnvVar, "1");
+        setEnv(nulldev::kManualEnvVar, "1");
+        dca_engine_config cfg{};
+        cfg.sample_rate     = 48000;
+        cfg.buffer_frames   = 256;
+        cfg.output_channels = 2;
+        cfg.input_channels  = 2;
+        std::strncpy(cfg.output_type_name, nulldev::kTypeName, sizeof(cfg.output_type_name) - 1);
+        if (dca_engine_create(&cfg, &engine) != DCA_OK) engine = nullptr;
+    }
+    ~AbiPluginFixture()
+    {
+        if (engine != nullptr) dca_engine_destroy(engine);
+        setEnv(nulldev::kManualEnvVar, nullptr);
+        setEnv(nulldev::kEnvVar, nullptr);
+    }
+    bool ok() const { return engine != nullptr && nulldev::manualDevice() != nullptr; }
+
+    /// The stub stays owned by the handle; the raw pointer is for observing it.
+    dca_plugin_t adopt(StubThrowingInputPlugin*& observe)
+    {
+        auto stub = std::make_unique<StubThrowingInputPlugin>();
+        observe = stub.get();
+        return dca_rtcheck::adoptPluginForTest(engine, std::move(stub));
+    }
+
+    static void pump(int blocks)
+    {
+        for (int i = 0; i < blocks; ++i)
+        {
+            dcrt::ScopedRtThread rt;
+            nulldev::pump(1);
+        }
+    }
+};
+
+/// ONE ROLE PER INSTANCE. Attach-to-input then attach-to-instrument (and back)
+/// on the SAME plugin handle must MOVE it: the instance leaves the role it had
+/// before the new role prepares it. Left in both, it is processed twice per
+/// callback (once in the seat's input chain, once on the instrument bus), and
+/// the second role's prepareToPlay re-lays-out its buses while the first role's
+/// processBlock can still be running it.
+void scenarioPluginAttachMovesBetweenRoles()
+{
+    beginScenario("RtPluginAttachMovesTheInstanceBetweenRoles");
+    AbiPluginFixture fx;
+    if (! fx.ok()) { fail("dca_engine_create on the manual null device failed"); endScenario(); return; }
+    StubThrowingInputPlugin* stub = nullptr;
+    dca_plugin_t plugin = fx.adopt(stub);
+    if (plugin == nullptr) { fail("adoptPluginForTest refused the stub"); endScenario(); return; }
+
+    constexpr int kBlocks = 8;
+    RT_CHECK(dca_plugin_attach_to_input(plugin) == DCA_OK, "attach_to_input failed");
+    int before = stub->blocksRun();
+    AbiPluginFixture::pump(kBlocks);
+    const int asInput = stub->blocksRun() - before;
+    note("input role: " + std::to_string(asInput) + " processBlock calls in " + std::to_string(kBlocks) + " blocks");
+    RT_CHECK(asInput == kBlocks, "the input role ran " + std::to_string(asInput) + " times in "
+             + std::to_string(kBlocks) + " blocks — the setup does not exercise the input chain");
+
+    RT_CHECK(dca_plugin_attach_to_instrument(plugin) == DCA_OK, "attach_to_instrument failed");
+    RT_CHECK(dca_plugin_get_input_player(plugin) == -1,
+             "input -> instrument: the plugin still reports input seat "
+             + std::to_string(dca_plugin_get_input_player(plugin)));
+    before = stub->blocksRun();
+    AbiPluginFixture::pump(kBlocks);
+    const int asInstrument = stub->blocksRun() - before;
+    note("input -> instrument: " + std::to_string(asInstrument) + " calls in " + std::to_string(kBlocks) + " blocks");
+    RT_CHECK(asInstrument == kBlocks, "input -> instrument: the instance ran " + std::to_string(asInstrument)
+             + " times in " + std::to_string(kBlocks) + " blocks (it is still in the input chain too)");
+
+    RT_CHECK(dca_plugin_attach_to_input(plugin) == DCA_OK, "attach_to_input (back) failed");
+    RT_CHECK(dca_plugin_get_input_player(plugin) == 0, "instrument -> input: input seat is not 0");
+    before = stub->blocksRun();
+    AbiPluginFixture::pump(kBlocks);
+    const int backToInput = stub->blocksRun() - before;
+    note("instrument -> input: " + std::to_string(backToInput) + " calls in " + std::to_string(kBlocks) + " blocks");
+    RT_CHECK(backToInput == kBlocks, "instrument -> input: the instance ran " + std::to_string(backToInput)
+             + " times in " + std::to_string(kBlocks) + " blocks (it is still on the instrument bus too)");
+
+    dca_plugin_unload(plugin);
+    endScenario();
+}
+
+/// THE SLOT, NOT THE FLAG. Attach A, attach B (which replaces A in the single
+/// instrument slot), attach A again: A must be back in the slot. A per-plugin
+/// "attached as instrument" flag that B's attach never cleared made A's second
+/// attach an early-return success while B kept playing.
+void scenarioInstrumentReattachTakesTheSlotBack()
+{
+    beginScenario("RtInstrumentReattachTakesTheSlotBack");
+    AbiPluginFixture fx;
+    if (! fx.ok()) { fail("dca_engine_create on the manual null device failed"); endScenario(); return; }
+    StubThrowingInputPlugin* a = nullptr;
+    StubThrowingInputPlugin* b = nullptr;
+    dca_plugin_t pa = fx.adopt(a);
+    dca_plugin_t pb = fx.adopt(b);
+    if (pa == nullptr || pb == nullptr) { fail("adoptPluginForTest refused a stub"); endScenario(); return; }
+
+    constexpr int kBlocks = 8;
+    RT_CHECK(dca_plugin_attach_to_instrument(pa) == DCA_OK, "attach A failed");
+    RT_CHECK(dca_plugin_attach_to_instrument(pb) == DCA_OK, "attach B failed");
+    RT_CHECK(dca_plugin_attach_to_instrument(pa) == DCA_OK, "re-attach A failed");
+
+    const int a0 = a->blocksRun(), b0 = b->blocksRun();
+    AbiPluginFixture::pump(kBlocks);
+    const int aRan = a->blocksRun() - a0, bRan = b->blocksRun() - b0;
+    note("after A, B, A: A ran " + std::to_string(aRan) + ", B ran " + std::to_string(bRan)
+         + " of " + std::to_string(kBlocks) + " blocks");
+    RT_CHECK(aRan == kBlocks && bRan == 0, "after attach A, B, A the slot plays B (A "
+             + std::to_string(aRan) + ", B " + std::to_string(bRan) + ")");
+
+    RT_CHECK(dca_plugin_detach_from_instrument(pb) == DCA_OK, "detach B failed");
+    const int a1 = a->blocksRun();
+    AbiPluginFixture::pump(kBlocks);
+    // A pin, not a regression probe: a detach of a plugin that does not hold
+    // the slot is a no-op in the engine.
+    RT_CHECK(a->blocksRun() - a1 == kBlocks, "detaching B, which does not hold the slot, silenced A");
+
+    dca_plugin_unload(pb);
+    dca_plugin_unload(pa);
+    endScenario();
+}
+
+/// A VSTi THAT THROWS ON EVERY BLOCK IS LATCHED. The input chain stops calling
+/// a stage that threw until the chain is republished or re-prepared; the
+/// instrument bus has to do the same, or a deterministic fault (an expired
+/// licence check) pays a throw — exception object, unwind — on the audio thread
+/// every callback for the rest of the session. A re-attach is the second chance.
+void scenarioThrowingInstrumentIsLatched()
+{
+    beginScenario("RtThrowingInstrumentIsLatchedUntilReattach");
+    Fixture fx(48000, 256, 2);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+
+    StubThrowingInputPlugin instrument;
+    instrument.throwOnEveryBlock();
+    if (! fx.engine().attachInstrumentPlugin(&instrument))
+    { fail("attachInstrumentPlugin refused the stub"); endScenario(); return; }
+
+    constexpr int kBlocks = 16;
+    fx.pumpWarm(kBlocks);
+    note("throwing instrument: " + std::to_string(instrument.blocksThrown()) + " throws in "
+         + std::to_string(kBlocks) + " blocks");
+    RT_CHECK(instrument.blocksThrown() == 1, "a VSTi that throws on every block threw "
+             + std::to_string(instrument.blocksThrown()) + " times in " + std::to_string(kBlocks)
+             + " blocks — the fault is not latched");
+
+    // Re-attach: one more chance, then latched again.
+    if (! fx.engine().attachInstrumentPlugin(&instrument))
+    { fail("re-attach refused the stub"); fx.engine().detachInstrumentPlugin(&instrument); endScenario(); return; }
+    fx.pumpWarm(kBlocks);
+    RT_CHECK(instrument.blocksThrown() == 2, "after a re-attach the instrument threw "
+             + std::to_string(instrument.blocksThrown()) + " times in total, not 2");
+
+    fx.engine().detachInstrumentPlugin(&instrument);
+    endScenario();
+}
+
+/// Reader seam for SeqlockClock: runs a test action ONCE between the reader's
+/// two payload loads, i.e. with a reader stopped half-way through its copy.
+struct SeqlockReaderSeam
+{
+    static inline void (*action)(void*) = nullptr;
+    static inline void* user = nullptr;
+    static void betweenPayloadLoads() noexcept
+    {
+        auto* a = action;
+        action = nullptr;
+        if (a != nullptr) a(user);
+    }
+};
+
+/// THE SEQLOCK PAYLOAD (render clock, capture sync pair). The static_asserts
+/// pin that the payload is lock-free atomics (no data race on a copy); the
+/// runtime half pins the protocol through a reader seam. A reset is a WRITE:
+/// a reader stopped between its payload loads while the writer side resets and
+/// publishes again (a device restart, then its first block) must retry or
+/// return a pair that was published together, never one half of each. A reset
+/// that put the sequence back to its start let the re-check see the same even
+/// value around two different payloads.
+void scenarioSeqlockClockIsTornFree()
+{
+    beginScenario("RtSeqlockClockPayloadIsAtomicAndTornFree");
+    static_assert(std::atomic<int64_t>::is_always_lock_free && std::atomic<uint64_t>::is_always_lock_free,
+                  "the seqlock payload must be lock-free atomics");
+
+    SeqlockClock<int64_t> clock;
+    int64_t c = -1, t = -1;
+    RT_CHECK(! clock.read(c, t), "an unpublished clock read as valid");
+    clock.publish(5, 50);
+    RT_CHECK(clock.read(c, t) && c == 5 && t == 50, "a published pair did not read back");
+    RT_CHECK(clock.lastCount() == 5, "lastCount is not the published count");
+    clock.reset();
+    RT_CHECK(! clock.read(c, t), "a reset clock read as valid");
+    RT_CHECK(clock.lastCount() == 0, "lastCount is not zero after a reset");
+    clock.publish(6, 60);
+    RT_CHECK(clock.read(c, t) && c == 6 && t == 60, "a pair published after a reset did not read back");
+
+    using SeamClock = SeqlockClock<int64_t, SeqlockReaderSeam>;
+    SeamClock seamed;
+    seamed.publish(5, 50);
+    SeqlockReaderSeam::user   = &seamed;
+    SeqlockReaderSeam::action = [](void* u)
+    {
+        auto& clk = *static_cast<SeamClock*>(u);
+        clk.reset();
+        clk.publish(7, 70);
+    };
+    c = -1; t = -1;
+    const bool got = seamed.read(c, t);
+    SeqlockReaderSeam::action = nullptr;
+    note("reader overlapped by reset + publish: read " + std::string(got ? "true" : "false")
+         + " {" + std::to_string(c) + ", " + std::to_string(t) + "}");
+    RT_CHECK(! got || (c == 7 && t == 70) || (c == 5 && t == 50),
+             "a reader overlapped by reset + publish returned {" + std::to_string(c) + ", "
+             + std::to_string(t) + "}, a pair nobody published");
+
+    SeqlockReaderSeam::action = [](void* u) { static_cast<SeamClock*>(u)->reset(); };
+    c = -1; t = -1;
+    const bool afterReset = seamed.read(c, t);
+    SeqlockReaderSeam::action = nullptr;
+    RT_CHECK(! afterReset || (c == 7 && t == 70),
+             "a reader overlapped by a reset returned {" + std::to_string(c) + ", " + std::to_string(t) + "}");
+    endScenario();
+}
+
+/// Hold points for the instrument-slot seam. Each wait is a liveness bound
+/// (a broken seam fails the scenario instead of hanging the gate), not a
+/// timing assertion: the scenario never asserts on how long anything took.
+struct InstrumentRaceGate
+{
+    std::atomic<bool> holdAttach{ false }, attachHeld{ false }, releaseAttach{ false };
+    std::atomic<bool> attachAboutToBlock{ false };
+    std::atomic<bool> holdRender{ false }, renderHeld{ false }, releaseRender{ false };
+};
+
+void instrumentRaceSeam(AudioEngine::InstrumentSeam point, void* user)
+{
+    auto& g = *static_cast<InstrumentRaceGate*>(user);
+    switch (point)
+    {
+        case AudioEngine::InstrumentSeam::AttachBeforePublish:
+            if (! g.holdAttach.exchange(false)) return;
+            g.attachHeld.store(true);
+            while (! g.releaseAttach.load()) std::this_thread::yield();
+            return;
+        case AudioEngine::InstrumentSeam::AttachAboutToBlock:
+            g.attachAboutToBlock.store(true);
+            return;
+        case AudioEngine::InstrumentSeam::InputAttachAfterPublish:
+            return;
+        case AudioEngine::InstrumentSeam::RenderLoadedPlugin:
+            if (! g.holdRender.exchange(false)) return;
+            g.renderHeld.store(true);
+            while (! g.releaseRender.load()) std::this_thread::yield();
+            return;
+    }
+}
+
+bool waitForFlag(const std::atomic<bool>& flag)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (! flag.load())
+    {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+/// A GOOD INSTRUMENT THAT REPLACES A LATCHED ONE RENDERS. The audio thread has
+/// loaded the throwing plugin P (seam: held right after the pointer load) when
+/// an attach of Q runs as far as it can before it has to wait for that block
+/// (seam: about to block). P then throws. The latch that throw sets must belong
+/// to P: from the next block on, Q renders.
+void scenarioGoodInstrumentReplacingALatchedOneRenders()
+{
+    beginScenario("RtGoodInstrumentReplacingALatchedOneRenders");
+    Fixture fx(48000, 256, 2);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+
+    StubThrowingInputPlugin bad;
+    bad.throwOnEveryBlock();
+    StubThrowingInputPlugin good;
+    good.setOutputLevel(0.25f);
+    if (! fx.engine().attachInstrumentPlugin(&bad))
+    { fail("attachInstrumentPlugin refused the throwing stub"); endScenario(); return; }
+    fx.pumpWarm(4);
+    RT_CHECK(bad.blocksThrown() == 1, "setup: the throwing instrument threw " + std::to_string(bad.blocksThrown())
+             + " times in 4 blocks, not once (latched)");
+
+    InstrumentRaceGate g;
+    g.holdAttach.store(true);
+    g.holdRender.store(true);
+    fx.engine().setInstrumentSeamForTest(&instrumentRaceSeam, &g);
+    bool attached = false;
+    std::thread attacher([&] { attached = fx.engine().attachInstrumentPlugin(&good); });
+    bool seamOk = waitForFlag(g.attachHeld);
+    std::thread audio([&]
+    {
+        dcrt::ScopedRtThread rt;
+        nulldev::pump(1);
+    });
+    seamOk = seamOk && waitForFlag(g.renderHeld);
+    g.releaseAttach.store(true);
+    seamOk = seamOk && waitForFlag(g.attachAboutToBlock);
+    g.releaseRender.store(true);
+    audio.join();
+    attacher.join();
+    fx.engine().setInstrumentSeamForTest(nullptr, nullptr);
+    RT_CHECK(seamOk, "a seam point was never reached (attach held "
+             + std::to_string(g.attachHeld.load()) + ", render held " + std::to_string(g.renderHeld.load())
+             + ", attach about to block " + std::to_string(g.attachAboutToBlock.load()) + ")");
+    RT_CHECK(attached && fx.engine().instrumentPlugin() == &good, "the attach of the good instrument failed");
+
+    constexpr int kBlocks = 8;
+    const int ran0 = good.blocksRun();
+    float peak = 0.0f;
+    for (int i = 0; i < kBlocks; ++i)
+    {
+        fx.pumpWarm(1);
+        peak = std::max(peak, fx.lastOutputPeak());
+    }
+    const int ran = good.blocksRun() - ran0;
+    note("throwing instrument threw " + std::to_string(bad.blocksThrown()) + " times; its replacement ran "
+         + std::to_string(ran) + " of " + std::to_string(kBlocks) + " blocks, output peak " + std::to_string(peak));
+    RT_CHECK(ran == kBlocks, "the good instrument ran " + std::to_string(ran) + " of " + std::to_string(kBlocks)
+             + " blocks: the latch of the plugin it replaced silenced it");
+    RT_CHECK(peak > 0.0f, "the good instrument ran but the output stayed silent");
+    fx.engine().detachInstrumentPlugin(&good);
+    endScenario();
+}
+
+/// THE INSTRUMENT LATCH IS RE-ARMED BY EVERY RE-PREPARE. All of them run
+/// through audioDeviceAboutToStart -> prepareMasterBus ->
+/// reprepareAttachedPlugins: dca_engine_reconfigure (rate or block size),
+/// dca_engine_set_device_type and the watchdog's device rebuild. A stopped
+/// engine cannot be restarted, and a rebuilt engine is a new AudioEngine with
+/// no latch. Both device-setup changes are driven here.
+void scenarioInstrumentLatchClearsOnReprepare()
+{
+    beginScenario("RtInstrumentLatchClearsOnReprepare");
+    Fixture fx(48000, 256, 2);
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+
+    StubThrowingInputPlugin instrument;
+    if (! fx.engine().attachInstrumentPlugin(&instrument))
+    { fail("attachInstrumentPlugin refused the stub"); endScenario(); return; }
+
+    auto reopen = [&](double rate, int block) -> bool
+    {
+        juce::AudioDeviceManager::AudioDeviceSetup setup;
+        fx.engine().deviceManager().getAudioDeviceSetup(setup);
+        setup.sampleRate = rate;
+        setup.bufferSize = block;
+        return fx.engine().deviceManager().setAudioDeviceSetup(setup, true).isEmpty();
+    };
+    struct Path { const char* name; double rate; int block; };
+    const Path paths[] = { { "block size 256 -> 512", 48000.0, 512 }, { "sample rate 48000 -> 44100", 44100.0, 512 } };
+    constexpr int kBlocks = 8;
+    for (const auto& path : paths)
+    {
+        const int threw0 = instrument.blocksThrown();
+        instrument.throwOnEveryBlock();
+        fx.pumpWarm(kBlocks);
+        instrument.stopThrowing();
+        const int latchedAt = instrument.blocksRun();
+        fx.pumpWarm(kBlocks);
+        RT_CHECK(instrument.blocksThrown() - threw0 == 1 && instrument.blocksRun() == latchedAt,
+                 std::string(path.name) + ": setup: the instrument is not latched (threw "
+                 + std::to_string(instrument.blocksThrown() - threw0) + ")");
+        if (! reopen(path.rate, path.block))
+        { fail(std::string("could not reopen the null device: ") + path.name); break; }
+        fx.pumpWarm(kBlocks);
+        const int ran = instrument.blocksRun() - latchedAt;
+        note(std::string(path.name) + ": after the re-prepare the instrument ran " + std::to_string(ran)
+             + " of " + std::to_string(kBlocks) + " blocks");
+        RT_CHECK(ran == kBlocks, std::string(path.name) + ": the re-prepare did not clear the latch (ran "
+                 + std::to_string(ran) + " of " + std::to_string(kBlocks) + ")");
+    }
+    fx.engine().detachInstrumentPlugin(&instrument);
+    endScenario();
+}
+
+/// Throws from the input attach's post-publish seam point while the counter is
+/// positive: a failure after the new chain is already live.
+std::atomic<int> g_inputPublishThrows { 0 };
+void throwAfterInputPublishSeam(AudioEngine::InstrumentSeam point, void* user)
+{
+    if (point != AudioEngine::InstrumentSeam::InputAttachAfterPublish) return;
+    auto& left = *static_cast<std::atomic<int>*>(user);
+    if (left.load() <= 0) return;
+    left.fetch_sub(1);
+    throw std::runtime_error("input attach failed after its publish (seam)");
+}
+
+/// Throws from the instrument attach's post-publish seam point while the counter
+/// is positive: a failure after the new plugin already holds the slot.
+std::atomic<int> g_instrumentPublishThrows { 0 };
+void throwAfterInstrumentPublishSeam(AudioEngine::InstrumentSeam point, void* user)
+{
+    if (point != AudioEngine::InstrumentSeam::AttachAfterPublish) return;
+    auto& left = *static_cast<std::atomic<int>*>(user);
+    if (left.load() <= 0) return;
+    left.fetch_sub(1);
+    throw std::runtime_error("instrument attach failed after its publish (seam)");
+}
+
+/// A FAILED ATTACH KEEPS THE ROLE THE PLUGIN HAD. Every attach first takes the
+/// instance out of its current role; when the new role's prepare then throws,
+/// the caller gets an error and the plugin goes back where it was: the same
+/// seat and the same place in that seat's chain, or the instrument slot. Only
+/// when the way back fails too is it in neither role, and then the export's
+/// flags say so (an unload afterwards leaves nothing in the engine).
+void scenarioFailedAttachKeepsThePriorRole()
+{
+    beginScenario("RtFailedAttachKeepsThePriorRole");
+    AbiPluginFixture fx;
+    if (! fx.ok()) { fail("dca_engine_create on the manual null device failed"); endScenario(); return; }
+    auto* impl = dca_rtcheck::engineForTest(fx.engine);
+    StubThrowingInputPlugin* x = nullptr;
+    StubThrowingInputPlugin* s = nullptr;
+    StubThrowingInputPlugin* y = nullptr;
+    dca_plugin_t px = fx.adopt(x);
+    dca_plugin_t ps = fx.adopt(s);
+    dca_plugin_t py = fx.adopt(y);
+    if (impl == nullptr || px == nullptr || ps == nullptr || py == nullptr)
+    { fail("adoptPluginForTest refused a stub"); endScenario(); return; }
+
+    constexpr int kBlocks = 8;
+    RT_CHECK(dca_plugin_attach_to_input(px) == DCA_OK && dca_plugin_attach_to_input(ps) == DCA_OK
+                 && dca_plugin_attach_to_input(py) == DCA_OK, "attach to input failed");
+    RT_CHECK(impl->inputChainIndexOf(s, 0) == 1, "setup: the plugin is not second in seat 0's chain");
+
+    // (a) input -> instrument, the instrument prepare throws.
+    s->throwOnNextPrepares(1);
+    RT_CHECK(dca_plugin_attach_to_instrument(ps) != DCA_OK, "(a) a failed instrument attach reported success");
+    note("(a) after the failed instrument attach: input seat " + std::to_string(dca_plugin_get_input_player(ps))
+         + ", chain index " + std::to_string(impl->inputChainIndexOf(s, 0)));
+    RT_CHECK(impl->instrumentPlugin() != s, "(a) the failed attach left the plugin in the instrument slot");
+    RT_CHECK(dca_plugin_get_input_player(ps) == 0 && impl->inputChainIndexOf(s, 0) == 1,
+             "(a) the failed instrument attach cost the plugin its input role (seat "
+             + std::to_string(dca_plugin_get_input_player(ps)) + ", index "
+             + std::to_string(impl->inputChainIndexOf(s, 0)) + ", expected seat 0 index 1)");
+    int before = s->blocksRun();
+    AbiPluginFixture::pump(kBlocks);
+    RT_CHECK(s->blocksRun() - before == kBlocks, "(a) the restored input plugin ran "
+             + std::to_string(s->blocksRun() - before) + " of " + std::to_string(kBlocks) + " blocks");
+
+    // (b) a seat move whose prepare throws keeps the old seat and place.
+    s->throwOnNextPrepares(1);
+    RT_CHECK(dca_plugin_attach_to_input_for_player(ps, 1) != DCA_OK, "(b) a failed seat move reported success");
+    RT_CHECK(dca_plugin_get_input_player(ps) == 0 && impl->inputChainIndexOf(s, 0) == 1
+                 && impl->inputChainIndexOf(s, 1) == -1,
+             "(b) the failed seat move cost the plugin its seat (seat "
+             + std::to_string(dca_plugin_get_input_player(ps)) + ", index "
+             + std::to_string(impl->inputChainIndexOf(s, 0)) + ")");
+
+    // (c) instrument -> input, the input prepare throws.
+    RT_CHECK(dca_plugin_attach_to_instrument(ps) == DCA_OK, "(c) attach to instrument failed");
+    s->throwOnNextPrepares(1);
+    RT_CHECK(dca_plugin_attach_to_input(ps) != DCA_OK, "(c) a failed input attach reported success");
+    RT_CHECK(impl->instrumentPlugin() == s, "(c) the failed input attach cost the plugin the instrument slot");
+    RT_CHECK(dca_plugin_get_input_player(ps) == -1 && impl->inputChainIndexOf(s, 0) == -1,
+             "(c) the failed input attach left the plugin in the input chain");
+    before = s->blocksRun();
+    AbiPluginFixture::pump(kBlocks);
+    RT_CHECK(s->blocksRun() - before == kBlocks, "(c) the restored instrument ran "
+             + std::to_string(s->blocksRun() - before) + " of " + std::to_string(kBlocks) + " blocks");
+
+    // (d) the way back fails too: neither role, an error, and flags that agree.
+    s->throwOnNextPrepares(2);
+    RT_CHECK(dca_plugin_attach_to_input(ps) != DCA_OK, "(d) a failed input attach reported success");
+    RT_CHECK(impl->instrumentPlugin() != s && impl->inputChainIndexOf(s, 0) == -1
+                 && dca_plugin_get_input_player(ps) == -1,
+             "(d) a failed restore left the plugin in a role");
+
+    // (e) instrument -> input, the failure comes AFTER the input chain was
+    // published: the instance leaves that chain before it goes back to the slot.
+    impl->setInstrumentSeamForTest(&throwAfterInputPublishSeam, &g_inputPublishThrows);
+    RT_CHECK(dca_plugin_attach_to_instrument(ps) == DCA_OK, "(e) attach to instrument failed");
+    g_inputPublishThrows.store(1);
+    RT_CHECK(dca_plugin_attach_to_input(ps) != DCA_OK, "(e) an input attach that threw after its publish reported success");
+    note("(e) after the post-publish failure: instrument slot " + std::string(impl->instrumentPlugin() == s ? "kept" : "lost")
+         + ", seat 0 index " + std::to_string(impl->inputChainIndexOf(s, 0)));
+    RT_CHECK(impl->instrumentPlugin() == s, "(e) the post-publish failure cost the plugin the instrument slot");
+    RT_CHECK(impl->inputChainIndexOf(s, 0) == -1 && dca_plugin_get_input_player(ps) == -1,
+             "(e) the post-publish failure left the plugin in seat 0's chain as well (index "
+             + std::to_string(impl->inputChainIndexOf(s, 0)) + "): two roles");
+
+    // (f) input -> instrument, the instrument prepare throws AND the way back
+    // fails after its publish: the instance ends in no role, flags agree.
+    RT_CHECK(dca_plugin_attach_to_input(ps) == DCA_OK, "(f) attach to input failed");
+    s->throwOnNextPrepares(1);
+    g_inputPublishThrows.store(1);
+    RT_CHECK(dca_plugin_attach_to_instrument(ps) != DCA_OK, "(f) a failed instrument attach reported success");
+    note("(f) after the failed restore: seat 0 index " + std::to_string(impl->inputChainIndexOf(s, 0))
+         + ", input flag seat " + std::to_string(dca_plugin_get_input_player(ps)));
+    RT_CHECK(impl->instrumentPlugin() != s && impl->inputChainIndexOf(s, 0) == -1
+                 && dca_plugin_get_input_player(ps) == -1,
+             "(f) a restore that failed after its publish left the plugin in seat 0's chain (index "
+             + std::to_string(impl->inputChainIndexOf(s, 0)) + ") with flags naming no seat");
+
+    // (g) another plugin holds the slot and this attach fails AFTER its
+    // publish: the displaced plugin gets the slot back, flag and all.
+    impl->setInstrumentSeamForTest(&throwAfterInstrumentPublishSeam, &g_instrumentPublishThrows);
+    RT_CHECK(dca_plugin_attach_to_instrument(py) == DCA_OK, "(g) attach of the holder to the instrument failed");
+    g_instrumentPublishThrows.store(1);
+    RT_CHECK(dca_plugin_attach_to_instrument(ps) != DCA_OK, "(g) an instrument attach that threw after its publish reported success");
+    note(std::string("(g) after the post-publish failure: slot ")
+         + (impl->instrumentPlugin() == y ? "back with the displaced plugin" : impl->instrumentPlugin() == nullptr ? "empty" : "other")
+         + ", displaced flag " + (dca_rtcheck::instrumentFlagForTest(py) ? "set" : "clear"));
+    RT_CHECK(impl->instrumentPlugin() == y && dca_rtcheck::instrumentFlagForTest(py)
+                 && ! dca_rtcheck::instrumentFlagForTest(ps),
+             "(g) a failed instrument attach took the slot from the plugin that held it");
+    before = y->blocksRun();
+    AbiPluginFixture::pump(kBlocks);
+    RT_CHECK(y->blocksRun() - before == kBlocks, "(g) the restored instrument ran "
+             + std::to_string(y->blocksRun() - before) + " of " + std::to_string(kBlocks) + " blocks");
+
+    // (h) putting the displaced plugin back fails after its publish too: the
+    // slot is empty and neither flag claims it.
+    g_instrumentPublishThrows.store(2);
+    RT_CHECK(dca_plugin_attach_to_instrument(ps) != DCA_OK, "(h) a failed instrument attach reported success");
+    RT_CHECK(impl->instrumentPlugin() == nullptr && ! dca_rtcheck::instrumentFlagForTest(py)
+                 && ! dca_rtcheck::instrumentFlagForTest(ps),
+             "(h) a failed give-back left the slot or a flag claiming it");
+    g_instrumentPublishThrows.store(0);
+    impl->setInstrumentSeamForTest(nullptr, nullptr);
+
+    dca_plugin_unload(ps);
+    RT_CHECK(impl->instrumentPlugin() == nullptr, "an unload left a plugin in the instrument slot");
+    dca_plugin_unload(py);
+    dca_plugin_unload(px);
+    endScenario();
+}
+
+/// Hold points for the song-clock seam (each wait is a liveness bound only).
+struct SongClockRaceGate
+{
+    std::atomic<bool> holdReader{ false }, readerHeld{ false }, releaseReader{ false };
+    std::atomic<bool> forgetDraining{ false };
+};
+
+void songClockRaceSeam(AudioEngine::SongClockSeam point, void* user)
+{
+    auto& g = *static_cast<SongClockRaceGate*>(user);
+    switch (point)
+    {
+        case AudioEngine::SongClockSeam::ReaderLoadedSource:
+            if (! g.holdReader.exchange(false)) return;
+            g.readerHeld.store(true);
+            while (! g.releaseReader.load()) std::this_thread::yield();
+            return;
+        case AudioEngine::SongClockSeam::ForgetAboutToDrain:
+            g.forgetDraining.store(true);
+            return;
+    }
+}
+
+/// A REPLACED CLOCK SOURCE IS DRAINED BEFORE IT IS TORN DOWN. The audio thread
+/// has loaded clock source A (seam: held inside sampleSongClock) when A is
+/// replaced by B; A's teardown then unbinds A, which is not the published
+/// source. That unbind must still wait for the reader of A before it returns,
+/// or A's transport and stretcher are freed under readSongClockRt.
+void scenarioReplacedSongClockSourceIsDrained()
+{
+    beginScenario("RtReplacedSongClockSourceIsDrained");
+    const auto blob = makeWavBlob(2.0, 48000, 220.0);
+    if (blob.getSize() == 0) { fail("could not synthesise a WAV blob"); endScenario(); return; }
+    Fixture fx;
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    TransportSource a(e);
+    TransportSource b(e);
+    if (a.openMemory(blob.getData(), blob.getSize(), "wav").isNotEmpty()
+        || b.openMemory(blob.getData(), blob.getSize(), "wav").isNotEmpty())
+    { fail("openMemory failed"); endScenario(); return; }
+    a.setVolume(0.0f);
+    b.setVolume(0.0f);
+    RT_CHECK(e.setSongClockSource(&a), "source A refused as the clock");
+    RT_CHECK(e.setChartSourceEnabled(0, true), "enabling the chart source failed");
+    fx.pumpWarm(2);
+
+    SongClockRaceGate g;
+    g.holdReader.store(true);
+    e.setSongClockSeamForTest(&songClockRaceSeam, &g);
+    std::thread audio([&]
+    {
+        dcrt::ScopedRtThread rt;
+        nulldev::pump(1);
+    });
+    bool seamOk = waitForFlag(g.readerHeld);
+    RT_CHECK(e.setSongClockSource(&b), "source B refused as the clock");
+    std::atomic<bool> forgetReturned{ false };
+    bool returnedWhileHeld = false;
+    std::thread unbind([&]
+    {
+        (void) e.forgetSongClockSource(&a);
+        returnedWhileHeld = ! g.releaseReader.load();
+        forgetReturned.store(true);
+    });
+    // Either the unbind reaches its drain (and must then wait for the reader),
+    // or it returns without one while the reader still holds A.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (! g.forgetDraining.load() && ! forgetReturned.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    const bool drained = g.forgetDraining.load();
+    g.releaseReader.store(true);
+    audio.join();
+    unbind.join();
+    e.setSongClockSeamForTest(nullptr, nullptr);
+    RT_CHECK(seamOk, "the audio thread never reached the song-clock seam");
+    note(std::string("unbinding the replaced source: ") + (drained ? "drained the reader" : "no drain")
+         + (returnedWhileHeld ? ", returned while the reader still held it" : ""));
+    RT_CHECK(drained && ! returnedWhileHeld,
+             "forgetSongClockSource returned for a replaced source while the audio thread still read it: "
+             "its teardown would free the transport under readSongClockRt");
+    RT_CHECK(e.setChartSourceEnabled(0, false), "disable failed");
+    endScenario();
+}
+
+/// A SOURCE THAT WAS NEVER THE CLOCK IS TORN DOWN WITHOUT A DRAIN. The audio
+/// thread is held inside sampleSongClock on clock source A when source C, which
+/// was never published as the clock, is unbound. sampleSongClock only reads what
+/// it loaded from songClockSource_, so C cannot be under that reader: the unbind
+/// must return without reaching the drain (no 2 s wait behind a wedged callback).
+/// A, published and then replaced, is still drained.
+void scenarioNeverPublishedSourceSkipsTheClockDrain()
+{
+    beginScenario("RtNeverPublishedSourceSkipsTheClockDrain");
+    const auto blob = makeWavBlob(2.0, 48000, 220.0);
+    if (blob.getSize() == 0) { fail("could not synthesise a WAV blob"); endScenario(); return; }
+    Fixture fx;
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    TransportSource a(e);
+    TransportSource c(e);
+    if (a.openMemory(blob.getData(), blob.getSize(), "wav").isNotEmpty()
+        || c.openMemory(blob.getData(), blob.getSize(), "wav").isNotEmpty())
+    { fail("openMemory failed"); endScenario(); return; }
+    a.setVolume(0.0f);
+    c.setVolume(0.0f);
+    RT_CHECK(e.setSongClockSource(&a), "source A refused as the clock");
+    RT_CHECK(e.setChartSourceEnabled(0, true), "enabling the chart source failed");
+    fx.pumpWarm(2);
+
+    SongClockRaceGate g;
+    g.holdReader.store(true);
+    e.setSongClockSeamForTest(&songClockRaceSeam, &g);
+    std::thread audio([&]
+    {
+        dcrt::ScopedRtThread rt;
+        nulldev::pump(1);
+    });
+    const bool seamOk = waitForFlag(g.readerHeld);
+    std::atomic<bool> forgetReturned{ false };
+    bool returnedWhileHeld = false;
+    std::thread unbind([&]
+    {
+        (void) e.forgetSongClockSource(&c);
+        returnedWhileHeld = ! g.releaseReader.load();
+        forgetReturned.store(true);
+    });
+    // Liveness bound only: either the unbind returns, or it reaches the drain
+    // (the fault), which then waits for the held reader.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (! g.forgetDraining.load() && ! forgetReturned.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    const bool drainedC = g.forgetDraining.load();
+    g.releaseReader.store(true);
+    audio.join();
+    unbind.join();
+    note(std::string("unbinding the never-published source: ") + (drainedC ? "drained" : "no drain")
+         + (returnedWhileHeld ? ", returned while the reader held A" : ""));
+    RT_CHECK(seamOk, "the audio thread never reached the song-clock seam");
+    RT_CHECK(! drainedC && returnedWhileHeld,
+             "forgetSongClockSource drained for a source that was never the clock: a wedged "
+             "callback would cost its teardown the full drain bound");
+
+    // A was published: replacing it and unbinding it still drains.
+    g.forgetDraining.store(false);
+    RT_CHECK(e.setSongClockSource(nullptr), "unbinding the clock failed");
+    (void) e.forgetSongClockSource(&a);
+    RT_CHECK(g.forgetDraining.load(), "unbinding a source that was the clock skipped the drain");
+    // Drained and unbound since: a second teardown of A needs no drain.
+    g.forgetDraining.store(false);
+    (void) e.forgetSongClockSource(&a);
+    RT_CHECK(! g.forgetDraining.load(), "a source drained since its last publish was drained again");
+    e.setSongClockSeamForTest(nullptr, nullptr);
+    RT_CHECK(e.setChartSourceEnabled(0, false), "disable failed");
+    endScenario();
+}
+
+/// A GROUPED SOURCE REPORTS ITS AUDIBLE POSITION. Its own stretcher is bypassed;
+/// the samples sit in the shared stem-group stretcher instead, so the audible
+/// position (and the song clock that reads it) is the transport position minus
+/// the GROUP stretcher's read-ahead in file seconds: raw - readAhead / sr * tempo.
+void scenarioGroupedSourceReportsAudiblePosition()
+{
+    beginScenario("RtGroupedSourceReportsAudiblePosition");
+    const auto blob = makeWavBlob(6.0, 48000, 220.0);
+    if (blob.getSize() == 0) { fail("could not synthesise a WAV blob"); endScenario(); return; }
+    Fixture fx;
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    TransportSource src(e);
+    if (src.openMemory(blob.getData(), blob.getSize(), "wav").isNotEmpty())
+    { fail("openMemory failed"); endScenario(); return; }
+    src.setVolume(0.0f);
+    e.setSourceStemGrouped(&src, true);
+    RT_CHECK(src.isStretcherBypassed(), "the source is not routed through the stem group");
+    constexpr float kTempo = 0.8f;
+    e.setStemGroupTempo(kTempo);
+    src.play();
+    fx.pumpWarm(64);
+
+    const double raw       = src.getPositionSeconds();
+    const double audible   = src.getAudiblePositionSeconds();
+    const int    readAhead = e.stemGroupReadAheadSamples();
+    const double expected  = std::max(0.0, raw - (double) readAhead / (double) fx.sampleRate() * (double) kTempo);
+    double clockPos = 0.0, clockTempo = 0.0; bool playing = false; uint32_t gen = 0;
+    src.readSongClockRt(clockPos, playing, gen, clockTempo);
+    note("grouped at " + std::to_string(kTempo) + ": raw " + std::to_string(raw) + " s, audible "
+         + std::to_string(audible) + " s, song clock " + std::to_string(clockPos) + " s, group read-ahead "
+         + std::to_string(readAhead) + " samples, expected " + std::to_string(expected) + " s");
+    RT_CHECK(readAhead > 0, "setup: the group stretcher holds no read-ahead");
+    RT_CHECK(std::abs(audible - expected) < 1.0e-9,
+             "the audible position of a grouped source ignores the group stretcher's read-ahead ("
+             + std::to_string(audible) + " s, expected " + std::to_string(expected) + " s)");
+    RT_CHECK(std::abs(clockPos - expected) < 1.0e-9 && std::abs(clockTempo - (double) kTempo) < 1.0e-6,
+             "the song clock of a grouped source runs ahead of the audio (" + std::to_string(clockPos)
+             + " s, expected " + std::to_string(expected) + " s)");
+    src.pause();
+    e.setSourceStemGrouped(&src, false);
+    endScenario();
+}
+
+/// Hold points for the click-producer seam (each wait is a liveness bound only).
+struct ClickRaceGate
+{
+    std::atomic<bool> holdFirst{ false }, firstHeld{ false }, releaseFirst{ false };
+    std::atomic<bool> secondWaiting{ false };
+};
+
+void clickRaceSeam(AudioEngine::ClickSeam point, void* user)
+{
+    auto& g = *static_cast<ClickRaceGate*>(user);
+    switch (point)
+    {
+        case AudioEngine::ClickSeam::ProducerHoldsSlot:
+            if (! g.holdFirst.exchange(false)) return;
+            g.firstHeld.store(true);
+            while (! g.releaseFirst.load()) std::this_thread::yield();
+            return;
+        case AudioEngine::ClickSeam::ProducerWaiting:
+            g.secondWaiting.store(true);
+            return;
+    }
+}
+
+/// CLICK PRODUCERS ARE SERIALIZED. The click FIFOs are single-producer: while
+/// one scheduleClick holds a prepared slot (seam), a second producer must wait
+/// for it, never prepare the same slot and publish over it.
+void scenarioClickProducersAreSerialized()
+{
+    beginScenario("RtClickProducersAreSerialized");
+    Fixture fx;
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    fx.pumpWarm(2);
+    int64_t frames = 0, ticks = 0;
+    if (! e.getRenderClock(frames, ticks)) { fail("the render clock is not published"); endScenario(); return; }
+
+    ClickRaceGate g;
+    g.holdFirst.store(true);
+    e.setClickSeamForTest(&clickRaceSeam, &g);
+    std::thread first([&] { e.scheduleClick(0, frames + 4096); });
+    const bool seamOk = waitForFlag(g.firstHeld);
+    std::atomic<bool> secondReturned{ false };
+    bool returnedWhileHeld = false;
+    std::thread second([&]
+    {
+        e.scheduleClick(1, frames + 8192);
+        returnedWhileHeld = ! g.releaseFirst.load();
+        secondReturned.store(true);
+    });
+    // Either the second producer reports that it waits, or it finishes its
+    // write while the first still holds a prepared slot.
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
+    while (! g.secondWaiting.load() && ! secondReturned.load() && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::yield();
+    const bool waited = g.secondWaiting.load();
+    g.releaseFirst.store(true);
+    first.join();
+    second.join();
+    e.setClickSeamForTest(nullptr, nullptr);
+    e.clearScheduledClicks();
+    fx.pumpWarm(2);
+    RT_CHECK(seamOk, "the first producer never reached the click seam");
+    note(std::string("second producer: ") + (waited ? "waited for the first" : "did not wait")
+         + (returnedWhileHeld ? ", published while the first held its slot" : ""));
+    RT_CHECK(waited && ! returnedWhileHeld,
+             "two click producers were inside the single-producer FIFO at once: the second published "
+             "while the first held a prepared slot");
+    endScenario();
+}
+
+/// A CLEAR ALWAYS TAKES EFFECT. With the schedule FIFO full, a clear that
+/// travels through that FIFO is dropped and every queued click still sounds.
+/// The clear must cancel every click scheduled before it, FIFO full or not.
+void scenarioClickClearSurvivesAFullQueue()
+{
+    beginScenario("RtClickClearSurvivesAFullQueue");
+    Fixture fx;
+    if (! fx.ok()) { fail("engine did not start: " + fx.error()); endScenario(); return; }
+    auto& e = fx.engine();
+    fx.pumpWarm(4);
+    auto peakOver = [&](int blocks)
+    {
+        float peak = 0.0f;
+        for (int i = 0; i < blocks; ++i) { fx.pumpWarm(1); peak = std::max(peak, fx.lastOutputPeak()); }
+        return peak;
+    };
+    int64_t frames = 0, ticks = 0;
+    if (! e.getRenderClock(frames, ticks)) { fail("the render clock is not published"); endScenario(); return; }
+    e.scheduleClick(0, frames + 16);
+    const float audible = peakOver(48);
+    const float quiet   = peakOver(8);
+    RT_CHECK(audible > 0.0f && quiet == 0.0f, "setup: a scheduled click is not audible on a silent engine (peak "
+             + std::to_string(audible) + ", after it " + std::to_string(quiet) + ")");
+
+    e.getRenderClock(frames, ticks);
+    for (int i = 0; i < 200; ++i) e.scheduleClick(0, frames + 16 + i);   // more than the FIFO holds
+    e.clearScheduledClicks();
+    const float afterClear = peakOver(48);
+    note("a clear issued on a full schedule queue: output peak " + std::to_string(afterClear));
+    RT_CHECK(afterClear == 0.0f, "a clear issued while the schedule FIFO was full was dropped: the queued "
+             "clicks sounded (peak " + std::to_string(afterClear) + ")");
+
+    // A click scheduled AFTER the clear still sounds.
+    e.getRenderClock(frames, ticks);
+    e.scheduleClick(0, frames + 16);
+    RT_CHECK(peakOver(48) > 0.0f, "a click scheduled after the clear did not sound");
+    endScenario();
+}
+
+/// A FAILED OFFLINE RENDER KEEPS THE OLD DESTINATION. dca_render_to_wav writes
+/// a staged file and replaces the destination only after every block was read
+/// and written; a write that fails part-way (seam: the writer reports failure
+/// from block 1 on) returns an error, leaves the existing destination
+/// byte-for-byte as it was, and leaves no staged file behind. The same holds for
+/// a source read that fails (seam: the reader reports failure from read 1 on),
+/// on the direct path and on the path that changes the sample rate. Every
+/// resampling render here runs with a reader that fails any read touching a
+/// sample at or past its length (seam): only a failure inside the length is
+/// an error, so a clean resampling render still succeeds.
+void scenarioRenderToWavFailureKeepsDestination()
+{
+    beginScenario("RtRenderToWavFailureKeepsDestination");
+    const auto dir = juce::File::getSpecialLocation(juce::File::tempDirectory)
+                         .getChildFile("dc_rt_render_" + juce::String::toHexString(juce::Random::getSystemRandom().nextInt64()));
+    if (! dir.createDirectory()) { fail("could not create a scratch directory"); endScenario(); return; }
+    const auto src = dir.getChildFile("src.wav");
+    const auto dst = dir.getChildFile("dst.wav");
+    const auto blob = makeWavBlob(1.0, 48000, 220.0);   // 48000 frames: several 4096-frame blocks
+    const juce::String kept = "the previous render";
+    if (! src.replaceWithData(blob.getData(), blob.getSize()) || ! dst.replaceWithText(kept))
+    { fail("could not write the scratch files"); dir.deleteRecursively(); endScenario(); return; }
+    const auto srcUtf8 = src.getFullPathName().toStdString();
+    const auto dstUtf8 = dst.getFullPathName().toStdString();
+
+    dca_rtcheck::failRenderWritesFromBlockForTest(1);
+    const auto failed = dca_render_to_wav(srcUtf8.c_str(), dstUtf8.c_str(), 0.0f, 0.0f, 0);
+    dca_rtcheck::failRenderWritesFromBlockForTest(-1);
+    const auto afterFail = dst.loadFileAsString();
+    const int  filesAfterFail = dir.getNumberOfChildFiles(juce::File::findFiles);
+    note("render with a failing writer: status " + std::to_string((int) failed) + ", destination "
+         + (afterFail == kept ? "unchanged" : "changed (" + std::to_string(dst.getSize()) + " bytes)")
+         + ", files in the directory " + std::to_string(filesAfterFail));
+    RT_CHECK(failed != DCA_OK, "a render whose writes failed returned DCA_OK");
+    RT_CHECK(afterFail == kept, "a failed render changed or deleted the existing destination");
+    RT_CHECK(filesAfterFail == 2, "a failed render left " + std::to_string(filesAfterFail - 2) + " staged file(s) behind");
+
+    // An unreadable source block: direct (rate 0 = the source's) and resampling (44100 from 48000).
+    for (const int rate : { 0, 44100 })
+    {
+        const std::string path = rate == 0 ? "direct" : "resampling";
+        dca_rtcheck::failRenderReadsFromBlockForTest(1);
+        dca_rtcheck::failRenderReadsPastEndForTest(rate != 0);
+        const auto readFailed = dca_render_to_wav(srcUtf8.c_str(), dstUtf8.c_str(), 0.0f, 0.0f, rate);
+        dca_rtcheck::failRenderReadsPastEndForTest(false);
+        dca_rtcheck::failRenderReadsFromBlockForTest(-1);
+        const bool keptAfterRead = dst.loadFileAsString() == kept;
+        const int  filesAfterRead = dir.getNumberOfChildFiles(juce::File::findFiles);
+        note(path + " render with a failing read: status " + std::to_string((int) readFailed) + ", destination "
+             + (keptAfterRead ? "unchanged" : "changed") + ", files " + std::to_string(filesAfterRead));
+        RT_CHECK(readFailed == DCA_ERR_DECODE, "a " + path + " render whose source read failed returned status "
+                 + std::to_string((int) readFailed) + " instead of DCA_ERR_DECODE");
+        RT_CHECK(keptAfterRead, "a " + path + " render whose source read failed replaced the destination");
+        RT_CHECK(filesAfterRead == 2, "a " + path + " render whose source read failed left a staged file behind");
+    }
+
+    const auto ok = dca_render_to_wav(srcUtf8.c_str(), dstUtf8.c_str(), 0.0f, 0.0f, 0);
+    juce::AudioFormatManager fm;
+    fm.registerBasicFormats();
+    std::unique_ptr<juce::AudioFormatReader> reader(fm.createReaderFor(dst));
+    const juce::int64 frames = reader != nullptr ? reader->lengthInSamples : -1;
+    reader.reset();
+    const int filesAfterOk = dir.getNumberOfChildFiles(juce::File::findFiles);
+    RT_CHECK(ok == DCA_OK && frames == 48000, "a clean render did not replace the destination with the "
+             "whole file (status " + std::to_string((int) ok) + ", " + std::to_string(frames) + " frames)");
+    RT_CHECK(filesAfterOk == 2, "a clean render left " + std::to_string(filesAfterOk - 2) + " staged file(s) behind");
+
+    // A clean resampling render: the whole second at the new rate, not silence,
+    // from a reader that fails every read touching a sample past its end.
+    dca_rtcheck::failRenderReadsPastEndForTest(true);
+    const auto okResampled = dca_render_to_wav(srcUtf8.c_str(), dstUtf8.c_str(), 0.0f, 0.0f, 44100);
+    dca_rtcheck::failRenderReadsPastEndForTest(false);
+    std::unique_ptr<juce::AudioFormatReader> resampled(fm.createReaderFor(dst));
+    juce::int64 resampledFrames = -1;
+    float resampledPeak = 0.0f;
+    if (resampled != nullptr)
+    {
+        resampledFrames = resampled->lengthInSamples;
+        juce::AudioBuffer<float> check((int) resampled->numChannels, (int) resampledFrames);
+        if (resampled->read(&check, 0, (int) resampledFrames, 0, true, true))
+            resampledPeak = check.getMagnitude(0, check.getNumSamples());
+    }
+    resampled.reset();
+    note("clean resampling render: status " + std::to_string((int) okResampled) + ", "
+         + std::to_string(resampledFrames) + " frames, peak " + std::to_string(resampledPeak));
+    RT_CHECK(okResampled == DCA_OK && resampledFrames == 44100 && resampledPeak > 0.1f,
+             "a clean resampling render did not write the whole second of audio");
+    dir.deleteRecursively();
+    endScenario();
+}
+
+void startChartGainSource(AudioEngine& engine, TransportSource& source, int seat)
+{
+    const auto song = makeWavBlob(3.0, 48000, 220.0);
+    RT_CHECK(source.openMemory(song.getData(), song.getSize(), "wav").isEmpty(), "song open failed");
+    source.setVolume(0.0f);
+    RT_CHECK(engine.setSongClockSource(&source), "clock bind failed");
+    dca_chart_note held{};
+    held.start_seconds = 0.05;
+    held.release_seconds = 2.0;
+    held.sustain_seconds = 1.95;
+    held.pitch = 57;
+    held.velocity = 1.0f;
+    held.string_index = 2;
+    held.fret = 3;
+    held.slide_to_fret = -1.0f;
+    held.chord_id = -1;
+    held.bend_first = -1;
+    std::string error;
+    RT_CHECK(engine.setChartVoice(seat, DCA_CHART_VOICE_GUITAR), "guitar voice setup failed");
+    RT_CHECK(engine.setChartNotes(seat, &held, 1, sizeof(held), nullptr, 0, error), error);
+    RT_CHECK(engine.setChartSourceEnabled(seat, true), "chart enable failed");
+    source.play();
+}
+
+void scenarioChartGainAboveUnity()
+{
+    beginScenario("RtChartGainAboveUnity");
+    using Stereo = std::array<std::vector<float>, 2>;
+    const auto measure = [](bool instrument, bool distorted, float gain, bool live)
+    {
+        Stereo samples;
+        StubToneInstrument vst;
+        Fixture fx;
+        if (! fx.ok()) { fail("engine did not start: " + fx.error()); return samples; }
+        auto& engine = fx.engine();
+        engine.setMonitorGain(0.45f);
+        engine.setMasterLimiter(true, -0.3f, 80.0f);
+        if (distorted)
+            RT_CHECK(engine.dspAddNode(0, "distortion") >= 0, "could not set up distortion");
+        TransportSource source(engine);
+        if (instrument)
+        {
+            RT_CHECK(engine.attachInstrumentPlugin(&vst), "instrument attach failed");
+            RT_CHECK(engine.setInstrumentRoute(0), "instrument route failed");
+            engine.setInstrumentGain(gain);
+        }
+        else
+        {
+            RT_CHECK(engine.setChartParams(0, gain, 0.0, DCA_CHART_SOURCE_MIX), "chart gain failed");
+            startChartGainSource(engine, source, 0);
+        }
+
+        auto* device = nulldev::manualDevice();
+        if (live)
+        {
+            fx.installInputStimulus(0.08f, 187.5);
+            auto& right = device->manualInputBuffers()[1];
+            std::fill(right.begin(), right.end(), 0.0f);
+        }
+        constexpr int blocks = 100;
+        for (auto& channel : samples) channel.reserve(blocks * (size_t) fx.blockSize());
+        warmUpAndArm(fx);
+        for (int block = 0; block < blocks; ++block)
+        {
+            fx.pumpArmed(1);
+            const auto& out = device->manualOutputBuffers();
+            for (size_t channel = 0; channel < samples.size(); ++channel)
+                samples[channel].insert(samples[channel].end(), out[channel].begin(), out[channel].end());
+        }
+        dcrt::disarm();
+        reportHeap("chart gain");
+        RT_CHECK(dcrt::allocCount() == 0 && dcrt::freeCount() == 0, "chart gain allocated or freed on callback");
+        RT_CHECK(engine.masterLimiterReductionDb() == 0.0f, "the gain fixture needs limiter headroom");
+        if (instrument) engine.detachInstrumentPlugin(&vst);
+        return samples;
+    };
+
+    const auto rms = [](const std::vector<float>& samples)
+    {
+        double energy = 0.0;
+        for (float sample : samples) energy += (double) sample * sample;
+        return samples.empty() ? 0.0 : std::sqrt(energy / (double) samples.size());
+    };
+    for (bool instrument : { false, true })
+        for (bool distorted : { false, true })
+        {
+            const std::string name = std::string(instrument ? "VST" : "synth") + (distorted ? " distorted" : " clean");
+            const auto unity = measure(instrument, distorted, 1.0f, true);
+            const double base = rms(unity[1]);
+            if (base < 0.001) { fail(name + " did not reach output"); continue; }
+            double guitarPeak = 0.0;
+            for (size_t i = 0; i < unity[0].size(); ++i)
+                guitarPeak = std::max(guitarPeak, (double) std::abs(unity[0][i] - unity[1][i]));
+            RT_CHECK(guitarPeak > 0.001, name + " did not render the live guitar");
+            note(name + " 100% RMS " + std::to_string(20.0 * std::log10(base)) + " dBFS");
+            for (float gain : { 1.5f, 2.0f })
+            {
+                const auto boosted = measure(instrument, distorted, gain, true);
+                const double ratio = rms(boosted[1]) / base;
+                note(name + " " + std::to_string(gain) + "x: " + std::to_string(20.0 * std::log10(ratio)) + " dB");
+                RT_CHECK(std::abs(ratio - gain) < 0.002, name + " boost did not scale linearly");
+                RT_CHECK(boosted[0].size() == unity[0].size(), name + " did not render every block");
+                float error = 0.0f;
+                for (size_t ch = 0; ch < unity.size(); ++ch)
+                    for (size_t i = 0; i < boosted[ch].size(); ++i)
+                        error = std::max(error, std::abs(boosted[ch][i] - gain * unity[ch][i]));
+                RT_CHECK(error < 1.0e-5f, name + " boost changed the normalized chart or live waveform");
+            }
+        }
+    endScenario();
+}
+
+void scenarioChartGainRampsOnItsSeat()
+{
+    beginScenario("RtChartGainRampsOnItsSeat");
+    for (bool instrument : { false, true })
+    {
+        StubToneInstrument vst;
+        Fixture fx;
+        if (! fx.ok()) { fail("engine did not start: " + fx.error()); break; }
+        auto& engine = fx.engine();
+        engine.setMonitorGain(1.0f);
+        fx.installInputStimulus(0.08f, 187.5, 1.5707963267948966);
+        auto* device = nulldev::manualDevice();
+        auto& right = device->manualInputBuffers()[1];
+        std::fill(right.begin(), right.end(), 0.0f);
+        const auto& left = device->manualInputBuffers()[0];
+        TransportSource source(engine);
+        const auto setGain = [&](float gain)
+        {
+            if (instrument) engine.setInstrumentGain(gain);
+            else RT_CHECK(engine.setChartParams(0, gain, 0.0, DCA_CHART_SOURCE_MIX), "chart gain failed");
+        };
+        const auto checkBlock = [&](float from, float to)
+        {
+            fx.pumpArmed(1);
+            const auto& out = device->manualOutputBuffers();
+            float error = 0.0f;
+            for (size_t i = 0; i < left.size(); ++i)
+            {
+                const float gain = from + (to - from) * (float) i / (float) left.size();
+                error = std::max(error, std::abs((out[0][i] - out[1][i]) - gain * left[i]));
+            }
+            RT_CHECK(error < 2.0e-5f, "live output missed the expected chart-gain ramp");
+        };
+
+        setGain(2.0f);
+        fx.pumpWarm(4);
+        checkBlock(1.0f, 1.0f);
+        if (instrument)
+        {
+            RT_CHECK(engine.attachInstrumentPlugin(&vst), "instrument attach failed");
+            RT_CHECK(engine.setInstrumentRoute(0), "instrument route failed");
+        }
+        else startChartGainSource(engine, source, 0);
+        setGain(1.0f);
+        warmUpAndArm(fx);
+        checkBlock(1.0f, 1.0f);
+        RT_CHECK(device->manualOutputBuffers()[1][0] != 0.0f, "chart did not reach the rig");
+        setGain(2.0f);
+        checkBlock(1.0f, 2.0f);
+        checkBlock(2.0f, 2.0f);
+        setGain(0.0f);
+        checkBlock(2.0f, 1.0f);
+        checkBlock(1.0f, 1.0f);
+        for (float sample : device->manualOutputBuffers()[1])
+            RT_CHECK(sample == 0.0f, "muting chart gain left chart sound");
+        setGain(0.5f);
+        checkBlock(1.0f, 1.0f);
+        setGain(2.0f);
+        checkBlock(1.0f, 2.0f);
+        checkBlock(2.0f, 2.0f);
+        if (! instrument)
+        {
+            source.pause();
+            checkBlock(2.0f, 1.0f);
+            checkBlock(1.0f, 1.0f);
+            source.play();
+            checkBlock(1.0f, 2.0f);
+            checkBlock(2.0f, 2.0f);
+        }
+        dcrt::disarm();
+        reportHeap("chart gain ramp");
+        RT_CHECK(dcrt::allocCount() == 0 && dcrt::freeCount() == 0, "chart ramp allocated or freed on callback");
+
+        if (instrument) engine.detachInstrumentPlugin(&vst);
+        else RT_CHECK(engine.setChartSourceEnabled(0, false), "chart disable failed");
+        checkBlock(2.0f, 1.0f);
+        checkBlock(1.0f, 1.0f);
+
+        // Seat 1 has a generator at 200% and its monitor is muted.
+        // Only seat 0's live input should reach the device, at unity.
+        engine.setPlayerCount(2);
+        engine.setPlayerInputChannel(0, 0);
+        engine.setPlayerInputChannel(1, 1);
+        engine.setPlayerMonitorGain(1, 0.0f);
+        TransportSource secondSource(engine);
+        if (instrument)
+        {
+            RT_CHECK(engine.attachInstrumentPlugin(&vst), "instrument reattach failed");
+            RT_CHECK(engine.setInstrumentRoute(1), "second-seat route failed");
+        }
+        else
+        {
+            RT_CHECK(engine.setChartParams(1, 2.0f, 0.0, DCA_CHART_SOURCE_MIX), "second-seat gain failed");
+            startChartGainSource(engine, secondSource, 1);
+        }
+        fx.pumpWarm(64);
+        const auto& mix = device->manualOutputBuffers();
+        float error = 0.0f;
+        for (const auto& channel : mix)
+            for (size_t i = 0; i < left.size(); ++i)
+                error = std::max(error, std::abs(channel[i] - left[i]));
+        RT_CHECK(error < 2.0e-5f, "chart boost reached a seat without chart sound");
+        if (instrument) engine.detachInstrumentPlugin(&vst);
+    }
+    endScenario();
+}
+
+// ABI v51 (DotCharter #751): seat routing. Seat 0's chart source and the
+// in-process instrument each enter the seats their MASK names, rendered once,
+// summed into every named seat's rig, and never the capture ring. Two seats on
+// a silent input: a seat's monitor gain decides whether ITS rig is heard, so
+// muting one seat at a time shows which rigs carry the generator.
+void scenarioSeatRoutingMasks()
+{
+    beginScenario("RtSeatRoutingMasks");
+    for (bool instrument : { false, true })
+    {
+        const std::string what = instrument ? "instrument" : "chart source";
+        StubToneInstrument vst;
+        Fixture fx;
+        if (! fx.ok()) { fail("engine did not start: " + fx.error()); break; }
+        auto& engine = fx.engine();
+        auto* device = nulldev::manualDevice();
+        for (auto& channel : device->manualInputBuffers()) std::fill(channel.begin(), channel.end(), 0.0f);
+        engine.setMonitorGain(1.0f);
+        engine.setPlayerCount(2);
+        engine.setPlayerInputChannel(0, 0);
+        engine.setPlayerInputChannel(1, 1);
+        TransportSource source(engine);
+        const auto route = [&](uint32_t mask)
+        {
+            const bool ok = instrument ? engine.setInstrumentRouteMask(mask) : engine.setChartRouteMask(0, mask);
+            RT_CHECK(ok, what + " route mask " + std::to_string(mask) + " was refused");
+        };
+        if (instrument)
+        {
+            RT_CHECK(engine.attachInstrumentPlugin(&vst), "instrument attach failed");
+            engine.setInstrumentGain(1.0f);
+        }
+        else startChartGainSource(engine, source, 0);
+
+        // Peak heard over 16 blocks with seat 0's and seat 1's monitors at g0 / g1.
+        const auto heard = [&](float g0, float g1)
+        {
+            engine.setPlayerMonitorGain(0, g0);
+            engine.setPlayerMonitorGain(1, g1);
+            fx.pumpArmed(4);   // the monitor ramps settle
+            float peak = 0.0f;
+            for (int i = 0; i < 16; ++i)
+            {
+                fx.pumpArmed(1);
+                peak = std::max(peak, fx.lastOutputPeak());
+            }
+            return peak;
+        };
+        route(0b10u);
+        warmUpAndArm(fx);
+        const float bassOnlyViaSeat1 = heard(0.0f, 1.0f);
+        const float bassOnlyViaSeat0 = heard(1.0f, 0.0f);
+        route(0b01u);
+        const float guitarOnlyViaSeat0 = heard(1.0f, 0.0f);
+        const float guitarOnlyViaSeat1 = heard(0.0f, 1.0f);
+        route(0b11u);
+        const float bothViaSeat0 = heard(1.0f, 0.0f);
+        const float bothViaSeat1 = heard(0.0f, 1.0f);
+        // One live seat: a mask naming only seat 1 falls back (chart: its own
+        // seat; instrument: the master), so the sound never vanishes.
+        engine.setPlayerCount(1);
+        route(0b10u);
+        const float oneSeatFallback = heard(1.0f, 1.0f);
+        dcrt::disarm();
+        reportHeap(("seat routing " + what).c_str());
+        RT_CHECK(dcrt::allocCount() == 0 && dcrt::freeCount() == 0,
+                 "seat routing (" + what + ") allocated or freed on the callback");
+        note(what + ": bass-only s1 " + std::to_string(bassOnlyViaSeat1) + " s0 " + std::to_string(bassOnlyViaSeat0)
+             + ", guitar-only s0 " + std::to_string(guitarOnlyViaSeat0) + " s1 " + std::to_string(guitarOnlyViaSeat1)
+             + ", both s0 " + std::to_string(bothViaSeat0) + " s1 " + std::to_string(bothViaSeat1)
+             + ", one-seat fallback " + std::to_string(oneSeatFallback));
+        // A muted seat is EXACTLY silent; a heard one need only be audible (the
+        // chart's one plucked note decays across the windows).
+        RT_CHECK(bassOnlyViaSeat1 > 1.0e-3f, what + " routed to seat 1 never came out of seat 1's rig");
+        RT_CHECK(bassOnlyViaSeat0 < 1.0e-6f, what + " routed to seat 1 still reached seat 0's rig");
+        RT_CHECK(guitarOnlyViaSeat0 > 1.0e-3f, what + " routed to seat 0 never came out of seat 0's rig");
+        RT_CHECK(guitarOnlyViaSeat1 < 1.0e-6f, what + " routed to seat 0 still reached seat 1's rig");
+        RT_CHECK(bothViaSeat0 > 1.0e-3f && bothViaSeat1 > 1.0e-3f, what + " routed to both seats missed one");
+        RT_CHECK(oneSeatFallback > 1.0e-3f, what + " went silent when its only routed seat was not live");
+        RT_CHECK(! fx.lastOutputHasNonFinite(), what + " routing put a NaN/Inf on the output");
+
+        RT_CHECK(! engine.setInstrumentRouteMask(1u << AudioEngine::kMaxPlayers)
+                     && ! engine.setChartRouteMask(0, 1u << AudioEngine::kMaxPlayers)
+                     && ! engine.setChartRouteMask(AudioEngine::kMaxPlayers, 1u),
+                 "an out-of-range seat mask or player was accepted");
+        RT_CHECK(engine.setChartRouteMask(1, 0u) && engine.chartRouteMask(1) == 0b10u,
+                 "mask 0 does not read back as the seat's own bit");
+        RT_CHECK(engine.setInstrumentRouteMask(0b110u) && engine.instrumentRoute() == 1,
+                 "the v38 one-seat view does not read the mask's lowest seat");
+        RT_CHECK(engine.setInstrumentRoute(-1) && engine.instrumentRouteMask() == 0u,
+                 "the v38 route -1 did not clear the mask");
+        if (instrument) engine.detachInstrumentPlugin(&vst);
+        else RT_CHECK(engine.setChartSourceEnabled(0, false), "chart disable failed");
+    }
+    endScenario();
+}
+
+// DotCharter #751 review (design D): the chart sound plays at the SAME master
+// level whichever seats it is routed to. A generator summed through two rigs
+// enters each at 1/2; without that, Guitar+Bass is ~+6 dB. Each route runs on a
+// FRESH engine over the same window, so the plucked note's decay is identical;
+// both seat rigs are the default (linear) chain. Gain 2.0 covers the monitor
+// boost (#753), which applies on every target seat.
+void scenarioSeatRoutingKeepsTheLevel()
+{
+    beginScenario("RtSeatRoutingKeepsTheLevel");
+    struct Level { double peak = 0.0; double rms = 0.0; };
+    const auto measure = [](bool instrument, uint32_t mask, float gain)
+    {
+        Level level;
+        StubToneInstrument vst;
+        Fixture fx;
+        if (! fx.ok()) { fail("engine did not start: " + fx.error()); return level; }
+        auto& engine = fx.engine();
+        auto* device = nulldev::manualDevice();
+        for (auto& channel : device->manualInputBuffers()) std::fill(channel.begin(), channel.end(), 0.0f);
+        engine.setMonitorGain(0.45f);
+        engine.setMasterLimiter(true, -0.3f, 80.0f);
+        engine.setPlayerCount(2);
+        engine.setPlayerInputChannel(0, 0);
+        engine.setPlayerInputChannel(1, 1);
+        engine.setPlayerMonitorGain(0, 1.0f);
+        engine.setPlayerMonitorGain(1, 1.0f);
+        TransportSource source(engine);
+        if (instrument)
+        {
+            RT_CHECK(engine.attachInstrumentPlugin(&vst), "instrument attach failed");
+            RT_CHECK(engine.setInstrumentRouteMask(mask), "instrument route mask refused");
+            engine.setInstrumentGain(gain);
+        }
+        else
+        {
+            RT_CHECK(engine.setChartRouteMask(0, mask), "chart route mask refused");
+            RT_CHECK(engine.setChartParams(0, gain, 0.0, DCA_CHART_SOURCE_MIX), "chart gain failed");
+            startChartGainSource(engine, source, 0);
+        }
+        constexpr int blocks = 60;
+        double energy = 0.0;
+        size_t count = 0;
+        warmUpAndArm(fx);
+        for (int block = 0; block < blocks; ++block)
+        {
+            fx.pumpArmed(1);
+            for (const auto& channel : device->manualOutputBuffers())
+                for (float s : channel)
+                {
+                    level.peak = std::max(level.peak, (double) std::abs(s));
+                    energy += (double) s * s;
+                    ++count;
+                }
+        }
+        level.rms = count > 0 ? std::sqrt(energy / (double) count) : 0.0;
+        dcrt::disarm();
+        reportHeap("seat routing level");
+        RT_CHECK(dcrt::allocCount() == 0 && dcrt::freeCount() == 0, "seat routing level allocated or freed on the callback");
+        RT_CHECK(engine.masterLimiterReductionDb() == 0.0f, "the level fixture needs limiter headroom");
+        RT_CHECK(! fx.lastOutputHasNonFinite(), "seat routing level put a NaN/Inf on the output");
+        if (instrument) engine.detachInstrumentPlugin(&vst);
+        else engine.setChartSourceEnabled(0, false);
+        return level;
+    };
+    const auto db = [](double a, double b) { return 20.0 * std::log10(std::max(a, 1.0e-12) / std::max(b, 1.0e-12)); };
+    for (bool instrument : { false, true })
+        for (float gain : { 1.0f, 2.0f })
+        {
+            const std::string name = std::string(instrument ? "instrument" : "chart source") + " at " + std::to_string(gain);
+            const Level guitar = measure(instrument, 0b01u, gain);
+            const Level bass   = measure(instrument, 0b10u, gain);
+            const Level both   = measure(instrument, 0b11u, gain);
+            if (guitar.rms < 1.0e-4) { fail(name + " did not reach the output"); continue; }
+            note(name + ": guitar peak " + std::to_string(guitar.peak) + " rms " + std::to_string(guitar.rms)
+                 + ", both " + std::to_string(db(both.peak, guitar.peak)) + " dB peak / "
+                 + std::to_string(db(both.rms, guitar.rms)) + " dB rms, bass " + std::to_string(db(bass.rms, guitar.rms)) + " dB rms");
+            RT_CHECK(std::abs(db(both.peak, guitar.peak)) < 0.5 && std::abs(db(both.rms, guitar.rms)) < 0.5,
+                     name + ": Guitar+Bass is not at the one-seat level");
+            RT_CHECK(std::abs(db(bass.rms, guitar.rms)) < 0.5, name + ": Bass only is not at the Guitar only level");
+        }
+    endScenario();
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -12785,6 +15832,7 @@ int main(int argc, char** argv)
     run("RtMidiOutputRetriesARefusedSendAsJuce8Did",         &scenarioMidiOutputRetriesLikeJuce8);
     // ABI v38 (chart source), appended last like everything since the bridge rule.
     run("RtChartSourceFeedsTheSeatRigNotTheCaptureRing",      &scenarioChartSource);
+    run("RtChartSourceDisableFadesOnAnInputlessDevice",       &scenarioChartSourceDisableFadesWithNoInput);
     // The chart voice (#39 step 1), appended last like everything since the bridge rule.
     run("RtChartVoiceRendersEveryArticulationWithoutAllocating", &scenarioChartVoice);
     run("RtChartModelSwapCrossfadesAndReleasesThePack",         &scenarioChartModelSwap);
@@ -12815,6 +15863,40 @@ int main(int argc, char** argv)
     run("RtWemSourceIsPreloadedNeverStreamed",                  &scenarioWemSourceIsPreloadedNeverStreamed);
     // ABI v49: a one-output device folds L and R into its channel, appended last.
     run("RtMonoOutputFoldsLAndRWithoutAllocating",              &scenarioMonoOutputFoldsLAndR);
+    // DotCharter #646 (bridge v4: the sandbox bridge routes every seat), appended last.
+    run("RtSandboxRoutesEverySeatWithoutAllocating",            &scenarioSandboxRoutesEverySeat);
+    run("RtSandboxInstrumentTripSharesTheCallbackDeadline",     &scenarioSandboxInstrumentTripSharesTheDeadline);
+    run("RtSandboxChildDropsARequestOverwrittenDuringItsCopy",  &scenarioSandboxChildDropsAnOverwrittenRequest);
+    // JuceSharp #22 (plugin attach transactions, seqlock clocks), appended last.
+    run("RtSyncCallRethrowsAPluginExceptionOnTheCaller",        &scenarioSyncCallRethrowsOnTheCaller);
+    run("RtPluginAttachMovesTheInstanceBetweenRoles",           &scenarioPluginAttachMovesBetweenRoles);
+    run("RtInstrumentReattachTakesTheSlotBack",                 &scenarioInstrumentReattachTakesTheSlotBack);
+    run("RtThrowingInstrumentIsLatchedUntilReattach",           &scenarioThrowingInstrumentIsLatched);
+    run("RtSeqlockClockPayloadIsAtomicAndTornFree",             &scenarioSeqlockClockIsTornFree);
+    run("RtGoodInstrumentReplacingALatchedOneRenders",          &scenarioGoodInstrumentReplacingALatchedOneRenders);
+    run("RtInstrumentLatchClearsOnReprepare",                   &scenarioInstrumentLatchClearsOnReprepare);
+    run("RtFailedAttachKeepsThePriorRole",                      &scenarioFailedAttachKeepsThePriorRole);
+    run("RtReplacedSongClockSourceIsDrained",                   &scenarioReplacedSongClockSourceIsDrained);
+    run("RtNeverPublishedSourceSkipsTheClockDrain",             &scenarioNeverPublishedSourceSkipsTheClockDrain);
+    run("RtGroupedSourceReportsAudiblePosition",                &scenarioGroupedSourceReportsAudiblePosition);
+    run("RtClickProducersAreSerialized",                        &scenarioClickProducersAreSerialized);
+    run("RtClickClearSurvivesAFullQueue",                       &scenarioClickClearSurvivesAFullQueue);
+    run("RtRenderToWavFailureKeepsDestination",                 &scenarioRenderToWavFailureKeepsDestination);
+    // JuceSharp #23 (the seat loop counts live seats only), appended last.
+    run("RtChartSourceOnASeatThatLeftTheLiveRangeStopsTheSeatLoop", &scenarioChartSourceOffLiveSeatStopsTheSeatLoop);
+    run("RtChartReplacedVoiceFadeRunsTheSeatLoopOnAnInputlessDevice", &scenarioChartReplacedVoiceFadeRunsTheSeatLoop);
+    // DotCharter #696 (ABI v50: one sandbox child per seat), appended last.
+    run("RtSandboxEachSeatOwnsItsBridge",                       &scenarioSandboxEachSeatOwnsItsBridge);
+    run("RtSandboxOverloadedSeatDropsOnlyItsOwnChain",          &scenarioSandboxOverloadedSeatDropsOnlyItsOwnChain);
+    run("RtSandboxWedgedChildPutsOnlyItsSeatInPollOnly",        &scenarioSandboxWedgedChildPutsOnlyItsSeatInPollOnly);
+    run("RtSandboxInstrumentOnAHealthySeatKeepsSounding",       &scenarioSandboxInstrumentOnAHealthySeatKeepsSounding);
+    run("RtSandboxFourSeatsWaitAtMostOneBudget",                &scenarioSandboxFourSeatsWaitAtMostOneBudget);
+    run("RtSongKeyIsTheSongOnlyInBothSeatPaths",                &scenarioSongKeyIsTheSongOnlyInBothSeatPaths);
+    run("RtSandboxArmPreparesTheMappingOutsideTheBarrier",      &scenarioSandboxArmPreparesOutsideTheBarrier);
+    run("RtChartGainAboveUnity",                              &scenarioChartGainAboveUnity);
+    run("RtChartGainRampsOnItsSeat",                           &scenarioChartGainRampsOnItsSeat);
+    run("RtSeatRoutingMasks",                                  &scenarioSeatRoutingMasks);
+    run("RtSeatRoutingKeepsTheLevel",                          &scenarioSeatRoutingKeepsTheLevel);
 
     // --- meta: the run-list ORDER -----------------------------------------
     // Runs under `--only` as well, unlike the two meta-assertions below: it

@@ -336,3 +336,54 @@ if(MSVC)
 endif()
 add_test(NAME rsamp_table COMMAND juce_sharp_rsamp_table_test)
 set_tests_properties(rsamp_table PROPERTIES TIMEOUT 120)
+
+# Test-only VST3 effect (DotCharter #646): output = input x 0.5, no editor, no
+# parameters. JuceSharp's VstSandboxSeatEndToEndTests loads it through the real
+# juce_vst_host.exe on chosen seats. Built ONLY here, from JUCE's bundled VST3
+# SDK: never shipped, never installed, never copied to a system plugin folder
+# (COPY_PLUGIN_AFTER_BUILD off). The bundle is copied to the build folder's
+# test-plugins/DcTestHalfGain.vst3, a fixed path the managed test looks for and
+# skips without.
+if(WIN32)
+    juce_add_plugin(dc_test_halfgain
+        COMPANY_NAME "JuceSharp Tests"
+        BUNDLE_ID com.jucesharp.tests.dctesthalfgain
+        PLUGIN_MANUFACTURER_CODE Jsts
+        PLUGIN_CODE Dchg
+        FORMATS VST3
+        PRODUCT_NAME "DcTestHalfGain"
+        IS_SYNTH FALSE
+        NEEDS_MIDI_INPUT FALSE
+        NEEDS_MIDI_OUTPUT FALSE
+        IS_MIDI_EFFECT FALSE
+        EDITOR_WANTS_KEYBOARD_FOCUS FALSE
+        COPY_PLUGIN_AFTER_BUILD FALSE)
+    target_sources(dc_test_halfgain PRIVATE vst3_halfgain/HalfGainPlugin.cpp)
+    target_compile_definitions(dc_test_halfgain
+        PUBLIC
+            JUCE_WEB_BROWSER=0
+            JUCE_USE_CURL=0
+            JUCE_VST3_CAN_REPLACE_VST2=0)
+    target_link_libraries(dc_test_halfgain
+        PRIVATE
+            juce::juce_audio_processors
+            juce::juce_audio_utils
+        PUBLIC
+            juce::juce_recommended_config_flags
+            juce::juce_recommended_warning_flags)
+    # A target of its own rather than a POST_BUILD step: JUCE writes the
+    # bundle's moduleinfo.json in a step it appends after every POST_BUILD
+    # added here, so only a dependent target copies the finished bundle.
+    add_custom_target(dc_test_halfgain_plugin ALL
+        COMMAND ${CMAKE_COMMAND} -E rm -rf "${CMAKE_BINARY_DIR}/test-plugins/DcTestHalfGain.vst3"
+        COMMAND ${CMAKE_COMMAND} -E copy_directory
+                "$<GENEX_EVAL:$<TARGET_PROPERTY:dc_test_halfgain_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>"
+                "${CMAKE_BINARY_DIR}/test-plugins/DcTestHalfGain.vst3"
+        COMMENT "Copying the test-only DcTestHalfGain.vst3 to the build folder's test-plugins/"
+        VERBATIM)
+    add_dependencies(dc_test_halfgain_plugin dc_test_halfgain_VST3)
+    # The RT gate recipe builds only `--target juce_sharp_rtcheck`, and the
+    # JuceSharp suite run after it would then skip the end-to-end test for want
+    # of the bundle. So the gate's own build step produces the plugin too.
+    add_dependencies(juce_sharp_rtcheck dc_test_halfgain_plugin)
+endif()

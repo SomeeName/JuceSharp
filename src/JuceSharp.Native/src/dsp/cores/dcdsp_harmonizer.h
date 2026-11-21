@@ -145,6 +145,23 @@ public:
     /// stereo rig paid 4x for the eight-channel worst case.
     long long reprimeChannelClears() const noexcept { return reprimeChannelClears_; }
 
+    /// TEST SURFACE. How far the NEXT grain's analysis start sits behind the
+    /// newest input sample. It has to stay inside the input ring: negative is
+    /// a grain that waits for input that will never come in time (a stall),
+    /// beyond the ring is a grain read from overwritten history.
+    long long analysisLagForTest() const noexcept {
+        return inCount_ - static_cast<long long>(std::floor(nextAnalysisStart()));
+    }
+
+    /// TEST SURFACE. The next grain's analysis start, the analysis hop in
+    /// force and the grains produced since the last (re)prime.
+    double    nextAnalysisStartForTest() const noexcept { return nextAnalysisStart(); }
+    double    analysisHopForTest() const noexcept { return ha_; }
+    long long grainsProducedForTest() const noexcept { return grainM_; }
+
+    /// TEST SURFACE. The input ring length in force, in samples.
+    int inputRingSamplesForTest() const noexcept { return inSize_; }
+
     /// TEST SURFACE. True while BOTH latency modes' Hann tables are sized for
     /// this rate, i.e. a mode flip cannot reach buildHann() on the callback.
     bool hannTablesCoverBothModes() const noexcept {
@@ -156,6 +173,9 @@ public:
         stRead_    = 0.0;
         stEnd_     = 0;
         grainM_    = 0;
+        anaBase_   = 0.0;
+        anaHop_    = ha_;
+        anaGrains_ = 0;
         inCount_   = 0;
         primed_    = false;
         for (int c = 0; c < kMaxChannels; ++c) ch_[c].reset();
@@ -343,7 +363,10 @@ private:
     void reprimeSoft() {
         stRead_  = 0.0;
         stEnd_   = 0;
-        grainM_  = 0;
+        grainM_    = 0;
+        anaBase_   = 0.0;
+        anaHop_    = ha_;
+        anaGrains_ = 0;
         primed_  = false;
         inCount_ = 0;
         // numChannels_, not kMaxChannels: this runs on the AUDIO CALLBACK (a
@@ -363,10 +386,27 @@ private:
     // Grain production (WSOLA time-scale, rate 1 — resampling is done on read).
     // Returns false if not enough buffered input is available yet.
     // =======================================================================
+    /// The analysis start of the NEXT grain: the grid product `base + hop x
+    /// grains` of the segment that began at the last hop change. With no change
+    /// since the (re)prime the base is 0 and the grain count is grainM_, so a
+    /// fixed pitch is exactly `ha_ * grainM_`. Never `ha_ * grainM_` across a
+    /// change: a live semitone change moves `ha_`, and that product would jump
+    /// the whole history's worth of hops at once.
+    double nextAnalysisStart() const {
+        return anaBase_ + anaHop_ * static_cast<double>(anaGrains_);
+    }
+
     bool produceGrain(int nActive) {
         // Ideal analysis start for this grain on the fixed grid (float index,
         // absolute in input-sample terms).  Marches at Ha per grain.
-        const double ideal = ha_ * static_cast<double>(grainM_);
+        // A hop change starts a new segment where the old grid had reached:
+        // the grains so far keep the hop they were taken with.
+        if (ha_ != anaHop_) {
+            anaBase_   = nextAnalysisStart();
+            anaHop_    = ha_;
+            anaGrains_ = 0;
+        }
+        const double ideal = nextAnalysisStart();
 
         // Consume any per-sample onset flag raised since the last grain, arming a
         // transient hold on that channel.  During the hold the similarity search
@@ -417,6 +457,7 @@ private:
         }
 
         ++grainM_;   // 50 % overlap: next grain at base+hs_, frontier = grainM_*hs_
+        ++anaGrains_;  // the next grain sits one hop further on this segment's grid
         return true;
     }
 
@@ -654,6 +695,9 @@ private:
     double    stRead_  = 0.0;    // fractional read pos in stretched domain
     long long stEnd_   = 0;      // one-past highest written stretched pos
     long long grainM_  = 0;      // grains produced
+    double    anaBase_   = 0.0;  // analysis start of the segment's first grain (input samples)
+    double    anaHop_    = 512.0; // the hop of the current segment (ha_ when it began)
+    long long anaGrains_ = 0;    // grains produced on the current segment
     long long inCount_ = 0;      // input samples pushed
     bool      primed_  = false;
 

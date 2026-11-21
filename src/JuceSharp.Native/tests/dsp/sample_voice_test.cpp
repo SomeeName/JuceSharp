@@ -707,6 +707,72 @@ void testCodec(const Fixture& g)
     std::fill(damaged.begin() + (std::ptrdiff_t) dataOff, damaged.begin() + (std::ptrdiff_t) dataOff + 64, (uint8_t) 0);
     SamplePack pd;
     check(! parsePack(damaged.data(), damaged.size(), pd, err) && pd.zones.empty(), "damaged coded samples are rejected (" + err + ")");
+    // #20: header / zone offsets that WRAP a u64 sum must be rejected on both the
+    // eager and the lazy path, never indexed (a wrapped start was an OOB read/write).
+    auto wrapRejected = [&](const std::vector<uint8_t>& good, size_t at, const char* what) {
+        std::vector<uint8_t> b = good;
+        const uint64_t evil = 0xFFFFFFFFFFFFFFF0ull;
+        std::memcpy(b.data() + at, &evil, 8);
+        SamplePack pe, pl;
+        std::string e1, e2;
+        check(! parsePack(b.data(), b.size(), pe, e1) && ! e1.empty() && pe.zones.empty(), std::string(what) + " (eager: " + e1 + ")");
+        check(! parsePackLazy(std::make_shared<const std::vector<uint8_t>>(b), pl, e2) && ! e2.empty(), std::string(what) + " (lazy: " + e2 + ")");
+    };
+    wrapRejected(raw, 64 + 16, "v1: a zone start near 2^64 is rejected");
+    wrapRejected(coded, 64 + 16, "v2: a zone start near 2^64 is rejected");
+    wrapRejected(raw, 24, "v1: a zone table offset near 2^64 is rejected");
+    wrapRejected(coded, 24, "v2: a zone table offset near 2^64 is rejected");
+
+    // The FILE reader sizes its prefix read as zonesOff + zones * 40: that sum wraps for an
+    // offset near 2^64 and must be refused as an offset outside the file, not read short.
+    {
+        std::vector<uint8_t> b = raw;
+        const uint64_t evil = 0xFFFFFFFFFFFFFFF0ull;
+        std::memcpy(b.data() + 24, &evil, 8);
+        const std::filesystem::path file = std::filesystem::temp_directory_path() / "dc_wrap_prefix_test.dcvp";
+        { std::ofstream f(file, std::ios::binary | std::ios::trunc); f.write((const char*) b.data(), (std::streamsize) b.size()); }
+        SamplePack pf;
+        std::string e;
+        check(! loadPackLazy(file, pf, e) && e == "offsets outside the file", "a file pack whose zone table offset wraps is refused with the offsets message (" + e + ")");
+        std::error_code ec;
+        std::filesystem::remove(file, ec);
+    }
+
+    // Zone ranges are bounded IN TOTAL, not only one by one: zones that all claim the whole
+    // coded region (or the whole sample range) would make a lazy decode allocate zones x region.
+    {
+        const uint32_t zoneCount = 5;
+        std::vector<uint8_t> b = coded;
+        uint64_t dataOffH = 0, textOffH = 0;
+        std::memcpy(&dataOffH, b.data() + 32, 8);
+        std::memcpy(&textOffH, b.data() + 48, 8);
+        const uint32_t region = (uint32_t) (textOffH - dataOffH);
+        const uint64_t zero = 0;
+        for (uint32_t i = 0; i < zoneCount; ++i)
+        {
+            std::memcpy(b.data() + 64 + 40 * i + 24, &region, 4);
+            std::memcpy(b.data() + 64 + 40 * i + 32, &zero, 8);
+        }
+        SamplePack pl;
+        std::string e;
+        check(! parsePackLazy(std::make_shared<const std::vector<uint8_t>>(b), pl, e)
+                  && e == "the zones' samples add up to more than the pack holds",
+              "zones whose coded bytes add up to more than the file are rejected (" + e + ")");
+
+        b = coded;
+        const uint64_t samples = 300u * 1024u * 1024u;   // each zone claims 300 Mi samples: 600 Mi in all, past the 512 Mi cap
+        std::memcpy(b.data() + 40, &samples, 8);
+        const uint32_t len = (uint32_t) samples;
+        for (uint32_t i = 0; i < 2; ++i)
+        {
+            std::memcpy(b.data() + 64 + 40 * i + 12, &len, 4);
+            std::memcpy(b.data() + 64 + 40 * i + 16, &zero, 8);
+        }
+        SamplePack pm;
+        check(! parsePackLazy(std::make_shared<const std::vector<uint8_t>>(b), pm, e)
+                  && e == "the zones' samples add up to more than the pack holds",
+              "zones whose lengths add up past the sample cap are rejected (" + e + ")");
+    }
 }
 
 // ---- tests ---------------------------------------------------------------------

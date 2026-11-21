@@ -261,6 +261,15 @@ cmake --build build --config Release --target juce_sharp_rtcheck
 ctest --test-dir build -C Release --output-on-failure --no-tests=error
 ```
 
+The `juce_sharp_rtcheck` target depends on `dc_test_halfgain_plugin`, so that
+same build step also produces the test-only VST3 at
+`build/test-plugins/DcTestHalfGain.vst3` (offline: JUCE's bundled VST3 SDK).
+The JuceSharp suite run after it (`tools/agent/Invoke-Gate.ps1 -Solution
+JuceSharp\JuceSharp.sln ...`, which builds no native code) therefore RUNS
+`VstSandboxSeatEndToEndTests` instead of skipping it; the full native build
+(`cmake --build build --config Release`, CI's first build step) produces it as
+part of `ALL`. The test still skips without it and names the path it looked for.
+
 - **THE ORDER OF THE RUN LIST IS LOAD-BEARING, AND IT IS NOW ENFORCED.**
   `scenarioBridgeWaitBounded` launches the out-of-process VST host child and
   TIMES its handshake, so anything registered AHEAD of it shifts that timing and
@@ -358,7 +367,7 @@ ctest --test-dir build -C Release --output-on-failure --no-tests=error
   tick clicks). The chain had scrubbed its input and every stage boundary since
   it existed; the engine stages downstream of it had not, and two of them take
   samples from code this project does not compile — `processInputChain` (the
-  user's VST3s) and `RemoteVstBridge::process` (a memcpy out of a child
+  user's VST3s) and `RemoteVstBridge::collect` (a memcpy out of a child
   process's mapping). One NaN block therefore latched that seat's input EQ
   silent for the session, and the peak meter reads the same buffer, so the UI
   showed a dead input with nothing saying why. Three passes now: after the input
@@ -502,9 +511,20 @@ ctest --test-dir build -C Release --output-on-failure --no-tests=error
   2026-08-21: the VSTi loads, MIDI still reaches it (the request is written and
   the event set regardless of the wait), and no audio ever comes back. A merely
   slow child keeps its heartbeat alive, so the managed health timer never
-  restarts it either. `RemoteVstBridge` now re-tries the real synchronous wait
+  restarts it either. `RemoteVstBridge` re-tries the real synchronous wait
   every `kRetrySyncEveryBlocks` (256, ~0.7 s at 128/48k) so a child that has
   finished loading is found healthy again.
+  **With several seats, poll-only is per seat** (ABI v50, DotCharter #696):
+  every seat has its own bridge and child, every request of a callback is
+  POSTED first and then collected against ONE one-block deadline
+  (`RemoteVstBridge::collect`), so only the seat whose child is too slow misses,
+  and after `kPollOnlyAfterMissedCallbacks` missed callbacks only ITS bridge is
+  poll-only; the other seats and the sandboxed instrument keep being processed.
+  A poll-only bridge never holds the collection open. One callback waits at most
+  one block budget in total however many seats post.
+  `RtSandboxOverloadedSeatDropsOnlyItsOwnChain` (seat 0 at 0.5 blocks, seat 1
+  at 1.2, and mirrored) and `RtSandboxWedgedChildPutsOnlyItsSeatInPollOnly`
+  assert exactly this.
   **The stub child needs `setAnswerDelayUs` for that phase to mean anything.**
   With a zero-delay stub the immediate poll succeeds by accident and phase C
   passed at 580/600 waits against the BROKEN code. At a realistic 300 µs it
@@ -512,7 +532,7 @@ ctest --test-dir build -C Release --output-on-failure --no-tests=error
 
 ### The scenario roster — all 47 (76 by 2026-09-27: re-count)
 
-**2026-10-24, ABI v49 appended `RtMonoOutputFoldsLAndRWithoutAllocating`: 96 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp`.** **2026-10-20, ABI v48 appended `RtWemSourceIsPreloadedNeverStreamed`: 95 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp`.** **2026-10-18, ABI v47 appended `RtExternalProcessInsertExchangesWithoutAllocatingAndFallsBackDry`: 94 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp`; a full run printed 97 summary lines, all PASS.** **2026-10-13, JuceSharp #29 appended `RtCallbackLoadIsMeasuredWithoutAllocating`: 92 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp` (91 before it).** **2026-10-12, JuceSharp #31 appended `RtSparseOutputMaskIsPackedAndTheMasterBusKeepsLAndRApart`: 88 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp` (87 before it).** **2026-10-12, JuceSharp #32 appended the three `RtSpeedCrossingUnityIsSeamless*`: 87 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp` (84 before them).** **2026-10-07, #411 appended `RtPreloadedSourceHoldsSixteenBitPcm`: 82 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp` (81 before it).** **2026-09-28, the JUCE 9 port appended one (`RtMidiOutputRetriesARefusedSendAsJuce8Did`): a
+**2026-11-21, ABI v51 (DotCharter #751) appended `RtSeatRoutingMasks` and `RtSeatRoutingKeepsTheLevel`: 127 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp`.** **2026-11-15, ABI v50 (DotCharter #696) appended `RtSandboxEachSeatOwnsItsBridge`, `RtSandboxOverloadedSeatDropsOnlyItsOwnChain`, `RtSandboxWedgedChildPutsOnlyItsSeatInPollOnly`, `RtSandboxInstrumentOnAHealthySeatKeepsSounding` and `RtSandboxFourSeatsWaitAtMostOneBudget`: 121 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp` (116 before them).** **2026-11-15, bridge v4 (DotCharter #646) appended `RtSandboxInstrumentTripSharesTheCallbackDeadline` and `RtSandboxChildDropsARequestOverwrittenDuringItsCopy`: 99 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp`.** **2026-11-15, bridge v4 (DotCharter #646) appended `RtSandboxRoutesEverySeatWithoutAllocating`: 97 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp`.** **2026-10-24, ABI v49 appended `RtMonoOutputFoldsLAndRWithoutAllocating`: 96 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp`.** **2026-10-20, ABI v48 appended `RtWemSourceIsPreloadedNeverStreamed`: 95 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp`.** **2026-10-18, ABI v47 appended `RtExternalProcessInsertExchangesWithoutAllocatingAndFallsBackDry`: 94 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp`; a full run printed 97 summary lines, all PASS.** **2026-10-13, JuceSharp #29 appended `RtCallbackLoadIsMeasuredWithoutAllocating`: 92 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp` (91 before it).** **2026-10-12, JuceSharp #31 appended `RtSparseOutputMaskIsPackedAndTheMasterBusKeepsLAndRApart`: 88 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp` (87 before it).** **2026-10-12, JuceSharp #32 appended the three `RtSpeedCrossingUnityIsSeamless*`: 87 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp` (84 before them).** **2026-10-07, #411 appended `RtPreloadedSourceHoldsSixteenBitPcm`: 82 lines match `run("Rt` / `wanted("Rt` in `rt_main.cpp` (81 before it).** **2026-09-28, the JUCE 9 port appended one (`RtMidiOutputRetriesARefusedSendAsJuce8Did`): a
 full run prints 78 summary lines (75 registered scenarios, `RtRunListOrderIsPinned` and the
 two meta-assertions).** **Re-counted 2026-09-27 after ABI v37 appended two: 74 lines match
 `run("Rt` / `wanted("Rt` in `rt_main.cpp`, plus the two meta-scenarios.** The
@@ -596,6 +616,14 @@ a subset, and the rest were invisible.
 | `RtStretchQualityIsPerEngineNotPerProcess` | `dca_engine_set_stretch_quality` took a handle and ignored it, so one engine loading stems silently re-voiced another engine's stretchers. No device needed. |
 | `RtSoloSeatOnAMultiInputDeviceFollowsItsCaptureChannel` | Four DC inputs at four distinct levels: which number comes out says which channel the rig was filled from, read against the capture ring in the same breath. |
 | `RtBridgeWaitIsBounded` | The sandbox bridge's bounded wait. **Flakes intermittently and not because of your change** — see the bullet above, and note the stub needs `setAnswerDelayUs`. |
+| `RtSandboxRoutesEverySeatWithoutAllocating` | Bridge v4 and ABI v50: a second seat round-trips its own input to its OWN child only while that child's seat mask names it, with no MIDI, without allocating; a re-arm keeps the routing. Phase D (both children wedged): at most one request posted per child per callback, a miss on each seat's own bridge, at most one callback over the block budget plus 1/16. Phase G (seat 0 at 0.5 blocks, seat 1 at 0.8): both answered with no miss inside one budget, judged over 8 samples, one preempted callback tolerated (red on a per-seat sequential wait). |
+| `RtSandboxInstrumentTripSharesTheCallbackDeadline` | Bridge v4 and ABI v50: with no input device, seat 1's request (its own child) and the instrument's zero-input request (seat 0's child) are collected together against one deadline: both wedged cost one miss each and ONE wait; at 0.5 and 0.8 blocks both are answered inside one budget (8 samples, one preempted callback tolerated). |
+| `RtSandboxEachSeatOwnsItsBridge` | ABI v50: each seat's bridge has its own mapping and child: seat 1 armed alone sends seat 0's child nothing and moves no seat-0 statistic; with both armed each child sees only its seat's requests (MIDI only on seat 0's); disarming one seat leaves the other processing; a wedged seat-1 child counts misses only on seat 1; the v19 entry point arms seat 0. Red (8 assertions) with the per-seat entry points ignoring the seat. |
+| `RtSandboxOverloadedSeatDropsOnlyItsOwnChain` | ABI v50: one seat's child at 1.2 blocks, the other at 0.5 (and mirrored): the healthy seat is processed every callback with no miss, the slow one misses alone; it waits the deadline until poll-only latches at callback #3 and less than 3/4 of a block after. |
+| `RtSandboxWedgedChildPutsOnlyItsSeatInPollOnly` | ABI v50: seat 1's child wedged for 16 callbacks beside a healthy seat 0: one request per callback to the wedged child, only seat 1 in poll-only, seat 0 never dry; seat 1 answering again leaves poll-only (answered in at least 6 of 8). |
+| `RtSandboxInstrumentOnAHealthySeatKeepsSounding` | ABI v50: with no input device, the sandboxed instrument (seat 0's child at 0.5 blocks) keeps sounding while seat 1's take overloads its own child at 1.2 blocks. |
+| `RtSandboxFourSeatsWaitAtMostOneBudget` | ABI v50: four seats at 0.4 blocks each are all answered inside one budget (a sequential wait needs 1.6); four wedged children cost one wait of at most one budget plus 1/16, one request per child per callback. |
+| `RtSandboxChildDropsARequestOverwrittenDuringItsCopy` | Bridge v4: `dcvb::takeRequest` reads the seat with the acquire and drops a request the parent began or finished overwriting during the copy (staged inside the copy callback, no sleep), including one the real `RemoteVstBridge` overwrites; a request still being written is not taken; the answer a re-preparing child gives without copying (`dcvb::answerInactive`, `juce_vst_host`) publishes nothing for a request the parent began overwriting (red with the check removed). Pure memory work, no device. |
 | `RtXrunCounterIsRealAndQuiet` | The dropout counters over the manual-pump device: real when there is a dropout, quiet when there is not. |
 | `RtXrunStatsAbiHonoursStructBytes` | The EXPORT, not the engine method — the `cbSize` contract, which a unit test of `fillXrunStats` can never reach. |
 

@@ -171,9 +171,9 @@ takes an optional `component` index for a multi-component bundle since ABI v33 �
 The parent also has to **create the mapping and initialise its header first**:
 `dcvb::SharedHeader` (`src/JuceSharp.Native/include/dotcharter_vst_bridge.h`)
 begins with `magic` `'DCVB'` (`0x44435642`) and `version`
-(`dcvb::kBridgeVersion`, **3** today — v3 appended the per-event MIDI sample
-offsets after the instrument region, so the mapping is `dcvb::kTotalBytes`
-= 197,704 bytes), and both sides refuse a version they do
+(`dcvb::kBridgeVersion`, **4** today — v3 appended the per-event MIDI sample
+offsets after the instrument region and v4 the seat-routing block after those,
+so the mapping is `dcvb::kTotalBytes` = 197,712 bytes), and both sides refuse a version they do
 not recognise rather than running on a half-understood layout. The child
 publishes `childState = kChildReady` once it is up, bumps `heartbeat` on every
 worker wakeup — a stalled heartbeat is how the parent notices a crash — and

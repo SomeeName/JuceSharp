@@ -49,6 +49,13 @@ public:
     /// playback position so the playhead doesn't drift when tempo != 1.
     int getReadAheadOutputSamples() const noexcept;
 
+    /// A second home for the published read-ahead: the engine's stem-group
+    /// stretcher mirrors it into the engine, so a grouped source reads it
+    /// without touching this object. Control thread: set before this source is
+    /// added to a mixer, cleared after it was removed. Null = no mirror.
+    void setReadAheadMirror(std::atomic<int>* mirror) noexcept
+    { readAheadMirror_.store(mirror, std::memory_order_release); }
+
     /// Which Rubber Band engine the stretcher was actually built with at the
     /// last prepareToPlay: true = R2 (Faster), false = R3 (Finer). Test hook —
     /// the choice is otherwise invisible from outside, which is how a
@@ -157,6 +164,14 @@ private:
     /// that call used to dereference the unique_ptr with nothing stopping
     /// releaseResources() from resetting it mid-call.
     std::atomic<int>                              readAheadOut_ { 0 };
+    std::atomic<std::atomic<int>*>                readAheadMirror_ { nullptr };
+    /// Stores readAheadOut_ and, when set, the mirror. Every publish goes here.
+    void publishReadAhead(int samples) noexcept
+    {
+        readAheadOut_.store(samples, std::memory_order_release);
+        if (auto* mirror = readAheadMirror_.load(std::memory_order_acquire))
+            mirror->store(samples, std::memory_order_release);
+    }
 
     juce::AudioBuffer<float>                      pullBuffer_;
     juce::AudioBuffer<float>                      retrieveBuffer_;

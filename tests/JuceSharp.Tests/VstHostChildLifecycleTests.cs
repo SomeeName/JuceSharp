@@ -96,9 +96,9 @@ public sealed class VstHostChildLifecycleTests
 
             var hello = ReadLine(reader);
             Assert.Contains("\"hello\"", hello, StringComparison.Ordinal);
-            // Bridge v3 (JuceSharp #28): the child reports the layout it was
-            // built against, and DotCharter kills a child whose number differs.
-            Assert.Matches("\"bridgeVersion\":\\s*3\\b", hello);
+            // The child reports the layout it was built against (bridge v4,
+            // DotCharter #646), and DotCharter kills a child whose number differs.
+            Assert.Matches("\"bridgeVersion\":\\s*4\\b", hello);
 
             // A load that FAILS is enough: what is under test is the shutdown
             // that follows a command which went through onMessageThread, not
@@ -108,6 +108,14 @@ public sealed class VstHostChildLifecycleTests
                          + missing.Replace("\\", "\\\\") + "\",\"bypass\":false}\n");
             var loadReply = ReadLine(reader);
             Assert.Contains("\"id\": 1", loadReply.Replace("\"id\":1", "\"id\": 1"), StringComparison.Ordinal);
+
+            // Bridge v4: a slot belongs to a seat, and a seat the layout cannot
+            // route is refused before any plugin is touched, never clamped onto
+            // another player's chain.
+            writer.Write("{\"op\":\"load\",\"id\":3,\"slot\":\"b\",\"path\":\""
+                         + missing.Replace("\\", "\\\\") + "\",\"bypass\":false,\"seat\":4}\n");
+            var seatReply = ReadLine(reader);
+            Assert.Contains("seat 4 is out of range", seatReply, StringComparison.Ordinal);
 
             writer.Write("{\"op\":\"quit\",\"id\":2}\n");
             // Acknowledged BEFORE the shutdown sequence starts, so a failure
@@ -127,25 +135,29 @@ public sealed class VstHostChildLifecycleTests
     }
 
     /// <summary>
-    /// Bridge v3 grew the mapping by a MIDI-timing block, and a named mapping
-    /// keeps the size it was created with. A v3 child pointed at a mapping a
-    /// v2 parent created must refuse it — exit 2 before it ever touches the
-    /// control pipe, saying WHY in its log — not view past the end of it or
-    /// run a layout the parent does not speak.
+    /// Bridge v3 grew the mapping by a MIDI-timing block and v4 by a
+    /// seat-routing block, and a named mapping keeps the size it was created
+    /// with. A v4 child pointed at a mapping an older parent created must
+    /// refuse it — exit 2 before it ever touches the control pipe, saying WHY
+    /// in its log — not view past the end of it or run a layout the parent
+    /// does not speak. A v3 parent would run every seat's plugins over the one
+    /// input it sends.
     /// </summary>
-    [NativeAvailableFact]
-    public void AChildGivenABridgeV2Mapping_RefusesItAndExits()
+    [NativeAvailableTheory]
+    [InlineData(2u, 197184)]   // v2: no MIDI-timing block
+    [InlineData(3u, 197704)]   // v3: no seat-routing block
+    public void AChildGivenAnOlderBridgeMapping_RefusesItAndExits(uint version, int mappingBytes)
     {
         var exe = Path.Combine(AppContext.BaseDirectory, "juce_vst_host.exe");
         if (!File.Exists(exe)) Assert.Skip($"no juce_vst_host.exe next to the test assembly ({exe})");
 
         var suffix = Guid.NewGuid().ToString("N");
         var shmName = "dcvb_v2child_shm_" + suffix;
-        using var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateOrOpen(shmName, 197184);
-        using (var acc = mmf.CreateViewAccessor(0, 197184))
+        using var mmf = System.IO.MemoryMappedFiles.MemoryMappedFile.CreateOrOpen(shmName, mappingBytes);
+        using (var acc = mmf.CreateViewAccessor(0, mappingBytes))
         {
             acc.Write(0, 0x44435642u);   // 'DCVB'
-            acc.Write(4, 2u);            // bridge v2
+            acc.Write(4, version);
             acc.Write(8, 8192u);
             acc.Write(12, 2u);
         }
@@ -179,8 +191,8 @@ public sealed class VstHostChildLifecycleTests
             child.WaitForExit();   // flush the redirected log
             var text = string.Join(" | ", log);
             Assert.Equal(2, child.ExitCode);
-            Assert.Contains("bridge layout mismatch: header v2", text, StringComparison.Ordinal);
-            Assert.Contains("this build v3", text, StringComparison.Ordinal);
+            Assert.Contains($"bridge layout mismatch: header v{version}", text, StringComparison.Ordinal);
+            Assert.Contains("this build v4", text, StringComparison.Ordinal);
         }
         finally
         {

@@ -1097,10 +1097,26 @@ private:
     dcdsp::GraphicEqCore core_; dcdsp::GraphicEqParams p_{}; ParamMailbox<dcdsp::GraphicEqParams> mail_;
 };
 
+// The latency a core has ADOPTED, published for the message thread. The core
+// writes its own latency fields on the audio thread (the mailbox drains at the
+// top of process(), under processMutex_ only), so a message-thread read of
+// those fields under writeMutex_ races that write. The adapter stores the
+// adopted number here right after the drain and readers load it.
+class AdoptedLatency
+{
+public:
+    template <typename CoreT>
+    void publish(const CoreT& core) noexcept { v_.store(core.latencySamples(), std::memory_order_relaxed); }
+    int load() const noexcept { return v_.load(std::memory_order_relaxed); }
+private:
+    std::atomic<int> v_{0};
+};
+
 class HarmonizerModule : public DspModule
 {
 public:
-    void prepare(double sr, int mb, int nch) override { core_.prepare(sr, mb, nch); }
+    HarmonizerModule() { latency_.publish(core_); }
+    void prepare(double sr, int mb, int nch) override { core_.prepare(sr, mb, nch); latency_.publish(core_); }
     void reset() override { core_.reset(); }
     bool setParam(const char* id, float v) override
     {
@@ -1118,20 +1134,27 @@ public:
         else return false;
         return true;
     }
-    void process(float* const* ch, int nch, int n) override { mail_.applyPending(core_); core_.process(ch, nch, n); }
+    void process(float* const* ch, int nch, int n) override
+    {
+        mail_.applyPending(core_);
+        latency_.publish(core_);
+        core_.process(ch, nch, n);
+    }
     // WSOLA pipeline delay. The core has always reported it; the adapter used
     // to swallow it, so the chain-latency export (v30) would have called the
     // one genuinely late module in a rig zero-latency.
-    int latencySamples() const override { return core_.latencySamples(); }
+    int latencySamples() const override { return latency_.load(); }
     const char* typeId() const override { return "harmonizer"; }
 private:
     dcdsp::HarmonizerCore core_; dcdsp::HarmonizerParams p_{}; ParamMailbox<dcdsp::HarmonizerParams> mail_;
+    AdoptedLatency latency_;
 };
 
 class VibratoModule : public DspModule
 {
 public:
-    void prepare(double sr, int mb, int nch) override { core_.prepare(sr, mb, nch); }
+    VibratoModule() { latency_.publish(core_); }
+    void prepare(double sr, int mb, int nch) override { core_.prepare(sr, mb, nch); latency_.publish(core_); }
     void reset() override { core_.reset(); }
     bool setParam(const char* id, float v) override
     {
@@ -1149,12 +1172,18 @@ public:
         else return false;
         return true;
     }
-    void process(float* const* ch, int nch, int n) override { mail_.applyPending(core_); core_.process(ch, nch, n); }
+    void process(float* const* ch, int nch, int n) override
+    {
+        mail_.applyPending(core_);
+        latency_.publish(core_);
+        core_.process(ch, nch, n);
+    }
     // The nominal (centre) modulated tap — see the core.
-    int latencySamples() const override { return core_.latencySamples(); }
+    int latencySamples() const override { return latency_.load(); }
     const char* typeId() const override { return "vibrato"; }
 private:
     dcdsp::VibratoCore core_; dcdsp::VibratoParams p_{}; ParamMailbox<dcdsp::VibratoParams> mail_;
+    AdoptedLatency latency_;
 };
 
 class SustainerModule : public DspModule
@@ -1732,7 +1761,8 @@ private:
 class WhammyModule : public DspModule
 {
 public:
-    void prepare(double sr, int mb, int nch) override { core_.prepare(sr, mb, nch); }
+    WhammyModule() { latency_.publish(core_); }
+    void prepare(double sr, int mb, int nch) override { core_.prepare(sr, mb, nch); latency_.publish(core_); }
     void reset() override { core_.reset(); }
     bool setParam(const char* id, float v) override
     {
@@ -1758,12 +1788,18 @@ public:
         else return false;
         return true;
     }
-    void process(float* const* ch, int nch, int n) override { mail_.applyPending(core_); core_.process(ch, nch, n); }
+    void process(float* const* ch, int nch, int n) override
+    {
+        mail_.applyPending(core_);
+        latency_.publish(core_);
+        core_.process(ch, nch, n);
+    }
     // WSOLA pipeline delay (shorter in the lowLatency mode).
-    int latencySamples() const override { return core_.latencySamples(); }
+    int latencySamples() const override { return latency_.load(); }
     const char* typeId() const override { return "whammy"; }
 private:
     dcdsp::WhammyCore core_; dcdsp::WhammyParams p_{}; ParamMailbox<dcdsp::WhammyParams> mail_;
+    AdoptedLatency latency_;
 };
 
 class ReverseDelayModule : public DspModule

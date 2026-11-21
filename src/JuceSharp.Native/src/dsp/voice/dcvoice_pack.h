@@ -186,6 +186,9 @@ inline T rd(const uint8_t* p) noexcept
 } // namespace packdetail
 
 namespace packdetail {
+/// The most samples a coded pack may decode to, and the most its zones may add up to (1 GiB of int16).
+inline constexpr uint64_t kPackMaxSamples = (uint64_t) 512 * 1024 * 1024;
+
 /// Where a pack's samples are, per zone (filled by parseIndex).
 struct Index
 {
@@ -233,19 +236,23 @@ inline bool parseIndex(const uint8_t* b, size_t avail, uint64_t n, SamplePack& p
     }
     // A coded pack's data region runs up to the text; its sample count is what
     // it DECODES to, so it is capped (1 GiB of int16) instead of tied to the file.
-    if (zonesOff + (uint64_t) zoneCount * 40 > n || dataOff > n || textOff > n || textBytes > n - textOff
+    if (zonesOff > n || (n - zonesOff) / 40 < zoneCount || dataOff > n || textOff > n || textBytes > n - textOff
         || (dataOff & 1) != 0
-        || (coded ? (textOff < dataOff || dataSamples > (uint64_t) 512 * 1024 * 1024) : dataSamples > (n - dataOff) / 2))
+        || (coded ? (textOff < dataOff || dataSamples > kPackMaxSamples) : dataSamples > (n - dataOff) / 2))
     {
         error = "offsets outside the file";
         return false;
     }
-    if (zonesOff + (uint64_t) zoneCount * 40 > avail)
+    if (zonesOff > avail || (avail - zonesOff) / 40 < zoneCount)
     {
         error = "the zone table was not read";
         return false;
     }
     const uint64_t codedRegion = coded ? textOff - dataOff : 0;
+    // The zones' stored bytes and decoded samples are bounded in TOTAL too: a lazy decode
+    // buffers every stored byte it reads and every sample it decodes, so zones that each
+    // claim the whole region must not multiply it.
+    uint64_t totalStored = 0, totalSamples = 0;
     ix.coded = coded;
     ix.dataOff = dataOff;
     ix.dataSamples = dataSamples;
@@ -284,7 +291,7 @@ inline bool parseIndex(const uint8_t* b, size_t avail, uint64_t n, SamplePack& p
         }
         if (o.art >= kArtCount || o.variant > 1 || ! std::isfinite(o.rootHz) || o.rootHz <= 0.0f
             || ! std::isfinite(o.gain) || o.gain <= 0.0f || o.gain > 1.0f || o.length < 8
-            || o.start + o.length > dataSamples)
+            || o.start > dataSamples || o.length > dataSamples - o.start)
         {
             error = "zone " + std::to_string(i) + " is malformed";
             return false;
@@ -293,6 +300,13 @@ inline bool parseIndex(const uint8_t* b, size_t avail, uint64_t n, SamplePack& p
         {
             ix.srcOff[i] = o.start * 2;
             ix.srcBytes[i] = o.length * 2;
+        }
+        totalStored += ix.srcBytes[i];   // at most 2^33 per zone (a raw zone's length x 2) x 100,000 zones: cannot wrap
+        totalSamples += o.length;
+        if (totalStored > n || (coded && totalSamples > kPackMaxSamples))
+        {
+            error = "the zones' samples add up to more than the pack holds";
+            return false;
         }
         p.layerCount[o.art][o.variant] = std::max(p.layerCount[o.art][o.variant], (int) o.layer + 1);
     }
@@ -483,12 +497,13 @@ inline bool loadPackLazy(const std::filesystem::path& path, SamplePack& out, std
     // like the parser caps it: 100,000 zones of 40 bytes).
     const uint64_t zonesOff = packdetail::rd<uint64_t>(head + 24);
     const uint64_t zoneCount = packdetail::rd<uint32_t>(head + 12);
-    const uint64_t prefix = zonesOff + std::min<uint64_t>(zoneCount, 100000) * 40;
-    if (prefix > (uint64_t) size || zonesOff < 64)
+    const uint64_t tableBytes = std::min<uint64_t>(zoneCount, 100000) * 40;
+    if (zonesOff < 64 || zonesOff > (uint64_t) size || tableBytes > (uint64_t) size - zonesOff)
     {
         error = "offsets outside the file";
         return false;
     }
+    const uint64_t prefix = zonesOff + tableBytes;   // inside the file: cannot wrap
     std::vector<uint8_t> bytes((size_t) prefix);
     f.seekg(0);
     if (! f.read((char*) bytes.data(), (std::streamsize) prefix))

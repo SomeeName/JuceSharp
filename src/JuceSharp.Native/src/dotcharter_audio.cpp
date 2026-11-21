@@ -8,6 +8,7 @@
 #include "RubberBandAudioSource.h"
 #include "StemSeparator.h"
 #include "AbiArgs.h"
+#include "SyncCall.h"
 #include "Utf8Truncate.h"
 #include "wem/WemAudioFormat.h"
 #include "DeviceRateWav.h"
@@ -403,34 +404,23 @@ public:
     // DotCharter has been observed to do this, but treat callSync bodies as
     // "must not provoke nested host re-entry" until a timeout/escape path
     // is added here.
+    //
+    // An exception out of `f` (a plugin's prepareToPlay inside an attach, say)
+    // is caught ON THE MESSAGE THREAD and rethrown HERE, on the caller's
+    // thread, where the export's guard() reports it — see SyncCall.h.
     template <class F>
     auto callSync(F&& f) -> std::invoke_result_t<F>
     {
-        using R = std::invoke_result_t<F>;
         ensureStarted();
 
         if (juce::MessageManager::existsAndIsCurrentThread())
             return f();
 
-        if constexpr (std::is_void_v<R>)
-        {
-            std::function<void()> fn = std::forward<F>(f);
-            void* user = &fn;
-            juce::MessageManager::getInstance()->callFunctionOnMessageThread(
-                [](void* u) -> void* { (*static_cast<std::function<void()>*>(u))(); return nullptr; },
-                user);
-        }
-        else
-        {
-            R result{};
-            auto wrapper = [&]() { result = f(); };
-            std::function<void()> fn = wrapper;
-            void* user = &fn;
-            juce::MessageManager::getInstance()->callFunctionOnMessageThread(
-                [](void* u) -> void* { (*static_cast<std::function<void()>*>(u))(); return nullptr; },
-                user);
-            return result;
-        }
+        return dcsync::callThroughTrampoline(std::forward<F>(f),
+            [](dcsync::Trampoline trampoline, void* user)
+            {
+                juce::MessageManager::getInstance()->callFunctionOnMessageThread(trampoline, user);
+            });
     }
 
 private:
@@ -528,6 +518,119 @@ struct EditorWindow : public juce::DocumentWindow
     bool closeScheduled_ = false;
 };
 
+// An instrument attach REPLACES the engine's single instrument slot, so the
+// plugin it displaced no longer holds it: clear that plugin's flag. Message
+// thread, inside the attach transaction; the registry lock keeps a plugin that
+// is being unloaded from going away under the scan.
+inline void setInstrumentFlagOf(Engine& e, const juce::AudioPluginInstance* inst, bool holdsSlot)
+{
+    if (inst == nullptr) return;
+    std::lock_guard<std::mutex> lk(e.pluginsMutex);
+    for (auto* other : e.plugins)
+        if (other != nullptr && other->instance.get() == inst)
+            other->attachedAsInstrument = holdsSlot;
+}
+
+// The roles an instance holds IN THE ENGINE (its slot and chains, not the
+// Plugin flags): the instrument slot, and the seat whose input chain holds it
+// with its index there. An attach records this before it takes the instance
+// out of its roles, so a failed attach can put it back.
+// ONE SEAT PER INSTANCE: the ABI cannot put an instance into two seats'
+// chains (every attach runs leaveAllRoles first, which empties every seat),
+// so one recorded seat is the whole input role; currentRoles asserts it.
+struct PluginRoles
+{
+    bool instrument = false;
+    int  seat       = -1;
+    int  index      = -1;
+};
+
+inline PluginRoles currentRoles(dotcharter::AudioEngine& impl, const juce::AudioPluginInstance* inst)
+{
+    PluginRoles r;
+    r.instrument = impl.instrumentPlugin() == inst;
+    for (int seat = 0; seat < dotcharter::AudioEngine::kMaxPlayers; ++seat)
+    {
+        const int index = impl.inputChainIndexOf(inst, seat);
+        if (index < 0) continue;
+        jassert(r.seat < 0);   // one seat per instance (see PluginRoles)
+        if (r.seat < 0) { r.seat = seat; r.index = index; }
+    }
+    return r;
+}
+
+// ONE ROLE PER INSTANCE: take it off the instrument bus and out of every
+// seat's input chain (each detach waits one block) BEFORE a new role
+// re-lays-out its buses and prepares it, so no role is running it meanwhile
+// and it is never processed twice per callback. Message thread.
+inline void leaveAllRoles(Plugin& p)
+{
+    auto& impl = p.engine->impl;
+    auto* inst = p.instance.get();
+    impl.detachInstrumentPlugin(inst);   // no-op unless it holds the slot
+    impl.detachInputPlugin(inst);        // every seat; no-op where absent
+    p.attachedAsInstrument = false;
+    p.attached             = false;
+    p.attachedPlayer       = -1;
+}
+
+// After a failed attach: back into the roles it had, at the same seat and the
+// same index in that seat's chain (exact, because the whole attach is one
+// message-thread transaction and nothing else edits that chain meanwhile).
+// Starts from "in no role" (abandonAttach). A role whose restore throws is
+// left again, even when the throw came after its publish, so the instance is
+// never in a role the flags do not name; the flags are then read back from
+// the engine.
+inline void restoreRoles(Plugin& p, const PluginRoles& roles) noexcept
+{
+    auto& impl = p.engine->impl;
+    auto* inst = p.instance.get();
+    if (roles.instrument)
+    {
+        try { (void) impl.attachInstrumentPlugin(inst); }
+        catch (...) { try { impl.detachInstrumentPlugin(inst); } catch (...) {} }
+    }
+    if (roles.seat >= 0)
+    {
+        try { (void) impl.attachInputPlugin(inst, roles.seat, roles.index); }
+        catch (...) { try { impl.detachInputPlugin(inst); } catch (...) {} }
+    }
+    const auto now = currentRoles(impl, inst);
+    p.attachedAsInstrument = now.instrument;
+    p.attached             = now.seat >= 0;
+    p.attachedPlayer       = now.seat;
+}
+
+// A FAILED ATTACH STARTS ITS RESTORE FROM "IN NO ROLE". The failure may come
+// after the target chain or slot was already published, so the instance first
+// leaves the target role (both detaches are no-ops where it is absent; every
+// other role was emptied by leaveAllRoles). Without that a restore would put it
+// back into its old role as well: two roles, flags naming one. When the detach
+// itself throws, no restore runs (it could only add a second role) and the
+// flags are read back from the engine.
+inline void abandonAttach(Plugin& p, const PluginRoles& prior) noexcept
+{
+    auto& impl = p.engine->impl;
+    auto* inst = p.instance.get();
+    bool inNoRole = false;
+    try
+    {
+        impl.detachInstrumentPlugin(inst);
+        impl.detachInputPlugin(inst);
+        inNoRole = true;
+    }
+    catch (...) {}
+    if (inNoRole)
+    {
+        restoreRoles(p, prior);
+        return;
+    }
+    const auto now = currentRoles(impl, inst);
+    p.attachedAsInstrument = now.instrument;
+    p.attached             = now.seat >= 0;
+    p.attachedPlayer       = now.seat;
+}
+
 // Tear a single Plugin down. MUST NOT be called from the JuceHost message
 // thread (we block on it). Editor is reset first to keep VST3s like BIAS FX,
 // Helix and Neural DSP — which crash if their editor outlives their
@@ -543,22 +646,21 @@ inline void teardownPluginAndDelete(Plugin* p)
     // it is already on the message thread, so this is also what makes the
     // "MUST NOT be called from the message thread" note above conservative
     // rather than load-bearing.)
-    if ((p->attached || p->attachedAsInstrument) && p->engine && p->instance)
+    //
+    // Decided by the ENGINE's state, not by the flags: both detaches are
+    // no-ops where the instance is absent, and a flag that ever disagreed with
+    // the engine would otherwise free an instance the audio thread still runs.
+    if (p->engine && p->instance)
     {
         JuceHost::instance().callSync([p]
         {
-            if (p->attached)
-            {
-                try { p->engine->impl.detachInputPlugin(p->instance.get()); }
-                catch (...) {}
-                p->attached = false;
-            }
-            if (p->attachedAsInstrument)
-            {
-                try { p->engine->impl.detachInstrumentPlugin(p->instance.get()); }
-                catch (...) {}
-                p->attachedAsInstrument = false;
-            }
+            try { p->engine->impl.detachInputPlugin(p->instance.get()); }
+            catch (...) {}
+            try { p->engine->impl.detachInstrumentPlugin(p->instance.get()); }
+            catch (...) {}
+            p->attached             = false;
+            p->attachedPlayer       = -1;
+            p->attachedAsInstrument = false;
         });
     }
 
@@ -593,7 +695,128 @@ inline void teardownPluginAndDelete(Plugin* p)
     delete p;
 }
 
+#if DCA_RTCHECK
+std::atomic<int> g_failRenderWritesFromBlock { -1 };
+std::atomic<int> g_failRenderReadsFromBlock { -1 };
+std::atomic<bool> g_failRenderReadsPastEnd { false };
+#endif
+
+// One source read of dca_render_to_wav (`block` counts the reads of one render):
+// false when the reader could not decode that range.
+bool readRenderBlock(juce::AudioFormatReader& reader, juce::AudioBuffer<float>& buffer, int startSample,
+                     int numSamples, juce::int64 sourcePos, juce::int64 block)
+{
+    const bool read = reader.read(&buffer, startSample, numSamples, sourcePos, true, true);
+#if DCA_RTCHECK
+    const int failFrom = g_failRenderReadsFromBlock.load();
+    if (failFrom >= 0 && block >= failFrom) return false;
+    if (g_failRenderReadsPastEnd.load() && sourcePos + numSamples > reader.lengthInSamples) return false;
+#else
+    (void) block;
+#endif
+    return read;
+}
+
+// The resampling render's source. juce::AudioFormatReaderSource ignores what
+// reader->read returns, so an unreadable block would be rendered as silence;
+// this one reads through readRenderBlock and records the first failure, which
+// the render checks after every block before the destination is replaced.
+// juce::ResamplingAudioSource asks for a few samples past the end on the last
+// block: only the part inside lengthInSamples is read, the rest is silence, so
+// a reader that refuses reads past its end (JUCE's MP3 reader) still renders.
+class CheckedRenderReaderSource final : public juce::PositionableAudioSource
+{
+public:
+    explicit CheckedRenderReaderSource(juce::AudioFormatReader& reader) noexcept : reader_(reader) {}
+
+    bool failed() const noexcept { return failed_; }
+
+    void prepareToPlay(int, double) override {}
+    void releaseResources() override {}
+    void getNextAudioBlock(const juce::AudioSourceChannelInfo& info) override
+    {
+        if (info.numSamples <= 0) return;
+        const int inside = (int) juce::jlimit<juce::int64>(0, info.numSamples, reader_.lengthInSamples - nextPos_);
+        if (inside > 0 && ! readRenderBlock(reader_, *info.buffer, info.startSample, inside, nextPos_, reads_++))
+            failed_ = true;
+        if (inside < info.numSamples)
+            info.buffer->clear(info.startSample + inside, info.numSamples - inside);
+        nextPos_ += info.numSamples;
+    }
+    void setNextReadPosition(juce::int64 pos) override { nextPos_ = pos; }
+    juce::int64 getNextReadPosition() const override { return nextPos_; }
+    juce::int64 getTotalLength() const override { return reader_.lengthInSamples; }
+    bool isLooping() const override { return false; }
+
+private:
+    juce::AudioFormatReader& reader_;
+    juce::int64 nextPos_ = 0;
+    juce::int64 reads_   = 0;
+    bool        failed_  = false;
+};
+
+// One block of dca_render_to_wav: true when the writer took all of it.
+bool writeRenderBlock(juce::AudioFormatWriter& writer, const juce::AudioBuffer<float>& buffer,
+                      int numSamples, juce::int64 block)
+{
+    const bool written = writer.writeFromAudioSampleBuffer(buffer, 0, numSamples);
+#if DCA_RTCHECK
+    const int failFrom = g_failRenderWritesFromBlock.load();
+    if (failFrom >= 0 && block >= failFrom) return false;
+#else
+    (void) block;
+#endif
+    return written;
+}
+
 } // namespace
+
+#if DCA_RTCHECK
+// Internal gate seam, never exported: from render block `block` on (-1 = off),
+// writeRenderBlock reports a failed write, the way a full disk would; from
+// source read `block` on, readRenderBlock reports an unreadable range; with
+// past-end failures on, any read that touches a sample at or past the source's
+// length fails, the way JUCE's MP3 reader does.
+namespace dca_rtcheck {
+void failRenderWritesFromBlockForTest(int block) { g_failRenderWritesFromBlock.store(block); }
+void failRenderReadsFromBlockForTest(int block) { g_failRenderReadsFromBlock.store(block); }
+void failRenderReadsPastEndForTest(bool on) { g_failRenderReadsPastEnd.store(on); }
+} // namespace dca_rtcheck
+#endif
+
+#if DCA_RTCHECK
+// Internal gate seam, never exported and absent from the shipped DLL: wraps an
+// in-process AudioPluginInstance in a plugin handle registered on `engine`, the
+// way dca_plugin_load does once a VST3 is instantiated, so the RT gate can drive
+// the attach / detach exports against a stub plugin. dca_plugin_unload frees it.
+namespace dca_rtcheck {
+dca_plugin_t adoptPluginForTest(dca_engine_t engine, std::unique_ptr<juce::AudioPluginInstance> instance)
+{
+    auto* eng = reinterpret_cast<Engine*>(engine);
+    if (eng == nullptr || instance == nullptr) return nullptr;
+    auto* p = new Plugin();
+    p->engine   = eng;
+    p->instance = std::move(instance);
+    {
+        std::lock_guard<std::mutex> lk(eng->pluginsMutex);
+        eng->plugins.push_back(p);
+    }
+    return reinterpret_cast<dca_plugin_t>(p);
+}
+
+dotcharter::AudioEngine* engineForTest(dca_engine_t engine)
+{
+    auto* eng = reinterpret_cast<Engine*>(engine);
+    return eng != nullptr ? &eng->impl : nullptr;
+}
+
+bool instrumentFlagForTest(dca_plugin_t plugin)
+{
+    auto* p = reinterpret_cast<Plugin*>(plugin);
+    return p != nullptr && p->attachedAsInstrument.load();
+}
+} // namespace dca_rtcheck
+#endif
 
 // p3-48: ABI marshalling invariants. Underlying-type assertions ensure
 // dca_status / dca_driver / dca_log_level always cross the ABI as 32-bit
@@ -1829,6 +2052,45 @@ DCA_API dca_status DCA_CALL dca_engine_get_instrument_route(dca_engine_t handle,
     auto* e = reinterpret_cast<Engine*>(handle);
     if (!e || !out_player) return DCA_ERR_INVALID_ARG;
     *out_player = (int32_t) e->impl.instrumentRoute();
+    return DCA_OK;
+}
+
+// ABI v51 (#751): seat routing masks. Atomic stores, no device round trip.
+DCA_API dca_status DCA_CALL dca_engine_set_instrument_route_mask(dca_engine_t handle, uint32_t seat_mask)
+{
+    auto* e = reinterpret_cast<Engine*>(handle);
+    if (!e) return DCA_ERR_INVALID_ARG;
+    return e->impl.setInstrumentRouteMask(seat_mask) ? DCA_OK : DCA_ERR_INVALID_ARG;
+}
+
+DCA_API dca_status DCA_CALL dca_engine_get_instrument_route_mask(dca_engine_t handle, uint32_t* out_mask)
+{
+    if (out_mask) *out_mask = 0;
+    auto* e = reinterpret_cast<Engine*>(handle);
+    if (!e || !out_mask) return DCA_ERR_INVALID_ARG;
+    *out_mask = e->impl.instrumentRouteMask();
+    return DCA_OK;
+}
+
+DCA_API dca_status DCA_CALL dca_engine_chart_source_set_route_mask_for_player(dca_engine_t handle,
+                                                                              int32_t player,
+                                                                              uint32_t seat_mask)
+{
+    auto* e = reinterpret_cast<Engine*>(handle);
+    if (!e) return DCA_ERR_INVALID_ARG;
+    return e->impl.setChartRouteMask((int) player, seat_mask) ? DCA_OK : DCA_ERR_INVALID_ARG;
+}
+
+DCA_API dca_status DCA_CALL dca_engine_chart_source_get_route_mask_for_player(dca_engine_t handle,
+                                                                              int32_t player,
+                                                                              uint32_t* out_mask)
+{
+    if (out_mask) *out_mask = 0;
+    auto* e = reinterpret_cast<Engine*>(handle);
+    if (!e || !out_mask) return DCA_ERR_INVALID_ARG;
+    const uint32_t mask = e->impl.chartRouteMask((int) player);
+    if (mask == 0) return DCA_ERR_INVALID_ARG;
+    *out_mask = mask;
     return DCA_OK;
 }
 
@@ -3955,15 +4217,25 @@ DCA_API dca_status DCA_CALL dca_plugin_attach_to_input_for_player(dca_plugin_t h
     {
         // Serialize the whole transition, including the idempotence check.
         // Two callers must never prepare/append the same instance twice.
-        if (p->attached.load() && p->attachedPlayer.load() == (int) player) return;
-        if (p->attached.load())
+        // Decided by the ENGINE's chains and slot, not by this plugin's flags.
+        auto& impl = p->engine->impl;
+        auto* inst = p->instance.get();
+        const auto prior = currentRoles(impl, inst);
+        if (prior.seat == (int) player && ! prior.instrument)
         {
-            p->engine->impl.detachInputPlugin(p->instance.get());
-            p->attached = false;
-            p->attachedPlayer = -1;
+            p->attached       = true;
+            p->attachedPlayer = (int) player;
+            return;
         }
-        if (!p->engine->impl.attachInputPlugin(p->instance.get(), (int) player))
+        leaveAllRoles(*p);
+        // A FAILED ATTACH KEEPS THE ROLE IT HAD: the caller gets the error and
+        // the instance goes back to the instrument slot or its old seat.
+        bool attached = false;
+        try { attached = impl.attachInputPlugin(inst, (int) player); }
+        catch (...) { abandonAttach(*p, prior); throw; }
+        if (!attached)
         {
+            abandonAttach(*p, prior);
             result = DCA_ERR_PLUGIN;
             return;
         }
@@ -3988,7 +4260,7 @@ DCA_API dca_status DCA_CALL dca_plugin_detach_from_input(dca_plugin_t handle)
     if (!p || !p->engine || !p->instance) return DCA_ERR_INVALID_ARG;
     JuceHost::instance().callSync([&]
     {
-        if (!p->attached.load()) return;
+        // By the engine's chains, not the flag: a no-op where it is absent.
         p->engine->impl.detachInputPlugin(p->instance.get());
         p->attached = false;
         p->attachedPlayer = -1;
@@ -4130,18 +4402,58 @@ DCA_API dca_status DCA_CALL dca_plugin_attach_to_instrument(dca_plugin_t handle)
     return guard("dca_plugin_attach_to_instrument", [&]() -> dca_status {
     auto* p = reinterpret_cast<Plugin*>(handle);
     if (!p || !p->engine || !p->instance) return DCA_ERR_INVALID_ARG;
-    if (p->attachedAsInstrument) return DCA_OK;
 
-    // Detaching any previously attached instrument from the same engine is
-    // the caller's responsibility — we replace the slot here either way.
-    bool ok = false;
+    // The whole transition is one message-thread transaction, and it decides
+    // by the engine's SLOT, not by this plugin's flag: attaching another
+    // plugin replaces the slot without asking this one, so "attached once"
+    // says nothing about who holds it now (attach A, B, A must put A back).
+    dca_status result = DCA_OK;
     JuceHost::instance().callSync([&]
     {
-        ok = p->engine->impl.attachInstrumentPlugin(p->instance.get());
+        auto& impl = p->engine->impl;
+        auto* inst = p->instance.get();
+        if (impl.instrumentPlugin() == inst)
+        {
+            p->attachedAsInstrument = true;
+            return;
+        }
+        const auto prior = currentRoles(impl, inst);
+        leaveAllRoles(*p);
+        // The slot is replaced, not shared; attachInstrumentPlugin waits for
+        // the displaced plugin's in-flight block before returning. A FAILED
+        // ATTACH KEEPS THE ROLE IT HAD: the caller gets the error and the
+        // instance goes back to its seat, at its old place in that chain.
+        auto* displaced = impl.instrumentPlugin();
+        // A FAILED ATTACH GIVES THE SLOT BACK. A failure after the publish
+        // empties the slot (abandonAttach takes this instance back out); the
+        // plugin it displaced goes back in through the same publish path
+        // (pointer and generation together), and the caller still gets this
+        // attach's error. The displaced plugin held no other role (one role per
+        // instance). When putting it back fails too, it leaves the slot again,
+        // which stays empty, and its flag is read back from the engine.
+        auto abandon = [&]
+        {
+            abandonAttach(*p, prior);
+            if (displaced != nullptr && impl.instrumentPlugin() == nullptr)
+            {
+                try { (void) impl.attachInstrumentPlugin(displaced); }
+                catch (...) { try { impl.detachInstrumentPlugin(displaced); } catch (...) {} }
+            }
+            setInstrumentFlagOf(*p->engine, displaced, impl.instrumentPlugin() == displaced);
+        };
+        bool attached = false;
+        try { attached = impl.attachInstrumentPlugin(inst); }
+        catch (...) { abandon(); throw; }
+        if (!attached)
+        {
+            abandon();
+            result = DCA_ERR_PLUGIN;
+            return;
+        }
+        p->attachedAsInstrument = true;
+        setInstrumentFlagOf(*p->engine, displaced, false);
     });
-    if (!ok) return DCA_ERR_PLUGIN;
-    p->attachedAsInstrument = true;
-    return DCA_OK;
+    return result;
 });
 }
 
@@ -4160,9 +4472,11 @@ DCA_API dca_status DCA_CALL dca_plugin_detach_from_instrument(dca_plugin_t handl
     // callSync calls straight through when it is already ON the message thread
     // (existsAndIsCurrentThread), so this cannot deadlock a caller that arrives
     // from a JUCE callback — see the D-07 note on callSync.
+    //
+    // detachInstrumentPlugin is a no-op unless this instance holds the slot,
+    // so a plugin another attach displaced cannot empty the slot it lost.
     JuceHost::instance().callSync([&]
     {
-        if (! p->attachedAsInstrument) return;
         p->engine->impl.detachInstrumentPlugin(p->instance.get());
         p->attachedAsInstrument = false;
     });
@@ -4172,21 +4486,23 @@ DCA_API dca_status DCA_CALL dca_plugin_detach_from_instrument(dca_plugin_t handl
 
 // --- Out-of-process VST bridge (ABI v19) -----------------------------------
 
-DCA_API dca_status DCA_CALL dca_engine_set_remote_bridge(
+// ABI v50: one bridge per seat; the v19 pair below is seat 0's.
+DCA_API dca_status DCA_CALL dca_engine_set_remote_bridge_for_player(
     dca_engine_t handle,
+    int32_t      player,
     const char*  shm_name,
     const char*  request_event_name,
     const char*  response_event_name,
     int32_t      enable)
 {
     auto* e = reinterpret_cast<Engine*>(handle);
-    if (!e) return DCA_ERR_INVALID_ARG;
+    if (!e || !dotcharter::AudioEngine::validPlayer((int) player)) return DCA_ERR_INVALID_ARG;
     if (enable != 0 && (shm_name == nullptr || shm_name[0] == '\0'
                         || request_event_name == nullptr || request_event_name[0] == '\0'
                         || response_event_name == nullptr || response_event_name[0] == '\0'))
         return DCA_ERR_INVALID_ARG;
-    return guard("dca_engine_set_remote_bridge", [&]() -> dca_status {
-        const bool ok = e->impl.setRemoteBridge(shm_name, request_event_name,
+    return guard("dca_engine_set_remote_bridge_for_player", [&]() -> dca_status {
+        const bool ok = e->impl.setRemoteBridge((int) player, shm_name, request_event_name,
                                                 response_event_name, enable != 0);
         if (!ok)
         {
@@ -4198,20 +4514,44 @@ DCA_API dca_status DCA_CALL dca_engine_set_remote_bridge(
     });
 }
 
+DCA_API dca_status DCA_CALL dca_engine_set_remote_bridge(
+    dca_engine_t handle,
+    const char*  shm_name,
+    const char*  request_event_name,
+    const char*  response_event_name,
+    int32_t      enable)
+{
+    return dca_engine_set_remote_bridge_for_player(handle, 0, shm_name, request_event_name,
+                                                   response_event_name, enable);
+}
+
+DCA_API dca_status DCA_CALL dca_engine_get_remote_bridge_stats_for_player(
+    dca_engine_t handle,
+    int32_t      player,
+    uint32_t*    out_processed,
+    uint32_t*    out_timeouts,
+    uint32_t*    out_heartbeat)
+{
+    if (out_processed) *out_processed = 0;
+    if (out_timeouts)  *out_timeouts  = 0;
+    if (out_heartbeat) *out_heartbeat = 0;
+    auto* e = reinterpret_cast<Engine*>(handle);
+    if (!e || !dotcharter::AudioEngine::validPlayer((int) player)) return DCA_ERR_INVALID_ARG;
+    uint32_t processed = 0, timeouts = 0, heartbeat = 0;
+    e->impl.getRemoteBridgeStats((int) player, processed, timeouts, heartbeat);
+    if (out_processed) *out_processed = processed;
+    if (out_timeouts)  *out_timeouts  = timeouts;
+    if (out_heartbeat) *out_heartbeat = heartbeat;
+    return DCA_OK;
+}
+
 DCA_API dca_status DCA_CALL dca_engine_get_remote_bridge_stats(
     dca_engine_t handle,
     uint32_t*    out_processed,
     uint32_t*    out_timeouts,
     uint32_t*    out_heartbeat)
 {
-    auto* e = reinterpret_cast<Engine*>(handle);
-    if (!e) return DCA_ERR_INVALID_ARG;
-    uint32_t processed = 0, timeouts = 0, heartbeat = 0;
-    e->impl.getRemoteBridgeStats(processed, timeouts, heartbeat);
-    if (out_processed) *out_processed = processed;
-    if (out_timeouts)  *out_timeouts  = timeouts;
-    if (out_heartbeat) *out_heartbeat = heartbeat;
-    return DCA_OK;
+    return dca_engine_get_remote_bridge_stats_for_player(handle, 0, out_processed, out_timeouts, out_heartbeat);
 }
 
 DCA_API dca_status DCA_CALL dca_engine_send_midi_short(dca_engine_t handle, uint8_t status, uint8_t data1, uint8_t data2)
@@ -4730,9 +5070,16 @@ DCA_API dca_status DCA_CALL dca_render_to_wav(const char* srcPath,
         const int outSr    = sampleRate > 0 ? sampleRate : (int) srcSr;
         const int outCh    = (int) reader->numChannels;
 
-        dst.deleteFile();
-        std::unique_ptr<juce::FileOutputStream> stream(dst.createOutputStream());
+        // THE DESTINATION IS REPLACED ONLY BY A COMPLETE RENDER. Every block goes
+        // to a staged sibling file; only after each read and write succeeded and
+        // the writer flushed does it replace the destination. A failure (a full
+        // disk, an unreadable block) returns an error and leaves an existing
+        // destination as it was; juce::TemporaryFile deletes the staged file on
+        // every exit path.
+        juce::TemporaryFile staged(dst);
+        std::unique_ptr<juce::FileOutputStream> stream(staged.getFile().createOutputStream());
         if (stream == nullptr) return DCA_ERR_INTERNAL;
+        const juce::FileOutputStream* const stagedStream = stream.get();
 
         juce::WavAudioFormat wav;
         // NOTE (D-01): juce::AudioFormatWriterOptions and the matching
@@ -4748,6 +5095,17 @@ DCA_API dca_status DCA_CALL dca_render_to_wav(const char* srcPath,
         auto streamForWriter = std::unique_ptr<juce::OutputStream> (stream.release());
         std::unique_ptr<juce::AudioFormatWriter> writer (wav.createWriterFor (streamForWriter, writerOptions));
         if (writer == nullptr) return DCA_ERR_INTERNAL;
+
+        // The staged file becomes the destination only when every block was
+        // written, the header flushed and the stream reports no error.
+        auto finish = [&](dca_status rendered) -> dca_status
+        {
+            if (rendered == DCA_OK && ! (writer->flush() && stagedStream->getStatus().wasOk()))
+                rendered = DCA_ERR_INTERNAL;
+            writer.reset();
+            if (rendered != DCA_OK) return rendered;
+            return staged.overwriteTargetFileWithTemporary() ? DCA_OK : DCA_ERR_INTERNAL;
+        };
 
         const juce::int64 srcSamples = reader->lengthInSamples;
         const int blockSize = 4096;
@@ -4767,7 +5125,7 @@ DCA_API dca_status DCA_CALL dca_render_to_wav(const char* srcPath,
         // downward direction, which is the one dcload deliberately refuses.
         if (converting)
         {
-            juce::AudioFormatReaderSource readerSource(reader.release(), true);
+            CheckedRenderReaderSource readerSource(*reader);
             juce::ResamplingAudioSource rs(&readerSource, false, outCh);
             rs.setResamplingRatio(srcSr / (double) outSr);
             rs.prepareToPlay(blockSize, (double) outSr);
@@ -4775,35 +5133,36 @@ DCA_API dca_status DCA_CALL dca_render_to_wav(const char* srcPath,
             const juce::int64 outFrames =
                 (juce::int64) std::llround((double) srcSamples * (double) outSr / srcSr);
             juce::AudioBuffer<float> buffer(outCh, blockSize);
-            for (juce::int64 pos = 0; pos < outFrames; pos += blockSize)
+            dca_status rendered = DCA_OK;
+            for (juce::int64 pos = 0; pos < outFrames && rendered == DCA_OK; pos += blockSize)
             {
                 const int n = (int) std::min<juce::int64>(blockSize, outFrames - pos);
                 buffer.clear();
                 juce::AudioSourceChannelInfo info(&buffer, 0, n);
                 rs.getNextAudioBlock(info);
-                writer->writeFromAudioSampleBuffer(buffer, 0, n);
+                if (readerSource.failed()) { rendered = DCA_ERR_DECODE; break; }
+                if (! writeRenderBlock(*writer, buffer, n, pos / blockSize)) rendered = DCA_ERR_INTERNAL;
             }
             rs.releaseResources();
-            writer.reset();
-            return DCA_OK;
+            return finish(rendered);
         }
 
         juce::AudioBuffer<float> buffer(outCh, blockSize);
-        for (juce::int64 pos = 0; pos < srcSamples; pos += blockSize)
+        dca_status rendered = DCA_OK;
+        for (juce::int64 pos = 0; pos < srcSamples && rendered == DCA_OK; pos += blockSize)
         {
             const int n = (int) std::min<juce::int64>(blockSize, srcSamples - pos);
             buffer.clear();
-            reader->read(&buffer, 0, n, pos, true, true);
+            if (! readRenderBlock(*reader, buffer, 0, n, pos, pos / blockSize)) { rendered = DCA_ERR_DECODE; break; }
 
             // No stretch, no shift: the argument check above has already
             // refused every request for one, so this loop only ever runs at
             // tempo 1.0 / 0 semitones and is an honest format conversion.
             // Wiring RubberBandAudioSource in here is the fix that would let
             // the guard be relaxed — do that before touching the guard.
-            writer->writeFromAudioSampleBuffer(buffer, 0, n);
+            if (! writeRenderBlock(*writer, buffer, n, pos / blockSize)) rendered = DCA_ERR_INTERNAL;
         }
-        writer.reset();
-        return DCA_OK;
+        return finish(rendered);
     });
 }
 

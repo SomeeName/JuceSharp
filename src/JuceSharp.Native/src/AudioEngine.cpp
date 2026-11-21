@@ -556,6 +556,7 @@ void AudioEngine::prepareMasterBus(juce::AudioIODevice* device)
     // write here: prepareMasterBus runs from audioDeviceAboutToStart, with no
     // callback in flight.
     masterGainCurrent_ = masterGain_.load(std::memory_order_relaxed);
+    chartMonitorBoostCurrent_.fill(1.0f);
     {
         const float mon = monitorGain_.load(std::memory_order_relaxed);
         for (int p = 0; p < kMaxPlayers; ++p)
@@ -780,8 +781,12 @@ void AudioEngine::reprepareAttachedPlugins()
     auto* instr = instrumentPlugin_.load(std::memory_order_acquire);
     if (instr == nullptr) return;
 
+    // A prepare is the instrument's second chance too: re-arm its fault latch.
+    // Bumped under instrumentMutex_, like every write to the generation (see
+    // attachInstrumentPlugin).
     { std::lock_guard<std::mutex> lk(instrumentMutex_);
-      try { instr->prepareToPlay(sr, blk); } catch (...) {} }
+      try { instr->prepareToPlay(sr, blk); } catch (...) {}
+      instrumentGeneration_.fetch_add(1, std::memory_order_acq_rel); }
 
     const int pluginOutCh = juce::jmax(1, instr->getTotalNumOutputChannels());
     int prepCh = 0, prepSize = 0;
@@ -1348,14 +1353,28 @@ void AudioEngine::fillXrunStats(dca_xrun_stats& s) noexcept
 
 // --- Click bus ------------------------------------------------------------
 
+AudioEngine::ClickProducerScope::ClickProducerScope(AudioEngine& owner) noexcept
+    : owner_(owner)
+{
+#if DCA_RTCHECK
+    if (owner_.clickProducerLock_.tryEnter()) return;
+    if (owner_.clickSeam_ != nullptr) owner_.clickSeam_(ClickSeam::ProducerWaiting, owner_.clickSeamUser_);
+#endif
+    owner_.clickProducerLock_.enter();
+}
+
 void AudioEngine::triggerClick(int type) noexcept
 {
     if (type < 0 || type > 2) return;
+    const ClickProducerScope producer(*this);
     int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
     clickFifo_.prepareToWrite(1, start1, size1, start2, size2);
-    if (size1 > 0)      clickQueue_[(size_t)start1] = type;
-    else if (size2 > 0) clickQueue_[(size_t)start2] = type;
-    else return; // FIFO full — drop trigger (UI is hammering us)
+    const int slot = (size1 > 0) ? start1 : (size2 > 0 ? start2 : -1);
+    if (slot < 0) return; // FIFO full — drop trigger (UI is hammering us)
+#if DCA_RTCHECK
+    if (clickSeam_ != nullptr) clickSeam_(ClickSeam::ProducerHoldsSlot, clickSeamUser_);
+#endif
+    clickQueue_[(size_t)slot] = type;
     clickFifo_.finishedWrite(size1 + size2);
 }
 
@@ -1364,46 +1383,35 @@ void AudioEngine::triggerClick(int type) noexcept
 void AudioEngine::scheduleClick(int type, int64_t renderFrame) noexcept
 {
     if (type < 0 || type > 2) return;
+    const ClickProducerScope producer(*this);
     int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
     clickScheduleFifo_.prepareToWrite(1, start1, size1, start2, size2);
     const int slot = (size1 > 0) ? start1 : (size2 > 0 ? start2 : -1);
     if (slot < 0) return; // FIFO full — drop (caller is hammering us)
-    clickScheduleQueue_[(size_t)slot] = ScheduledClick{ type, renderFrame };
+#if DCA_RTCHECK
+    if (clickSeam_ != nullptr) clickSeam_(ClickSeam::ProducerHoldsSlot, clickSeamUser_);
+#endif
+    // The generation is read under the producer lock, so it orders this click
+    // against every clear: an older generation than the audio thread has seen
+    // means "scheduled before a clear".
+    clickScheduleQueue_[(size_t)slot] =
+        ScheduledClick{ type, renderFrame, clickClearGeneration_.load(std::memory_order_relaxed) };
     clickScheduleFifo_.finishedWrite(size1 + size2);
 }
 
 void AudioEngine::clearScheduledClicks() noexcept
 {
-    // Pushed as an ordinary FIFO entry, NOT a side-channel flag: that is what
-    // makes "schedule A, then clear" always cancel A. The audio thread wipes
-    // its pending set when it drains the sentinel, so the clear cannot be
-    // reordered ahead of clicks that were queued before it.
-    int start1 = 0, size1 = 0, start2 = 0, size2 = 0;
-    clickScheduleFifo_.prepareToWrite(1, start1, size1, start2, size2);
-    const int slot = (size1 > 0) ? start1 : (size2 > 0 ? start2 : -1);
-    if (slot < 0) return;
-    clickScheduleQueue_[(size_t)slot] = ScheduledClick{ kClickClearSentinel, 0 };
-    clickScheduleFifo_.finishedWrite(size1 + size2);
+    // OUT OF BAND, so a full schedule FIFO cannot drop it (see
+    // clickClearGeneration_). Under the producer lock: a schedule either reads
+    // the old generation (and is cancelled) or the new one (and survives).
+    const ClickProducerScope producer(*this);
+    clickClearGeneration_.fetch_add(1, std::memory_order_release);
 }
 
 bool AudioEngine::getRenderClock(int64_t& outFrames, int64_t& outTicks) const noexcept
 {
-    for (int attempt = 0; attempt < 8; ++attempt)
-    {
-        const uint32_t before = renderSyncSeq_.load(std::memory_order_acquire);
-        if (before == 0) return false;          // no block rendered yet
-        if ((before & 1u) != 0) continue;       // writer in flight
-        const int64_t frames = renderFrames_;
-        const int64_t ticks  = renderSyncTicks_;
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (renderSyncSeq_.load(std::memory_order_relaxed) == before)
-        {
-            outFrames = frames;
-            outTicks  = ticks;
-            return true;
-        }
-    }
-    return false;
+    // False until the first block is rendered (and again after a device restart).
+    return renderClock_.read(outFrames, outTicks);
 }
 
 void AudioEngine::startClickVoice(int type, int offsetInBlock) noexcept
@@ -1452,6 +1460,17 @@ void AudioEngine::mixClickBus(float* const* out, int numChannels, int numSamples
     }
 
     // --- 2. Scheduled clicks: park them until their frame lands in a block.
+    //        A newer clear generation wipes everything parked so far; an entry
+    //        from an older generation was scheduled before a clear and is
+    //        dropped; an entry from a newer one means a clear landed after the
+    //        load below, so it wipes the set first.
+    auto wipePending = [this] { for (auto& p : clickPending_) p.type = -1; };
+    const uint32_t clearGen = clickClearGeneration_.load(std::memory_order_acquire);
+    if (clearGen != clickClearSeen_)
+    {
+        wipePending();
+        clickClearSeen_ = clearGen;
+    }
     int schedReady = clickScheduleFifo_.getNumReady();
     while (schedReady > 0)
     {
@@ -1462,10 +1481,12 @@ void AudioEngine::mixClickBus(float* const* out, int numChannels, int numSamples
             for (int i = 0; i < count; ++i)
             {
                 const ScheduledClick entry = clickScheduleQueue_[(size_t)(start + i)];
-                if (entry.type == kClickClearSentinel)
+                const auto age = (int32_t) (entry.clearGen - clickClearSeen_);
+                if (age < 0) continue;              // scheduled before an applied clear
+                if (age > 0)
                 {
-                    for (auto& p : clickPending_) p.type = -1;
-                    continue;
+                    wipePending();                  // a clear landed after the load above
+                    clickClearSeen_ = entry.clearGen;
                 }
                 for (auto& p : clickPending_)
                 {
@@ -1729,8 +1750,10 @@ void AudioEngine::removeSource(TransportSource* s)
                     std::lock_guard<std::mutex> srcLock(sourcesMutex_);
                     mixer_.removeInputSource(stemGroupStretcher_.get());
                 }
+                stemGroupStretcher_->setReadAheadMirror(nullptr);
                 stemGroupStretcher_->releaseResources();
                 stemGroupStretcher_.reset();
+                stemGroupReadAhead_.store(0, std::memory_order_release);
                 stemPositionable_.reset();
                 stemSubMixer_.reset();
             }
@@ -1777,6 +1800,9 @@ void AudioEngine::setSourceStemGrouped(TransportSource* s, bool grouped)
             const int    blk = deviceBlock_ > 0 ? deviceBlock_ : 512;
             const double sr  = deviceSr_    > 0 ? deviceSr_    : 44100.0;
             stemGroupStretcher_->prepareToPlay(blk, sr);
+            // Its read-ahead also lands in stemGroupReadAhead_, which a grouped
+            // source's audible position (and the song clock) reads lock-free.
+            stemGroupStretcher_->setReadAheadMirror(&stemGroupReadAhead_);
 
             std::lock_guard<std::mutex> srcLock(sourcesMutex_);
             mixer_.addInputSource(stemGroupStretcher_.get(), false);
@@ -1814,8 +1840,10 @@ void AudioEngine::setSourceStemGrouped(TransportSource* s, bool grouped)
                 std::lock_guard<std::mutex> srcLock(sourcesMutex_);
                 mixer_.removeInputSource(stemGroupStretcher_.get());
             }
+            stemGroupStretcher_->setReadAheadMirror(nullptr);
             stemGroupStretcher_->releaseResources();
             stemGroupStretcher_.reset();
+            stemGroupReadAhead_.store(0, std::memory_order_release);
             stemPositionable_.reset();
             stemSubMixer_.reset();
         }
@@ -2570,7 +2598,7 @@ bool TransportSource::wireReaderToTransport(bool requirePreload)
 
     // Re-apply bypass flag if this source was previously grouped — the
     // freshly-constructed stretcher defaults to active.
-    if (stretcherBypassed_) stretcher_->setBypass(true);
+    if (stretcherBypassed_.load(std::memory_order_relaxed)) stretcher_->setBypass(true);
 
     if (! attached_)
     {
@@ -2616,7 +2644,7 @@ void TransportSource::moveTransportTo(double seconds)
     if (stretcher_) stretcher_->repositionInner([this, seconds] { transport_->setPosition(seconds); });
     else            transport_->setPosition(seconds);
     // A grouped stem plays through the shared stem-group stretcher instead.
-    if (stretcherBypassed_) engine_.resetStemGroupStretcher();
+    if (stretcherBypassed_.load(std::memory_order_relaxed)) engine_.resetStemGroupStretcher();
 }
 
 double TransportSource::getPositionSeconds() const
@@ -2628,11 +2656,24 @@ double TransportSource::getAudiblePositionSeconds() const
 {
     if (! transport_) return 0.0;
     const double raw = transport_->getCurrentPosition();
-    if (! stretcher_) return raw;
 
-    const int    readAhead = stretcher_->getReadAheadOutputSamples();
-    const float  tempo     = stretcher_->currentTempoFactor();
-    const double devSr     = stretcher_->currentDeviceSampleRate();
+    int    readAhead = 0;
+    float  tempo     = 1.0f;
+    double devSr     = 0.0;
+    if (stretcherBypassed_.load(std::memory_order_relaxed))
+    {
+        // A grouped stem: its own stretcher is bypassed and its samples wait
+        // in the shared stem-group stretcher, at the group's tempo.
+        readAhead = engine_.stemGroupReadAheadRt();
+        tempo     = engine_.stemGroupTempo();
+        devSr     = engine_.currentSampleRate();
+    }
+    else if (stretcher_)
+    {
+        readAhead = stretcher_->getReadAheadOutputSamples();
+        tempo     = stretcher_->currentTempoFactor();
+        devSr     = stretcher_->currentDeviceSampleRate();
+    }
     if (readAhead <= 0 || tempo <= 0.0f || devSr <= 0.0)
         return raw;
 
@@ -2663,7 +2704,7 @@ void TransportSource::readSongClockRt(double& position, bool& playing, uint32_t&
     position = getAudiblePositionSeconds();
     playing  = transport_ != nullptr && transport_->isPlaying();
     tempo    = 1.0;
-    if (stretcherBypassed_) tempo = (double) engine_.stemGroupTempo();
+    if (stretcherBypassed_.load(std::memory_order_relaxed)) tempo = (double) engine_.stemGroupTempo();
     else if (stretcher_)    tempo = (double) stretcher_->currentTempoFactor();
     if (! (tempo > 0.0)) tempo = 1.0;
 }
@@ -2690,7 +2731,7 @@ void TransportSource::setPitchSemitones(float semitones)
 
 void TransportSource::setStretcherBypass(bool bypassed) noexcept
 {
-    stretcherBypassed_ = bypassed;
+    stretcherBypassed_.store(bypassed, std::memory_order_relaxed);
     if (stretcher_)
     {
         if (bypassed)
@@ -2708,7 +2749,7 @@ void TransportSource::setStretcherBypass(bool bypassed) noexcept
 
 // --- VST input chain -----------------------------------------------------
 
-bool AudioEngine::attachInputPlugin(juce::AudioPluginInstance* plugin, int player)
+bool AudioEngine::attachInputPlugin(juce::AudioPluginInstance* plugin, int player, int position)
 {
     if (plugin == nullptr) return false;
     if (! validPlayer(player)) return false;
@@ -2739,7 +2780,8 @@ bool AudioEngine::attachInputPlugin(juce::AudioPluginInstance* plugin, int playe
         auto next = std::make_shared<std::vector<juce::AudioPluginInstance*>>();
         if (current) next->reserve(current->size() + 1);
         if (current) next->insert(next->end(), current->begin(), current->end());
-        next->push_back(plugin);
+        const size_t at = (position < 0 || (size_t) position > next->size()) ? next->size() : (size_t) position;
+        next->insert(next->begin() + (std::ptrdiff_t) at, plugin);
         retired = std::atomic_exchange_explicit(&slot,
             std::shared_ptr<const std::vector<juce::AudioPluginInstance*>>(std::move(next)),
             std::memory_order_acq_rel);
@@ -2748,9 +2790,21 @@ bool AudioEngine::attachInputPlugin(juce::AudioPluginInstance* plugin, int playe
     {
         std::lock_guard<std::mutex> barrier(inputChainProcessMutex_[(size_t) player]);
     }
+#if DCA_RTCHECK
+    if (instrumentSeam_ != nullptr) instrumentSeam_(InstrumentSeam::InputAttachAfterPublish, instrumentSeamUser_);
+#endif
     // A new chain is a new chance for every plugin in it (W5-E7).
     inputChainGeneration_.fetch_add(1, std::memory_order_acq_rel);
     return true;
+}
+
+int AudioEngine::inputChainIndexOf(const juce::AudioPluginInstance* plugin, int player) const
+{
+    if (plugin == nullptr || ! validPlayer(player)) return -1;
+    const auto chain = std::atomic_load_explicit(&inputChain_[(size_t) player], std::memory_order_acquire);
+    if (chain == nullptr) return -1;
+    const auto it = std::find(chain->begin(), chain->end(), plugin);
+    return it == chain->end() ? -1 : (int) (it - chain->begin());
 }
 
 void AudioEngine::detachInputPlugin(juce::AudioPluginInstance* plugin)
@@ -2875,7 +2929,33 @@ bool AudioEngine::attachInstrumentPlugin(juce::AudioPluginInstance* plugin)
     // sendMidiShort produces from the JUCE MIDI input thread. See
     // discardQueuedMidi.
     discardQueuedMidi();
-    instrumentPlugin_.store(plugin, std::memory_order_release);
+#if DCA_RTCHECK
+    if (instrumentSeam_ != nullptr) instrumentSeam_(InstrumentSeam::AttachBeforePublish, instrumentSeamUser_);
+    if (instrumentSeam_ != nullptr) instrumentSeam_(InstrumentSeam::AttachAboutToBlock, instrumentSeamUser_);
+#endif
+    // The pointer and the fault-latch generation are published TOGETHER,
+    // under instrumentMutex_. renderInstrumentWork loads both under that mutex,
+    // so a block sees either the old plugin with the old generation or the new
+    // plugin with the new one, never a mix. Bumping outside the mutex let a
+    // block that had already loaded the old plugin read the NEW generation:
+    // when that plugin then threw, the latch landed on the generation that
+    // belongs to its replacement, which stayed silent until the next attach.
+    // A fresh attach is a fresh chance for a plugin whose earlier block threw.
+    //
+    // Taking the mutex is also the wait-one-block barrier for the plugin this
+    // displaces (the render path holds it for the whole of processBlock), so
+    // the caller may release or unload that plugin as soon as this returns,
+    // the way detachInstrumentPlugin does.
+    {
+        std::lock_guard<std::mutex> lk(instrumentMutex_);
+        instrumentGeneration_.fetch_add(1, std::memory_order_acq_rel);
+        instrumentPlugin_.store(plugin, std::memory_order_release);
+    }
+#if DCA_RTCHECK
+    // A failure once the plugin is live: the caller's undo has to empty the
+    // slot again and put back the plugin this one displaced.
+    if (instrumentSeam_ != nullptr) instrumentSeam_(InstrumentSeam::AttachAfterPublish, instrumentSeamUser_);
+#endif
     return true;
 }
 
@@ -2896,31 +2976,47 @@ void AudioEngine::detachInstrumentPlugin(juce::AudioPluginInstance* plugin)
 
 // --- Out-of-process VST bridge (ABI v19) ----------------------------------
 
-bool AudioEngine::setRemoteBridge(const char* shmName, const char* requestEventName,
+bool AudioEngine::setRemoteBridge(int seat, const char* shmName, const char* requestEventName,
                                   const char* responseEventName, bool enable)
 {
+    if (seat < 0 || seat >= kMaxPlayers) return false;
+    auto& bridge = remoteBridges_[(size_t) seat];
     std::lock_guard<std::mutex> config(remoteBridgeConfigMutex_);
     if (enable)
     {
-        // (Re)create under the audio barrier so the callback never observes
-        // half-initialised kernel handles.
-        std::lock_guard<std::mutex> barrier(remoteBridgeMutex_);
+        // Create and clear the mapping and open the events with NO audio
+        // barrier held: the prepared objects are invisible to the callback
+        // until arm() swaps them in, so arming one seat never makes another
+        // seat's post or collect wait for a ~198 KB clear. The barrier is
+        // taken only for the swap, so the callback never observes
+        // half-initialised kernel handles; the replaced ones close after it.
         const int sr  = deviceSr_ > 0 ? (int) deviceSr_ : 44100;
         const int blk = deviceBlock_ > 0 ? deviceBlock_ : 512;
-        return remoteBridge_.enable(shmName, requestEventName, responseEventName, sr, blk);
+        RemoteVstBridge::Prepared prepared;
+        if (bridge.prepare(shmName, requestEventName, responseEventName, sr, blk, prepared))
+        {
+            {
+                std::lock_guard<std::mutex> barrier(remoteBridgeMutex_);
+                bridge.arm(prepared);
+            }
+            RemoteVstBridge::release(prepared);
+            return true;
+        }
+        // A refused preparation leaves the seat disarmed: fall through.
     }
 
     // Disarm first (atomic flag), then acquire the audio barrier as a
     // wait-one-block fence, then release the kernel objects. Mirrors the
     // detachInputPlugin pattern.
-    remoteBridge_.markDisabled();
+    bridge.markDisabled();
     std::lock_guard<std::mutex> barrier(remoteBridgeMutex_);
-    remoteBridge_.disable();
+    bridge.disable();
     // Bridge v3 parks scheduled events for the child; with the child gone they
     // have nowhere to go, and a note-on that outlived it would reach the NEXT
-    // child with no note-off behind it.
-    clearBridgeMidiLocked();
-    return true;
+    // child with no note-off behind it. The MIDI leg is seat 0's: another
+    // seat's disarm leaves it alone.
+    if (seat == 0) clearBridgeMidiLocked();
+    return ! enable;
 }
 
 void AudioEngine::sendMidiShort(uint8_t status, uint8_t data1, uint8_t data2) noexcept
@@ -2936,7 +3032,7 @@ void AudioEngine::sendMidiShort(uint8_t status, uint8_t data1, uint8_t data2) no
 void AudioEngine::sendMidiAt(uint32_t packed, int64_t renderFrame) noexcept
 {
     if (instrumentPlugin_.load(std::memory_order_acquire) == nullptr
-        && ! remoteBridge_.isEnabled()) return;
+        && ! remoteBridges_[0].isEnabled()) return;
     // A status byte below 0x80 is not a MIDI message, and packed == 0 is this
     // queue's EMPTY marker — accepting one would make the pending set
     // unreadable. Reject rather than forward garbage to a plugin.
@@ -3017,6 +3113,9 @@ int AudioEngine::renderInstrumentWork(int numSamples, int64_t blockStartFrame) n
     // input chain and the remote bridge.
     auto* plugin = instrumentPlugin_.load(std::memory_order_acquire);
     if (plugin == nullptr) return 0;
+#if DCA_RTCHECK
+    if (instrumentSeam_ != nullptr) instrumentSeam_(InstrumentSeam::RenderLoadedPlugin, instrumentSeamUser_);
+#endif
 
     // Drain queued MIDI into the per-block buffer, AT ITS SAMPLE OFFSET
     // (ABI v34).
@@ -3026,7 +3125,7 @@ int AudioEngine::renderInstrumentWork(int numSamples, int64_t blockStartFrame) n
     // performance. The comment that justified it said the queue "would need to
     // carry (event, sampleOffset) pairs ... and we'd need a free-running sample
     // counter on the audio thread"; ABI v26 shipped exactly that counter
-    // (renderFrames_, of which blockStartFrame is this block's value) and
+    // (the render clock, of which blockStartFrame is this block's value) and
     // nobody came back here.
     //
     // The shape is deliberately the SAME as ABI v26's scheduled clicks: drain
@@ -3112,7 +3211,7 @@ int AudioEngine::renderInstrumentWork(int numSamples, int64_t blockStartFrame) n
                 {
                     // Not this block. Only reachable in the far future if the
                     // render clock rewound under us (a device restart drops
-                    // renderFrames_ to 0), in which case the event would sound
+                    // the render clock to 0), in which case the event would sound
                     // minutes from now — drop it rather than hold it for ever.
                     if (delta > futureFrames) p.packed = 0;
                     continue;
@@ -3152,10 +3251,30 @@ int AudioEngine::renderInstrumentWork(int numSamples, int64_t blockStartFrame) n
         || instrumentBuffer_.getNumChannels() < pluginCh)
         return 0;
 
+    // FAULT LATCH, the instrument's counterpart of the input chain's faulted
+    // set (W5-E7): a VSTi that threw is not called again until it is attached
+    // again or re-prepared (both bump instrumentGeneration_ under
+    // instrumentMutex_, which this block holds, so `gen` is the generation of
+    // the `plugin` loaded above and a latch set here belongs to it), so a plugin that
+    // faults deterministically does not pay a throw — exception object,
+    // unwind — on the audio thread every callback. Its MIDI is still drained
+    // above, so nothing piles up for the next chance. Audio-thread-only state.
+    const uint64_t gen = instrumentGeneration_.load(std::memory_order_acquire);
+    if (instrumentFaultGen_ != gen)
+    {
+        instrumentFaultGen_ = gen;
+        instrumentFaulted_  = false;
+    }
+    if (instrumentFaulted_) return 0;
+
     juce::AudioBuffer<float> work(instrumentBuffer_.getArrayOfWritePointers(), pluginCh, 0, numSamples);
     work.clear();
     try { plugin->processBlock(work, instrumentMidiPending_); }
-    catch (...) { return 0; }
+    catch (...)
+    {
+        instrumentFaulted_ = true;
+        return 0;
+    }
     // The rendered block stays in instrumentBuffer_ for the caller to mix —
     // onto the master (renderInstrumentBus) or into a seat (mixSeatGenerators).
     return pluginCh;
@@ -3211,34 +3330,16 @@ void AudioEngine::writeInputCapture(int player,
 
     // Publish the {captured-total, host ticks} sync pair (seqlock). Lets the
     // managed side map capture-stream sample indices to QPC time without
-    // fitting two free-running clocks. Plain stores between the seq bumps
-    // are safe: readers reject any window where the seq was odd or moved.
-    ring.syncSeq.fetch_add(1, std::memory_order_acq_rel);
-    ring.syncSamples = w + (uint64_t)numSamples;
-    ring.syncTicks   = juce::Time::getHighResolutionTicks();
-    ring.syncSeq.fetch_add(1, std::memory_order_release);
+    // fitting two free-running clocks. See SeqlockClock for why the pair is
+    // atomic and how the fences order it.
+    ring.sync.publish(w + (uint64_t)numSamples, juce::Time::getHighResolutionTicks());
 }
 
 bool AudioEngine::getInputCaptureSync(int player, uint64_t& outSamples, int64_t& outTicks) const noexcept
 {
     if (! validPlayer(player)) return false;
-    const auto& ring = captureRings_[(size_t) player];
-    for (int attempt = 0; attempt < 8; ++attempt)
-    {
-        const uint32_t before = ring.syncSeq.load(std::memory_order_acquire);
-        if (before == 0) return false;          // nothing captured yet
-        if ((before & 1u) != 0) continue;       // writer in flight
-        const uint64_t samples = ring.syncSamples;
-        const int64_t  ticks   = ring.syncTicks;
-        std::atomic_thread_fence(std::memory_order_acquire);
-        if (ring.syncSeq.load(std::memory_order_relaxed) == before)
-        {
-            outSamples = samples;
-            outTicks   = ticks;
-            return true;
-        }
-    }
-    return false;
+    // False until the seat captured its first block.
+    return captureRings_[(size_t) player].sync.read(outSamples, outTicks);
 }
 
 int AudioEngine::readInputCapture(int player, float* dest, int count) noexcept
@@ -3536,7 +3637,11 @@ bool AudioEngine::setSongClockSource(TransportSource* source)
         if (sources_.count(source) == 0) return false;   // not attached to THIS engine
     }
     // A replaced source needs no wait: it is still alive, and it calls
-    // forgetSongClockSource (which does wait) before it tears anything down.
+    // forgetSongClockSource before it tears anything down, which drains a
+    // reader of it whether or not it is still the published source. The
+    // publish count, bumped BEFORE the store and under the same mutex as the
+    // drain's read of it, is what tells that teardown a drain is due.
+    if (source != nullptr) ++source->songClockPublishes_;
     songClockSource_.store(source, std::memory_order_seq_cst);
     return true;
 }
@@ -3544,25 +3649,59 @@ bool AudioEngine::setSongClockSource(TransportSource* source)
 bool AudioEngine::forgetSongClockSource(TransportSource* source) noexcept
 {
     if (source == nullptr) return false;
+    bool     wasBound  = false;
+    bool     needDrain = true;   // the safe answer when the lock cannot be taken
+    bool     counted   = false;
+    uint32_t publishes = 0;
     try
     {
         std::lock_guard<std::mutex> lk(songClockMutex_);
         TransportSource* expected = source;
-        if (! songClockSource_.compare_exchange_strong(expected, nullptr, std::memory_order_seq_cst))
-            return false;
+        wasBound  = songClockSource_.compare_exchange_strong(expected, nullptr, std::memory_order_seq_cst);
+        publishes = source->songClockPublishes_;
+        needDrain = publishes != source->songClockDrainedThrough_;
+        counted   = true;
     }
     catch (...)
     {
         // The lock failed to construct; unbind without it — the wait below is
         // what protects the source, not the mutex.
         TransportSource* expected = source;
-        if (! songClockSource_.compare_exchange_strong(expected, nullptr, std::memory_order_seq_cst))
-            return false;
+        wasBound = songClockSource_.compare_exchange_strong(expected, nullptr, std::memory_order_seq_cst);
     }
+    // NO DRAIN FOR A SOURCE NOT PUBLISHED SINCE ITS LAST DRAIN. sampleSongClock
+    // dereferences only what it loaded from songClockSource_, and only
+    // setSongClockSource stores a source there (bumping its publish count
+    // first, under the mutex taken above). A source whose count its last
+    // completed drain already covered was not loadable after that drain.
+    if (! needDrain) return wasBound;
+    // DRAINED EVEN WHEN IT IS NOT THE PUBLISHED SOURCE. A callback may have
+    // loaded this source before setSongClockSource replaced it and still be
+    // reading it. Its busy flag was raised before that load and this thread's
+    // replace or unbind (seq_cst) came after it, so the flag is still visible
+    // here until that read is over.
+#if DCA_RTCHECK
+    if (songClockSeam_ != nullptr) songClockSeam_(SongClockSeam::ForgetAboutToDrain, songClockSeamUser_);
+#endif
     if (! waitForCallbackFlag(songClockBusy_))
+    {
         engineLog(kLogWarn, "Song clock: the audio callback held the clock source past 2 s while it was "
                             "being torn down.");
-    return true;
+        return wasBound;
+    }
+    // Record what this drain covered. A publish after the read above has a
+    // higher count, so its own teardown still drains.
+    if (! counted) return wasBound;
+    try
+    {
+        std::lock_guard<std::mutex> lk(songClockMutex_);
+        source->songClockDrainedThrough_ = publishes;
+    }
+    catch (...)
+    {
+        // Not recorded: the next teardown drains once more, which is only slower.
+    }
+    return wasBound;
 }
 
 void AudioEngine::sampleSongClock() noexcept
@@ -3573,6 +3712,9 @@ void AudioEngine::sampleSongClock() noexcept
     songClockBusy_.store(true, std::memory_order_seq_cst);
     if (auto* s = songClockSource_.load(std::memory_order_seq_cst))
     {
+#if DCA_RTCHECK
+        if (songClockSeam_ != nullptr) songClockSeam_(SongClockSeam::ReaderLoadedSource, songClockSeamUser_);
+#endif
         double pos = 0.0, tempo = 1.0; bool playing = false; uint32_t gen = 0;
         s->readSongClockRt(pos, playing, gen, tempo);
         c.valid = true; c.position = pos; c.playing = playing; c.seekGeneration = gen; c.tempo = tempo;
@@ -3829,6 +3971,8 @@ void AudioEngine::prepareChartSourcesForDevice(double sampleRate, int maxBlock)
     std::lock_guard<std::mutex> lk(chartMutex_);
     const double sr = sampleRate > 0.0 ? sampleRate : 48000.0;
     const int headroom = juce::jmax(maxBlock * 2, 2048);
+    // v51: the routed instrument's mono mix, the same headroom as the scratch.
+    instrumentMono_.assign((size_t) headroom, 0.0f);
     for (int p = 0; p < kMaxPlayers; ++p)
     {
         auto& cs = chart_[(size_t) p];
@@ -3840,6 +3984,7 @@ void AudioEngine::prepareChartSourcesForDevice(double sampleRate, int maxBlock)
             cs.fading.store(nullptr, std::memory_order_seq_cst);
             cs.fadingOwned.reset();
         }
+        cs.fadeRendering = false;
         if (cs.voiceOwned != nullptr && cs.voiceOwned->voice != nullptr)
         {
             cs.voiceOwned->voice->prepare(sr, headroom);
@@ -4013,25 +4158,186 @@ bool AudioEngine::getChartStatus(int player, dca_chart_source_status& out)
 bool AudioEngine::setInstrumentRoute(int player) noexcept
 {
     if (player != -1 && ! validPlayer(player)) return false;
-    instrumentRoute_.store(player, std::memory_order_relaxed);
+    instrumentRouteMask_.store(player < 0 ? 0u : (1u << player), std::memory_order_relaxed);
     return true;
+}
+
+int AudioEngine::instrumentRoute() const noexcept
+{
+    // The one-seat view of the v51 mask: its lowest seat, or -1 for the master.
+    const uint32_t mask = instrumentRouteMask_.load(std::memory_order_relaxed);
+    for (int p = 0; p < kMaxPlayers; ++p)
+        if ((mask & (1u << p)) != 0) return p;
+    return -1;
+}
+
+static constexpr uint32_t kAllSeatsMask = (1u << AudioEngine::kMaxPlayers) - 1u;
+
+bool AudioEngine::setInstrumentRouteMask(uint32_t seatMask) noexcept
+{
+    if ((seatMask & ~kAllSeatsMask) != 0) return false;
+    instrumentRouteMask_.store(seatMask, std::memory_order_relaxed);
+    return true;
+}
+
+bool AudioEngine::setChartRouteMask(int player, uint32_t seatMask) noexcept
+{
+    if (! validPlayer(player) || (seatMask & ~kAllSeatsMask) != 0) return false;
+    chart_[(size_t) player].routeMask.store(seatMask, std::memory_order_relaxed);
+    return true;
+}
+
+uint32_t AudioEngine::chartRouteMask(int player) const noexcept
+{
+    if (! validPlayer(player)) return 0u;
+    const uint32_t mask = chart_[(size_t) player].routeMask.load(std::memory_order_relaxed);
+    return mask != 0 ? mask : (1u << player);
 }
 
 // The cross-fade of a replaced chart voice (ABI v40).
 static constexpr double kChartCrossfadeSecondsRt = 0.010;
 
-void AudioEngine::mixSeatGenerators(int player, juce::AudioBuffer<float>& chainBuf, int numSamples,
-                                    bool instrumentHere) noexcept
+void AudioEngine::quiesceChartSeat(int player) noexcept
 {
     auto& cs = chart_[(size_t) player];
+    // The same Dekker handshake as mixSeatGenerators: the voice is used only
+    // between the raise and the drop.
+    chartBusy_.store(true, std::memory_order_seq_cst);
+    ChartVoiceSlot* slot = cs.voice.load(std::memory_order_seq_cst);
+    if (slot != nullptr && slot->voice != nullptr) slot->voice->reset();
+    ChartVoiceSlot* fade = cs.fading.load(std::memory_order_seq_cst);
+    if (fade != nullptr && fade != slot) fade->fadeDone.store(true, std::memory_order_release);
+    chartBusy_.store(false, std::memory_order_seq_cst);
+    cs.scheduler.reset();
+    cs.gainCurrent   = 0.0f;
+    cs.runState      = 0;
+    cs.fadeRendering = false;
+    cs.runStateShared.store(0, std::memory_order_release);
+}
+
+namespace
+{
+// 1 / (number of seats a mask names): the per-seat share of a generator that
+// enters several rigs, so a summed route plays at the one-seat level.
+float seatShareRt(uint32_t mask) noexcept
+{
+    int seats = 0;
+    for (; mask != 0; mask &= mask - 1u) ++seats;
+    return seats > 1 ? 1.0f / (float) seats : 1.0f;
+}
+} // namespace
+
+void AudioEngine::renderSeatGeneratorsRt(int players, int numSamples, uint32_t instrumentMask) noexcept
+{
+    const uint32_t live = (1u << players) - 1u;
+    generatorSeatsRt_ = 0;
+    for (int p = 0; p < kMaxPlayers; ++p)
+    {
+        auto& cs = chart_[(size_t) p];
+        cs.renderedRt = false;
+        cs.targetsRt  = 0;
+        if (p >= players) continue;
+        renderChartSeatRt(p, numSamples);
+        if (! cs.renderedRt) continue;
+        // ABI v51: the seats this source enters. Seats that are not live are
+        // skipped; with none left it plays into its own seat, never nowhere.
+        uint32_t targets = cs.routeMask.load(std::memory_order_relaxed) & live;
+        if (targets == 0) targets = 1u << p;
+        cs.targetsRt = targets;
+        cs.shareRt   = seatShareRt(targets);
+        generatorSeatsRt_ |= targets;
+    }
+
+    // The routed in-process instrument (rendered before the seat loop): summed
+    // to mono — a DI is mono — at the instrument gain, ramped like the master
+    // leg, ONCE per block whatever the number of seats it enters.
+    instrumentTargetsRt_ = 0;
+    instrumentBoostRt_   = 1.0f;
+    instrumentShareRt_   = 1.0f;
+    if (instrumentMask != 0)
+    {
+        // A routed seat runs its rig even when this block has no instrument
+        // sound (the pre-v51 rule), so a fade-out is never cut.
+        generatorSeatsRt_ |= instrumentMask;
+        if (instrumentWorkChannels_ > 0 && (int) instrumentMono_.size() >= numSamples
+            && instrumentBuffer_.getNumSamples() >= numSamples)
+        {
+            const int ich = juce::jmin(instrumentWorkChannels_, instrumentBuffer_.getNumChannels());
+            float* mono = instrumentMono_.data();
+            std::memcpy(mono, instrumentBuffer_.getReadPointer(0), sizeof(float) * (size_t) numSamples);
+            for (int c = 1; c < ich; ++c)
+                juce::FloatVectorOperations::add(mono, instrumentBuffer_.getReadPointer(c), numSamples);
+            if (ich > 1) juce::FloatVectorOperations::multiply(mono, 1.0f / (float) ich, numSamples);
+            float* scrub[1] = { mono };
+            dcdsp::scrubNonFinite(scrub, 1, numSamples);
+            const float g = instrumentGain_.load(std::memory_order_relaxed);
+            rampOrScale(mono, numSamples, std::min(instrumentGainCurrent_, 1.0f), std::min(g, 1.0f));
+            instrumentGainCurrent_ = g;
+            instrumentBoostRt_     = std::max(1.0f, g);
+            instrumentTargetsRt_   = instrumentMask;
+            instrumentShareRt_     = seatShareRt(instrumentMask);
+        }
+    }
+    instrumentWorkChannels_ = 0;
+}
+
+float AudioEngine::mixSeatGenerators(int player, juce::AudioBuffer<float>& chainBuf, int numSamples) noexcept
+{
+    const uint32_t bit = 1u << player;
     const int chans = juce::jmin(kChainChannels, chainBuf.getNumChannels());
+    float monitorBoost = 1.0f;
+
+    // A REPLACE-mode source routed here replaces the seat's input (v38: the
+    // memcpy), so the input is cleared before the sources are summed in.
+    bool replace = false;
+    for (int q = 0; q < kMaxPlayers; ++q)
+    {
+        const auto& cs = chart_[(size_t) q];
+        if (cs.renderedRt && (cs.targetsRt & bit) != 0 && cs.replaceRt) replace = true;
+    }
+    if (replace)
+        for (int ch = 0; ch < chans; ++ch)
+            juce::FloatVectorOperations::clear(chainBuf.getWritePointer(ch), numSamples);
+
+    // A generator entering N seats enters each at 1/N (shareRt): the rigs' sum
+    // on the master then matches the one-seat route. The monitor boost (gain
+    // above unity, #753) still applies on every target seat, so each seat's
+    // share is raised alike and the sum keeps the one-seat level.
+    const auto mixIn = [&](const float* src, float share)
+    {
+        for (int ch = 0; ch < chans; ++ch)
+        {
+            if (share == 1.0f) juce::FloatVectorOperations::add(chainBuf.getWritePointer(ch), src, numSamples);
+            else juce::FloatVectorOperations::addWithMultiply(chainBuf.getWritePointer(ch), src, share, numSamples);
+        }
+    };
+    for (int q = 0; q < kMaxPlayers; ++q)
+    {
+        const auto& cs = chart_[(size_t) q];
+        if (! cs.renderedRt || (cs.targetsRt & bit) == 0) continue;
+        mixIn(cs.scratch.data(), cs.shareRt);
+        monitorBoost = std::max(monitorBoost, cs.boostRt);
+    }
+    if ((instrumentTargetsRt_ & bit) != 0)
+    {
+        mixIn(instrumentMono_.data(), instrumentShareRt_);
+        monitorBoost = std::max(monitorBoost, instrumentBoostRt_);
+    }
+    return monitorBoost;
+}
+
+void AudioEngine::renderChartSeatRt(int player, int numSamples) noexcept
+{
+    auto& cs = chart_[(size_t) player];
     const bool enabled = cs.enabled.load(std::memory_order_relaxed);
+    float monitorBoost = 1.0f;
 
     // A block bigger than the prepared scratch skips the generators for that
     // ONE block rather than growing on the audio thread (audit #5).
     // A voice REPLACED by a model / pickup change (ABI v40) keeps rendering its
     // cross-fade even if nothing else here would run.
     const bool fadingVoice = cs.fading.load(std::memory_order_relaxed) != nullptr;
+    if (! fadingVoice) cs.fadeRendering = false;   // the reaper retired it
     if ((enabled || cs.runState != 0 || fadingVoice) && (int) cs.scratch.size() >= numSamples)
     {
         float* mono = cs.scratch.data();
@@ -4043,6 +4349,8 @@ void AudioEngine::mixSeatGenerators(int player, juce::AudioBuffer<float>& chainB
         const dcsynth::ChartNoteTable* table = cs.table.load(std::memory_order_seq_cst);
         ChartVoiceSlot*                slot  = cs.voice.load(std::memory_order_seq_cst);
         dcsynth::ChartVoice*           voice = slot != nullptr ? slot->voice.get() : nullptr;
+        const bool playing = enabled && songClock_.valid && songClock_.playing
+                          && voice != nullptr && table != nullptr && table->count() > 0;
 
         if (enabled)
         {
@@ -4076,6 +4384,7 @@ void AudioEngine::mixSeatGenerators(int player, juce::AudioBuffer<float>& chainB
         // silent, then flagged for the reaper, which frees it. Skipped when it is
         // still the published voice (the two stores are not one atomic step).
         ChartVoiceSlot* fade = cs.fading.load(std::memory_order_seq_cst);
+        cs.fadeRendering = false;
         if (fade != nullptr && fade != slot && fade->voice != nullptr && ! fade->fadeDone.load(std::memory_order_relaxed))
         {
             if (! fade->fadeStarted)
@@ -4085,6 +4394,7 @@ void AudioEngine::mixSeatGenerators(int player, juce::AudioBuffer<float>& chainB
             }
             fade->voice->render(mono, numSamples);
             if (fade->voice->activeNotes() == 0) fade->fadeDone.store(true, std::memory_order_release);
+            else cs.fadeRendering = true;
         }
         chartBusy_.store(false, std::memory_order_seq_cst);
         cs.runStateShared.store(cs.runState, std::memory_order_release);
@@ -4092,39 +4402,16 @@ void AudioEngine::mixSeatGenerators(int player, juce::AudioBuffer<float>& chainB
         // A voice is somebody's arithmetic too; nothing non-finite enters a rig.
         float* scrub[1] = { mono };
         dcdsp::scrubNonFinite(scrub, 1, numSamples);
-        const float target = cs.gain.load(std::memory_order_relaxed);
+        const float gain = cs.gain.load(std::memory_order_relaxed);
+        const float target = std::min(gain, 1.0f);
+        if (playing) monitorBoost = std::max(monitorBoost, gain);
         rampOrScale(mono, numSamples, cs.gainCurrent, target);
         cs.gainCurrent = target;
 
-        const bool replace = enabled && cs.mode.load(std::memory_order_relaxed) == DCA_CHART_SOURCE_REPLACE;
-        for (int ch = 0; ch < chans; ++ch)
-        {
-            float* dst = chainBuf.getWritePointer(ch);
-            if (replace) std::memcpy(dst, mono, sizeof(float) * (size_t) numSamples);
-            else         juce::FloatVectorOperations::add(dst, mono, numSamples);
-        }
+        cs.replaceRt  = enabled && cs.mode.load(std::memory_order_relaxed) == DCA_CHART_SOURCE_REPLACE;
+        cs.boostRt    = monitorBoost;
+        cs.renderedRt = true;
     }
-
-    // The routed in-process instrument (rendered before the seat loop): summed
-    // to mono — a DI is mono — at the instrument gain, ramped like the master leg.
-    if (instrumentHere && instrumentWorkChannels_ > 0 && (int) cs.scratch.size() >= numSamples
-        && instrumentBuffer_.getNumSamples() >= numSamples)
-    {
-        const int ich = juce::jmin(instrumentWorkChannels_, instrumentBuffer_.getNumChannels());
-        float* mono = cs.scratch.data();
-        std::memcpy(mono, instrumentBuffer_.getReadPointer(0), sizeof(float) * (size_t) numSamples);
-        for (int c = 1; c < ich; ++c)
-            juce::FloatVectorOperations::add(mono, instrumentBuffer_.getReadPointer(c), numSamples);
-        if (ich > 1) juce::FloatVectorOperations::multiply(mono, 1.0f / (float) ich, numSamples);
-        float* scrub[1] = { mono };
-        dcdsp::scrubNonFinite(scrub, 1, numSamples);
-        const float g = instrumentGain_.load(std::memory_order_relaxed);
-        rampOrScale(mono, numSamples, instrumentGainCurrent_, g);
-        instrumentGainCurrent_ = g;
-        for (int ch = 0; ch < chans; ++ch)
-            juce::FloatVectorOperations::add(chainBuf.getWritePointer(ch), mono, numSamples);
-    }
-    if (instrumentHere) instrumentWorkChannels_ = 0;
 }
 
 } // namespace dotcharter

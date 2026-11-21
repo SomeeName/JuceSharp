@@ -8,8 +8,8 @@ namespace JuceSharp.Tests;
 /// An exception thrown out of an <c>extern "C"</c> export does not become an
 /// error code — it unwinds through the caller's C frames, which is undefined
 /// behaviour and in practice <c>std::terminate</c>. The ABI has a
-/// <c>guard()</c> helper for exactly this, and the list below names the 70 of the
-/// header's 232 exports that reach code which can throw. (Re-measure both numbers
+/// <c>guard()</c> helper for exactly this, and the list below names the 71 of the
+/// header's 238 exports that reach code which can throw. (Re-measure both numbers
 /// rather than carrying them forward — <see cref="TheHeaderExportCount_IsWhatThisFileClaims" />
 /// now does it for you. It was 23 of 148 when this lint was written and 36 of 162
 /// when the wave-2 audit corrected it, which was ALREADY stale the day it was
@@ -145,6 +145,8 @@ public sealed class AbiExceptionGuardLintTests
         "dca_engine_extproc_open_for_player",
         "dca_engine_extproc_close_for_player",
         "dca_engine_extproc_get_stats_for_player",
+        // v50: arming a seat's sandbox bridge creates kernel objects under two mutexes.
+        "dca_engine_set_remote_bridge_for_player",
         "dca_engine_clear_input_injection_for_player",
         "dca_engine_dsp_get_spill_tail_count_for_player",
         // ABI v38. The note upload validates and COPIES a whole chart (vectors,

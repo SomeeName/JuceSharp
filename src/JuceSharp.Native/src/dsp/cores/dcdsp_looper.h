@@ -51,6 +51,7 @@
 #include <vector>
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <utility>
 
 namespace dcdsp {
@@ -63,8 +64,13 @@ struct LooperParams {
     float overdubDecay = 1.0f;   // 0 .. 1 — the existing loop's feedback
     float reverse      = 0.0f;   // 0 Off, 1 On
     float halfSpeed    = 0.0f;   // 0 Off, 1 On
-    float undoSeq      = 0.0f;   // TRIGGER: any CHANGE performs one undo
+    // The two press sequences are unsigned integers, not floats: a float stops
+    // changing at 2^24 and loses every press after it, while an unsigned count
+    // wraps to 0 and a wrap is still a CHANGE. They are internal fields, not
+    // params: the adapter bumps them, nothing reads them by id.
+    std::uint32_t undoSeq = 0;  // TRIGGER: any CHANGE performs one undo
     float mix          = 1.0f;   // 0 .. 1 — the loop's blend into the output
+    std::uint32_t stateSeq = 0; // COMMAND: any CHANGE applies `state` as one press
 };
 
 class LooperCore {
@@ -122,16 +128,21 @@ public:
         p_ = p;
         applyParams();
 
-        // Compared against the last REQUESTED transport, never against the live
-        // one: a record pass that closed itself on `maxLoopS` moves state_ to
-        // Play on the audio thread while the param still reads Record, and
-        // comparing against state_ would make the very next parameter write of
-        // ANY kind look like a fresh Record press and wipe the take.
+        // A transport COMMAND is a change of `stateSeq`, never a change of the
+        // `state` value: every parameter write republishes the whole set, and a
+        // record pass that closed itself on `maxLoopS` leaves `state` reading
+        // Record while the transport plays. Keyed on the value, the next knob
+        // turn would read that stale Record as a fresh press and wipe the take;
+        // keyed on the sequence it is no command at all, while a real Record
+        // press after the auto-close (a new sequence) starts a new take.
         const int want = clampi(static_cast<int>(std::lround(p.state)), 0, 3);
-        // Published UNCONDITIONALLY, including when it compares equal: it is how
-        // the message thread knows its write has crossed the mailbox at all.
-        pubSeen_.store(want, std::memory_order_relaxed);
-        if (want != reqState_) { reqState_ = want; transitionTo(want); }
+        if (p.stateSeq != stateSeq_) {
+            stateSeq_ = p.stateSeq;
+            if (want != state_) transitionTo(want);
+        }
+        // Published UNCONDITIONALLY: it is how the message thread knows its
+        // write has crossed the mailbox at all.
+        pubSeenSeq_.store(stateSeq_, std::memory_order_relaxed);
 
         // The undo TRIGGER: the adapter bumps a sequence rather than sending a
         // 1 the audio thread would have to see fall back to 0. A coalesced pair
@@ -216,12 +227,13 @@ public:
     /// last requested: a record pass that fills `maxLoopS` closes itself.
     /// Message-thread safe.
     int   transportState() const { return pubState_.load(std::memory_order_relaxed); }
-    /// The last `state` value the audio thread has SEEN out of the mailbox --
-    /// the player's request, never the engine's own override of it. A getter
-    /// compares this with the value it wrote: equal means the core has caught
-    /// up and `transportState()` is the honest answer; unequal means the write
-    /// is still in flight and the requested value is.
-    int   lastSeenRequest() const { return pubSeen_.load(std::memory_order_relaxed); }
+    /// The last `stateSeq` the audio thread has SEEN out of the mailbox. A
+    /// getter compares this with the sequence it wrote: equal means the core
+    /// has applied the latest press and `transportState()` is the honest
+    /// answer; unequal means the press is still in flight and the requested
+    /// value is. A sequence, not the value: a second Record press after an
+    /// auto-close writes the same value as the first.
+    std::uint32_t lastSeenStateSeq() const { return pubSeenSeq_.load(std::memory_order_relaxed); }
     int   capacityFrames()   const { return capacity_; }
     bool  undoAvailable()    const { return snapValid_; }
     // Bytes both rings cost at the prepared rate/channel count.
@@ -278,14 +290,12 @@ private:
     // by the CURRENT cap (`maxLoopS` may have been turned down mid-pass, and a
     // 5 s loop under a 2 s knob is not what the knob says).
     //
-    // It also republishes `reqState_`. This close can be ENGINE-driven -- a pass
-    // that filled the cap moves the transport to Play on the audio thread with
-    // no param write behind it -- and leaving reqState_ on Record made the
-    // player's next Record press compare equal and do NOTHING: they had to go
-    // Stop -> Record to start a new take.
+    // This close can be ENGINE-driven: a pass that filled the cap moves the
+    // transport to Play on the audio thread with no param write behind it.
+    // setParams compares a press against state_, so the player's next Record
+    // press starts a new take, and a knob write (no new `stateSeq`) is no press.
     void closeRecording(int want) {
         state_    = want;
-        reqState_ = want;
         const int cap = recordCap();
         loopLen_  = (recLen_ < cap) ? recLen_ : cap;
         pos_      = 0.0;
@@ -363,15 +373,15 @@ private:
     int    recLen_  = 0;
     double pos_     = 0.0;
     int    state_    = Stop;   // what the transport IS
-    int    reqState_ = Stop;   // what was last ASKED for (see setParams)
-    // Published for the MESSAGE thread by publishTransport(); see the getters.
-    std::atomic<int> pubState_{ Stop };
-    std::atomic<int> pubSeen_{ Stop };
+    std::uint32_t stateSeq_ = 0;   // the last transport press applied (see setParams)
+    // Published for the MESSAGE thread; see the getters.
+    std::atomic<int>   pubState_{ Stop };
+    std::atomic<std::uint32_t> pubSeenSeq_{ 0 };
 
     bool  reverse_   = false;
     bool  halfSpeed_ = false;
     float decay_     = 1.0f;
-    float undoSeq_   = 0.0f;
+    std::uint32_t undoSeq_ = 0;
 
     bool snapPending_ = false;
     bool snapValid_   = false;

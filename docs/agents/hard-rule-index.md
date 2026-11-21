@@ -47,6 +47,18 @@ One entry per invariant / ABI wave. Read the entry for the area you touch; each 
   renders a two-wide bus into preallocated buffers and writes `(L + R) / 2`.
   `AbiV49Tests`, `RtMonoOutputFoldsLAndRWithoutAllocating`. → `native-engine-abi.md`
 
+- **ABI v51: seat routing masks:** a chart source and the in-process instrument
+  enter the seats their mask names, rendered once per block before the seat loop
+  and summed into each named seat; mask 0 = v50 routing; a rebuild forgets both
+  (the host replays). `AbiV51Tests`, `RtSeatRoutingMasks`. → `native-engine-abi.md`
+
+- **ABI v50: one sandbox child per seat:** `dca_engine_set_remote_bridge_for_player`
+  / `dca_engine_get_remote_bridge_stats_for_player`; the v19 pair is seat 0's, and
+  seat 0's child renders the instrument. Every seat's request is posted, then all
+  are collected against ONE one-block deadline; a slow or wedged child misses and
+  goes poll-only alone. All bridges share the one `remoteBridgeMutex_` barrier.
+  `AbiV50Tests`, `RtSandboxOverloadedSeatDropsOnlyItsOwnChain`. → `native-engine-abi.md`
+
 - **ABI v48: the note upload names its byte length, and untrusted inputs are
   capped:** `dca_engine_chart_source_set_notes_for_player2` checks count x stride
   against the buffer; a `.wem` is capped at 256 MiB and is NEVER streamed (a
@@ -412,6 +424,37 @@ One entry per invariant / ABI wave. Read the entry for the area you touch; each 
   `dca_xrun_stats::input_plugin_faults`. No log from the catch body — the
   counter is the report. Pinned by the storm phase of
   `RtAThrowingInputPluginCannotKillTheCallback`.
+  **The INSTRUMENT bus latches the same way** (`instrumentFaulted_`, re-armed by
+  `instrumentGeneration_`, which attach and re-prepare bump UNDER
+  `instrumentMutex_`, the attach together with the plugin pointer): a VSTi that
+  threw is skipped until it gets that second chance. The render pass loads the
+  pointer and the generation under that mutex, so a latch always belongs to the
+  plugin that threw (`RtGoodInstrumentReplacingALatchedOneRenders`,
+  `RtInstrumentLatchClearsOnReprepare`). No counter — `dca_xrun_stats`
+  has no instrument field and a new one is an ABI change. Pinned by
+  `RtThrowingInstrumentIsLatchedUntilReattach`.
+- **Plugin attach is one message-thread transaction per instance, decided by the
+  engine's slot and chains, not by the `Plugin` flags.** Every attach, detach
+  and `teardownPluginAndDelete` reads the instrument slot and the seats' chains
+  (`currentRoles`, `AudioEngine::inputChainIndexOf`); the flags only follow.
+  `dca_plugin_attach_to_instrument` / `_attach_to_input_for_player` MOVE an
+  instance between roles (the old role is detached, with its wait-one-block
+  barrier, before the new role prepares it); an instrument attach clears the
+  displaced plugin's flag and waits for its in-flight block. **A failed attach
+  puts the instance back** into the role it had (same seat, same chain index,
+  or the instrument slot); only when that restore fails too is it in neither
+  role, with flags that say so (`RtFailedAttachKeepsThePriorRole`). The
+  restore starts from "in no role" (`abandonAttach` detaches the target role
+  first, because a failure can come after the new chain or slot was published),
+  and an instance is in at most ONE seat (`currentRoles` asserts it). A failed
+  instrument attach also gives the slot back to the plugin it displaced (same
+  publish path); if that fails too the slot is empty and no flag claims it.
+  `JuceHost::callSync` catches the body's exception on the
+  message thread and rethrows it on the caller (`src/SyncCall.h`), so the
+  export's `guard()` reports a plugin's throwing `prepareToPlay`. Pinned by
+  `RtPluginAttachMovesTheInstanceBetweenRoles`,
+  `RtInstrumentReattachTakesTheSlotBack` and
+  `RtSyncCallRethrowsAPluginExceptionOnTheCaller`.
   **The driver-callback BACKSTOP now clears the block, too.** Its comment said
   "the block of silence this produces" while its body was empty and `renderBlock`
   never zeroes `out` — so a throw from inside `player_` left whatever the driver

@@ -944,6 +944,41 @@ public sealed class GearUtilityTests : IDisposable
     }
 
     /// <summary>
+    ///     A record pass that fills <c>maxLoopS</c> closes itself to Play with
+    ///     no parameter write behind it, so the module's stored <c>state</c>
+    ///     still says Record. Every later write republishes the whole parameter
+    ///     set: a knob turn must not read that stale Record as a fresh press and
+    ///     erase the take. Only a write OF <c>state</c> is a transport command.
+    /// </summary>
+    [NativeAvailableFact]
+    public void Looper_AKnobTurnAfterAnAutoClose_KeepsTheTake()
+    {
+        const int cap = Rate48;                     // maxLoopS = 1
+        const int burst = 4800;
+
+        Assert.Equal(Ok, DspClearFor(H, 0));
+        var n = DspAddNode(H, "looper");
+        Assert.True(n >= 0);
+        Apply(n, "maxLoopS=1;loopLevel=1;mix=1");
+
+        var start = 1 * Frames;
+        RunLooper(n, 100, SineBetween(220f, start, start + burst), [(1, "state=1")]);
+        Assert.Equal(Ok, DspGetParam(H, n, "state", out var closed));
+        Assert.Equal(2f, closed, 3);
+
+        // No input at all from here on: whatever is heard is the take.
+        var after = RunLooper(n, 100, _ => 0f, [(1, "loopLevel=0.9")]);
+        var a = ArgPeak(after.L, 2 * Frames, cap);
+        _out.WriteLine($"looper after a knob turn: peak {after.L[a]:F4} at {a}");
+        Assert.True(MathF.Abs(after.L[a]) > 0.05f,
+            $"a loopLevel write after the auto-close erased the take (peak {after.L[a]:F4}) — "
+            + "the stale Record in the parameter set was read as a new Record press");
+
+        Assert.Equal(Ok, DspGetParam(H, n, "state", out var reported));
+        Assert.Equal(2f, reported, 3);
+    }
+
+    /// <summary>
     ///     <c>maxLoopS</c> is a LIVE knob. Turning it down below what has
     ///     already been recorded used to WEDGE the looper: the record branch was
     ///     never entered again, the auto-close lived inside it so it never
