@@ -7,6 +7,15 @@ The version lives in `Directory.Build.props` at the repository root (one
 it requires, because the managed wrapper demands exact equality and refuses a
 stale `juce_sharp.dll`.
 
+## 1.4.1 (2026-11-22)
+
+**ABI v51** (unchanged).
+
+- **Builds on CMake 4.5** — the NeuralAudio fetch now drops a stray argument
+  from that library's `source_group()` calls, which CMake 4.5 rejects
+  ("source_group given unknown argument"); CMake 4.4 and earlier build the
+  same as before.
+
 ## 1.4.0 (2026-11-21)
 
 **ABI v51.**

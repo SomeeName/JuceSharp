@@ -5,7 +5,7 @@ project(JuceSharpNative
     # sees. It sat at 0.3.0 for five releases while dca_version_string()
     # hard-coded the same stale number a second time; the string is generated
     # from this now, so there is one place to bump.
-    VERSION 1.4.0
+    VERSION 1.4.1
     DESCRIPTION "JuceSharp native audio engine (JUCE-based)"
     # C is required as of JUCE 8.0.15 (and by 9.x, which builds its zlib/FLAC as C) — its own CMakeLists hard-errors with
     # "A C compiler is required to build targets that depend on JUCE" when the
@@ -576,6 +576,9 @@ if(DOTCHARTER_DSP_NEURAL)
     # in-tree Eigen + json (see its SYSTEM include dirs). The only nested
     # submodule the build touches is RTNeural's xsimd (GitHub), which the
     # PATCH_COMMAND inits idempotently. Whole fetch stays on GitHub.
+    # The second PATCH_COMMAND step (cmake/PatchNeuralAudio.cmake, idempotent)
+    # drops a stray argument from NeuralAudio's source_group() calls that
+    # CMake 4.5 rejects (DotCharter#885; no policy covers it).
     # SOURCE_SUBDIR adds ONLY the NeuralAudio object library (not the C API /
     # utils).
     FetchContent_Declare(
@@ -585,6 +588,7 @@ if(DOTCHARTER_DSP_NEURAL)
         GIT_SUBMODULES "deps/NeuralAmpModelerCore;deps/RTNeural;deps/math_approx"
         GIT_SUBMODULES_RECURSE OFF
         PATCH_COMMAND  git -C deps/RTNeural submodule update --init modules/xsimd
+              COMMAND  ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_LIST_DIR}/cmake/PatchNeuralAudio.cmake
         SOURCE_SUBDIR  NeuralAudio)
     FetchContent_MakeAvailable(neuralaudio)
 
