@@ -7,11 +7,20 @@ The version lives in `Directory.Build.props` at the repository root (one
 it requires, because the managed wrapper demands exact equality and refuses a
 stale `juce_sharp.dll`.
 
+## 1.4.3 (2026-11-22)
+
+**ABI v51** (unchanged).
+
+- **Docs stored as UTF-8** — the changelog and a DSP test fixture held
+  characters saved in a legacy Windows encoding; both are now plain UTF-8, and
+  a new test checks that every doc decodes as strict UTF-8. No API or ABI
+  change.
+
 ## 1.4.1 (2026-11-22)
 
 **ABI v51** (unchanged).
 
-- **Builds on CMake 4.5** � the NeuralAudio fetch now drops a stray argument
+- **Builds on CMake 4.5** — the NeuralAudio fetch now drops a stray argument
   from that library's `source_group()` calls, which CMake 4.5 rejects
   ("source_group given unknown argument"); CMake 4.4 and earlier build the
   same as before.

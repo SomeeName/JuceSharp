@@ -1,5 +1,5 @@
 // Frozen e8286ab implementation: bit-exact legacy compatibility oracle.
-// dcdsp_delay.h — stereo delay with tone-shaped feedback and ping-pong (pure dcdsp core).
+// dcdsp_delay.h â€” stereo delay with tone-shaped feedback and ping-pong (pure dcdsp core).
 //
 // Per-channel InterpolatedDelayLine (sized for the 2000 ms max at prepare),
 // a one-pole low-pass ("tone") plus a DC blocker in each feedback path. When
@@ -22,9 +22,9 @@ using namespace dcdsp;
 struct DelayParams {
     float timeMs   = 300.0f;  // 10 .. 2000
     float feedback = 0.4f;    // 0  .. 0.95
-    float mix      = 0.35f;   // 0  .. 1     — dry/wet
+    float mix      = 0.35f;   // 0  .. 1     â€” dry/wet
     bool  pingPong = false;
-    float toneHz   = 4000.0f; // 500 .. 12000 — low-pass in the feedback path
+    float toneHz   = 4000.0f; // 500 .. 12000 â€” low-pass in the feedback path
 };
 
 class DelayCore {
@@ -39,8 +39,8 @@ public:
         tone_.resize((size_t)numCh_);
         dc_.resize((size_t)numCh_);
         // Inside the recirculating loop, so its corner compounds once per
-        // repeat. Unprepared it keeps R = 0.995 — ~38 Hz at 48 kHz but ~76 Hz
-        // at 96 kHz — and a delay tail loses its low end twice as fast purely
+        // repeat. Unprepared it keeps R = 0.995 â€” ~38 Hz at 48 kHz but ~76 Hz
+        // at 96 kHz â€” and a delay tail loses its low end twice as fast purely
         // because the device rate changed.
         for (auto& d : dc_) d.prepare(sr_);
         reads_.assign((size_t)numCh_, 0.0f);
